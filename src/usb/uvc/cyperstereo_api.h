@@ -235,7 +235,7 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
           double imu_count_ms = ((uint16_t)((imu.at<uchar>(0, 11 + i * 18)) << 8) | imu.at<uchar>(0, 10 + i * 18));
           double imu_count_s = ((uint16_t)((imu.at<uchar>(0, 13 + i * 18)) << 8) | imu.at<uchar>(0, 12 + i * 18));
           if (imu_count_s < frame_info.last_imu_count_s)
-            imu_count_s += 43200;
+            imu_count_s += frame_info.last_imu_count_s;
           frame_info.framestream.imu.imu_timestamp[i] = imu_count_s + imu_count_ms / 10000.0;
           frame_info.framestream.imu.acc_x[i] = ((int16_t)((imu.at<uchar>(0, 15 + i * 18)) << 8) | imu.at<uchar>(0, 14 + i * 18))* BMI088_ACCEL_SEN;
 		      frame_info.framestream.imu.acc_y[i] = ((int16_t)((imu.at<uchar>(0, 17 + i * 18)) << 8) | imu.at<uchar>(0, 16 + i * 18))* BMI088_ACCEL_SEN;
