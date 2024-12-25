@@ -138,7 +138,7 @@ bool FindCyperstereoDevices(std::shared_ptr<uvc::device>& cyperstereo_device) {
 
   size_t n = cyperstereo_devices.size();
   if (n <= 0) {
-    std::cout << "No MYNT EYE devices :(" << std::endl;
+    std::cout << "No Cyperstereo devices :(" << std::endl;
     return false;
   }
 
@@ -154,11 +154,11 @@ bool FindCyperstereoDevices(std::shared_ptr<uvc::device>& cyperstereo_device) {
 
   if (n <= 1) {
     cyperstereo_device = cyperstereo_devices[0];
-    std::cout << "Only one MYNT EYE device, select index: 0" << std::endl;
+    std::cout << "Only one Cyperstereo device, select index: 0" << std::endl;
   } else {
     while (true) {
       size_t i;
-      std::cout << "There are " << n << " MYNT EYE devices, select index: " << std::endl;
+      std::cout << "There are " << n << " Cyperstereo devices, select index: " << std::endl;
       std::cin >> i;
       if (i >= n) {
         std::cout << "Index out of range :(" << std::endl;
