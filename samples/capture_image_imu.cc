@@ -34,11 +34,12 @@ int main(int argc, char *argv[]) {
   }
   cyperstereo::FrameInfo frame_info{};
   cyperstereo::uvc::set_device_mode(
-      *cyperstereo_device, 752, 480, static_cast<int>(cyperstereo::Format::YUYV), 60,
+      *cyperstereo_device, 752, 480, static_cast<int>(cyperstereo::Format::YUYV), 55,
       [&frame_info](const void *data, std::function<void()> continuation) {
         cyperstereo::SetStreamData(frame_info, data, continuation);
       });
   cyperstereo::uvc::start_streaming(*cyperstereo_device, 0);
+  TicToc t_frame;
   while (true) {
     cyperstereo::WaitForStream(frame_info);
     double image_timestamp = frame_info.framestream.image_timestamp;
@@ -62,6 +63,12 @@ int main(int argc, char *argv[]) {
         std::cout.precision(6);
         std::cout << "imu_timestamp " << imu_timestamp << " " << gyro_x << " "<< gyro_y << " "<< gyro_z << " " << acc_x << " "<< acc_y << " " << acc_z << std::endl;
     }
+    if (count % 100 == 0) {
+    	double frame_rate = 100 / (t_frame.toc() / 1000);
+    	t_frame.tic();
+    	std::cout << "frame_rate " << frame_rate << std::endl;
+    }
+    
   }
   cyperstereo::uvc::stop_streaming(*cyperstereo_device);
   

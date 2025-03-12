@@ -36,7 +36,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
-
+#include <mutex>
+#include <atomic>
 
 CYPERSTEREO_BEGIN_NAMESPACE
 
@@ -45,8 +46,6 @@ namespace uvc {
 #define NO_DATA_MAX_COUNT 200
 #define LIVING_MAX_COUNT 9000
 
-int no_data_count = 0;
-int living_count = 0;
 
 struct throw_error {
   throw_error() = default;
@@ -108,7 +107,12 @@ struct device {
   std::vector<buffer> buffers;
 
   std::thread thread;
-  volatile bool stop = false;
+  std::mutex device_mutex; // 新增互斥锁
+  
+  int no_data_count = 0;
+  int living_count = 0;
+  std::atomic<bool> stop{false};
+  
 
   device(std::shared_ptr<context> parent, const std::string &name)
       : parent(parent), dev_name("/dev/" + name) {
@@ -324,9 +328,10 @@ struct device {
   }
 
   void stop_capture() {
+    std::lock_guard<std::mutex> lock(device_mutex);
     if (!is_capturing)
       return;
-
+    is_capturing = false;
     // Stop streamining
     v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (xioctl(fd, VIDIOC_STREAMOFF, &type) < 0)
@@ -377,9 +382,18 @@ struct device {
 
       if (callback) {
         callback(buffers[buf.index].start, [buf, this]() mutable {
-          if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
-            throw_error("VIDIOC_QBUF");
-        });
+          std::lock_guard<std::mutex> lock(device_mutex);
+          if (is_capturing && fd != -1) {
+           if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+              if (errno == ENODEV) { // 设备已断开
+        	stop_capture();
+      	      } else {
+        	throw_error("VIDIOC_QBUF");
+      	      }
+           }
+          }  
+        }
+        );
         if (living_count < LIVING_MAX_COUNT) {
           living_count++;
         } else {
@@ -403,6 +417,7 @@ struct device {
   }
 
   void start_streaming() {
+  std::lock_guard<std::mutex> lock(device_mutex);
     if (!callback) {
       std::cout << " failed: video_channel_callback is empty" << std::endl;
       return;

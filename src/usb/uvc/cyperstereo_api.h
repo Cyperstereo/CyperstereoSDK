@@ -69,8 +69,9 @@ struct FrameInfo {
   FrameStreamData framestream{};
   double last_imu_timestamp{0};
   double last_image_timestamp{0};
-  int last_imu_count_s{0};
-  int last_image_count_s{0};
+  double last_imu_count_s{0};
+  double last_imu_count_ms{0};
+  double last_image_count_s{0};
   FrameInfo() {
     framestream.left_image.create(480, 752, CV_8U);
     framestream.right_image.create(480, 752, CV_8U);
@@ -175,7 +176,7 @@ void WaitForStream(FrameInfo& frame_info) {
   std::unique_lock<std::mutex> lock(frame_info.mtx);
   const auto frame_ready = [&frame_info]() { return frame_info.frame != nullptr; };
   if (frame_info.frame == nullptr) {
-    if (!frame_info.con.wait_for(lock, std::chrono::seconds(2), frame_ready))
+    if (!frame_info.con.wait_for(lock, std::chrono::seconds(5), frame_ready))
       throw std::runtime_error("Timeout waiting for frame.");
   }  
   frame_info.frame = nullptr;
@@ -218,8 +219,10 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
         double image_count_ms = ((uint16_t)((imu.at<uchar>(0, 7)) << 8) | imu.at<uchar>(0, 6));
         double image_count_s = ((uint16_t)((imu.at<uchar>(0, 9)) << 8) | imu.at<uchar>(0, 8));
         if (image_count_s < frame_info.last_image_count_s) {
+          std::cout << "image_count_s " << image_count_s << "   last_image_count_s " << frame_info.last_image_count_s << std::endl;
           image_count_s += 43200;
         }
+        
         frame_info.framestream.image_timestamp = image_count_s + image_count_ms / 10000.0;
         if (frame_info.framestream.image_timestamp - frame_info.last_image_timestamp < 0.015) {
           std::cout << "image time too small " << frame_info.last_image_timestamp << "  " << frame_info.framestream.image_timestamp <<std::endl;
@@ -229,13 +232,23 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
         }
         frame_info.last_image_timestamp = frame_info.framestream.image_timestamp;
         frame_info.last_image_count_s = image_count_s;
-
+	
         //imu data
         for (int i = 0; i < 4; ++i) {
           double imu_count_ms = ((uint16_t)((imu.at<uchar>(0, 11 + i * 18)) << 8) | imu.at<uchar>(0, 10 + i * 18));
           double imu_count_s = ((uint16_t)((imu.at<uchar>(0, 13 + i * 18)) << 8) | imu.at<uchar>(0, 12 + i * 18));
-          if (imu_count_s < frame_info.last_imu_count_s)
-            imu_count_s += frame_info.last_imu_count_s;
+          //std::cout << "i " << i << " imu_count_s " << imu_count_s << "   last_imu_count_s " << frame_info.last_imu_count_s << std::endl;
+          //if (i == 3 && (abs(imu_count_s - frame_info.last_imu_count_s) > 1 && frame_info.last_imu_count_s != 0)){
+          //std::cout << "i " << i << " WARN!!!! imu_count_s " << imu_count_s << "   last_imu_count_s " << frame_info.last_imu_count_s << std::endl;
+          //frame_info.last_imu_count_ms = imu_count_ms;
+          //frame_info.last_imu_count_s = imu_count_s;
+	  //        continue;
+          //}
+          if ((imu_count_s < frame_info.last_imu_count_s && i != 3) || (frame_info.last_imu_timestamp > 43200)) {
+          std::cout << imu_count_s << "   last_imu_count_s " << frame_info.last_imu_count_s << std::endl;
+          imu_count_s += 43200;
+          }
+          
           frame_info.framestream.imu.imu_timestamp[i] = imu_count_s + imu_count_ms / 10000.0;
           frame_info.framestream.imu.acc_x[i] = ((int16_t)((imu.at<uchar>(0, 15 + i * 18)) << 8) | imu.at<uchar>(0, 14 + i * 18))* BMI088_ACCEL_SEN;
 		      frame_info.framestream.imu.acc_y[i] = ((int16_t)((imu.at<uchar>(0, 17 + i * 18)) << 8) | imu.at<uchar>(0, 16 + i * 18))* BMI088_ACCEL_SEN;
@@ -250,21 +263,25 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
             frame_info.framestream.imu.temperature[i] = frame_info.framestream.imu.temperature[i];
           }
           frame_info.framestream.imu.temperature[i] = frame_info.framestream.imu.temperature[i] * 0.125 + 23;
-          if (i == 3 && abs(frame_info.framestream.imu.imu_timestamp[3] - frame_info.framestream.imu.imu_timestamp[2]) > 0.01) {
-	          continue;
+          //std::cout << "frame_info.framestream.imu.temperature[i] " << frame_info.framestream.imu.temperature[i] << std::endl;
+          if (i == 3 && ((frame_info.framestream.imu.imu_timestamp[i] - frame_info.last_imu_timestamp > 0.006) ||  (frame_info.framestream.imu.imu_timestamp[i] - frame_info.last_imu_timestamp < 0.004) || (abs(frame_info.framestream.imu.temperature[i] - frame_info.framestream.imu.temperature[i - 1]) > 0.5))) {
+	      continue;
           }
           frame_info.framestream.imu.imu_count = i;
+
           if (frame_info.framestream.imu.imu_timestamp[i] - frame_info.last_imu_timestamp > 0.0075) {
             std::cout << "imu time too large " << frame_info.last_imu_timestamp << "  " << frame_info.framestream.imu.imu_timestamp[i] << std::endl;
           }
           if (frame_info.framestream.imu.imu_timestamp[i] - frame_info.last_imu_timestamp <= 0) {
             std::cout << "imu time too small " << frame_info.last_imu_timestamp << "  " << frame_info.framestream.imu.imu_timestamp[i] << std::endl;
           }
+
           frame_info.last_imu_timestamp = frame_info.framestream.imu.imu_timestamp[i];
+          frame_info.last_imu_count_ms = imu_count_ms;
           frame_info.last_imu_count_s = imu_count_s;
         }
-        if (frame_info.frame != nullptr)
-          frame_info.con.notify_one();
+        //if (frame_info.frame != nullptr)
+        frame_info.con.notify_one();
 }
 
 CYPERSTEREO_END_NAMESPACE
