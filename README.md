@@ -10,7 +10,21 @@ cmake ..
 make
 ```
 
-# 2.Run Samples
+# 2.Win Compile
+```c
+Before compiling the SDK, please ensure that you install Visual Studio on your own first.
+
+git clone https://github.com/Cyperstereo/CyperstereoSDK.git
+cd ~/CyperstereoSDK/samples
+mkdir build
+cd build
+
+cmake -G "Visual Studio 15 2017 Win64" ..
+msbuild ALL_BUILD.vcxproj /property:Configuration=Release
+```
+
+
+# 3.Run Samples
 ```c
 #save image and imu samples  
 mkdir left
