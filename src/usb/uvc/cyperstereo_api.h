@@ -12,7 +12,6 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include "uvc.h"
 #include "tic_toc.h"
-#include <opencv2/ximgproc.hpp>
 
 CYPERSTEREO_BEGIN_NAMESPACE
 
@@ -218,10 +217,6 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
         // double image_count_begin_s = ((uint16_t)((imu.at<uchar>(0, 5)) << 8) | imu.at<uchar>(0, 4));
         double image_count_ms = ((uint16_t)((imu.at<uchar>(0, 7)) << 8) | imu.at<uchar>(0, 6));
         double image_count_s = ((uint16_t)((imu.at<uchar>(0, 9)) << 8) | imu.at<uchar>(0, 8));
-        if (image_count_s < frame_info.last_image_count_s) {
-          std::cout << "image_count_s " << image_count_s << "   last_image_count_s " << frame_info.last_image_count_s << std::endl;
-          image_count_s += 43200;
-        }
         
         frame_info.framestream.image_timestamp = image_count_s + image_count_ms / 10000.0;
         if (frame_info.framestream.image_timestamp - frame_info.last_image_timestamp < 0.015) {
@@ -238,16 +233,6 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
           double imu_count_ms = ((uint16_t)((imu.at<uchar>(0, 11 + i * 18)) << 8) | imu.at<uchar>(0, 10 + i * 18));
           double imu_count_s = ((uint16_t)((imu.at<uchar>(0, 13 + i * 18)) << 8) | imu.at<uchar>(0, 12 + i * 18));
           //std::cout << "i " << i << " imu_count_s " << imu_count_s << "   last_imu_count_s " << frame_info.last_imu_count_s << std::endl;
-          //if (i == 3 && (abs(imu_count_s - frame_info.last_imu_count_s) > 1 && frame_info.last_imu_count_s != 0)){
-          //std::cout << "i " << i << " WARN!!!! imu_count_s " << imu_count_s << "   last_imu_count_s " << frame_info.last_imu_count_s << std::endl;
-          //frame_info.last_imu_count_ms = imu_count_ms;
-          //frame_info.last_imu_count_s = imu_count_s;
-	  //        continue;
-          //}
-          if ((imu_count_s < frame_info.last_imu_count_s && i != 3) || (frame_info.last_imu_timestamp > 43200)) {
-          std::cout << imu_count_s << "   last_imu_count_s " << frame_info.last_imu_count_s << std::endl;
-          imu_count_s += 43200;
-          }
           
           frame_info.framestream.imu.imu_timestamp[i] = imu_count_s + imu_count_ms / 10000.0;
           frame_info.framestream.imu.acc_x[i] = ((int16_t)((imu.at<uchar>(0, 15 + i * 18)) << 8) | imu.at<uchar>(0, 14 + i * 18))* BMI088_ACCEL_SEN;
@@ -265,7 +250,7 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
           frame_info.framestream.imu.temperature[i] = frame_info.framestream.imu.temperature[i] * 0.125 + 23;
           //std::cout << "frame_info.framestream.imu.temperature[i] " << frame_info.framestream.imu.temperature[i] << std::endl;
           if (i == 3 && ((frame_info.framestream.imu.imu_timestamp[i] - frame_info.last_imu_timestamp > 0.006) ||  (frame_info.framestream.imu.imu_timestamp[i] - frame_info.last_imu_timestamp < 0.004) || (abs(frame_info.framestream.imu.temperature[i] - frame_info.framestream.imu.temperature[i - 1]) > 0.5))) {
-	      continue;
+	          continue;
           }
           frame_info.framestream.imu.imu_count = i;
 
