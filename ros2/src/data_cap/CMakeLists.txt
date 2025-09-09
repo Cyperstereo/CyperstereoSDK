@@ -46,7 +46,7 @@ else()
   message(FATAL_ERROR "Unsupported OS.")
 endif()
 
-include_directories(include ${OpenCV_INCLUDE_DIRS})
+include_directories(${OpenCV_INCLUDE_DIRS})
 
 add_executable(capture_image_imu src/capture_image_imu.cpp)
 ament_target_dependencies(capture_image_imu rclcpp cv_bridge image_transport)
