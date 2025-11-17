@@ -3,40 +3,41 @@
 #--------------------------------------------------------------------------------------------
 # Camera Parameters. Adjust them!
 #--------------------------------------------------------------------------------------------
+
 Camera.type: "KannalaBrandt8"
 
 # Left Camera calibration and distortion parameters (OpenCV)
-Camera.fx: 324.34508286550977
-Camera.fy: 324.4205996262429
-Camera.cx: 405.0302910222278
-Camera.cy: 222.42758433196082
+Camera.fx: 234.27613584875468
+Camera.fy: 234.66446314015425
+Camera.cx: 395.5301155067932
+Camera.cy: 259.7726128077328
 
 # Kannala-Brandt distortion parameters
-Camera.k1: -0.2871572386663279
-Camera.k2: 0.07211205964338065
-Camera.k3: -0.0002804607715538131
-Camera.k4: -0.00036133055515907066
+Camera.k1: 0.09202048139495318
+Camera.k2: 0.04589926195405795
+Camera.k3: -0.02820754622080261
+Camera.k4: 0.0035568127613466735
 
 # Right Camera calibration and distortion parameters (OpenCV)
-Camera2.fx: 317.2106397831289
-Camera2.fy: 317.4818135727824
-Camera2.cx: 382.2972299736951
-Camera2.cy: 226.6003929056365
+Camera2.fx: 234.03432043974973
+Camera2.fy: 234.49044350841237
+Camera2.cx: 386.42802967404987
+Camera2.cy: 278.5071133928898
 
 # Kannala-Brandt distortion parameters
-Camera2.k1: -0.26689459288007567
-Camera2.k2: 0.053913736218377466
-Camera2.k3: 7.1300161957908e-05
-Camera2.k4: -0.001032747839311146
+Camera2.k1: 0.08983656435963258
+Camera2.k2: 0.04968415500527912
+Camera2.k3: -0.03102806647162496
+Camera2.k4: 0.0037635106334667034
     
 # Transformation matrix from right camera to left camera
 Tlr: !!opencv-matrix
   rows: 3
   cols: 4
   dt: f
-  data: [ 0.999568,  0.00444865,  -0.0290421, 0.136075, 
-          -0.00455923,    0.999983, -0.00374243, -0.000754099, 
-          0.0290249,  0.00387322,    0.999571, 0.000215501]
+  data: [ 0.9999383727454101, 0.01100327231341247, 0.0014760452747138812, 0.150023,
+          -0.01100633981097531, 0.9999372517086934, 0.0020864154009452543, 0.00235858,
+          -0.0014529952585795073, -0.002102532676762051, 0.9999967340752252, 0.00025564]
 
 # Lapping area between images  HAN
 Camera.lappingBegin: 0  
@@ -50,14 +51,14 @@ Camera.width: 752
 Camera.height: 480
 
 # Camera frames per second 
-Camera.fps: 27.0
+Camera.fps: 26.0
 
 # Color order of the images (0: BGR, 1: RGB. It is ignored if images are grayscale)
 Camera.RGB: 1
 
 # Close/Far threshold. Baseline times.   HAN
-ThDepth: 100.0
-Camera.bf: 43.64984748
+ThDepth: 40.0
+Camera.bf: 35.146808728
 
 
 # Transformation from body-frame (imu) to left camera
@@ -65,24 +66,24 @@ Tbc: !!opencv-matrix
    rows: 4
    cols: 4
    dt: f
-   data: [-0.99999271, -0.00373451,  0.00080072,  0.12502998,
-          0.00372409, -0.99991305, -0.0126504,   0.00005083,
-          0.00084789, -0.01264732,  0.99991966,  0.00285232,
-            0.0        , 0.0          , 0.0         , 1.0]
+   data: [-0.99996251, 0.00828459, 0.00251697, 0.13528204,
+           -0.0082806, -0.99996445, 0.00159314, 0.00309906,
+           0.00253007, 0.00157224, 0.99999556, 0.0094992,
+           0, 0, 0, 1.]
 
 # IMU noise (Use those from VINS-mono)   HAN
 IMU.NoiseGyro: 0.00016 # 0.004 (VINS) # 0.00016 (TUM) # 0.00016    # rad/s^0.5 
 IMU.NoiseAcc: 0.0028  # 0.04 (VINS) # 0.0028 (TUM) # 0.0028     # m/s^1.5
 IMU.GyroWalk: 0.000022 # 0.000022 (VINS and TUM) rad/s^1.5
-IMU.AccWalk: 0.0004 # 0.0004 (VINS) # 0.00086 # 0.00086    # m/s^2.5
+IMU.AccWalk: 0.00086 # 0.0004 (VINS) # 0.00086 # 0.00086    # m/s^2.5
 IMU.Frequency: 200
-thFarPoints: 100.0
+#thFarPoints: 20.0
 #--------------------------------------------------------------------------------------------
 # ORB Parameters
 #--------------------------------------------------------------------------------------------
 
 # ORB Extractor: Number of features per image   HAN
-ORBextractor.nFeatures: 1000 # Tested with 1250
+ORBextractor.nFeatures: 1500 # Tested with 1250
 
 # ORB Extractor: Scale factor between levels in the scale pyramid 	
 ORBextractor.scaleFactor: 1.2
@@ -94,8 +95,8 @@ ORBextractor.nLevels: 8
 # Image is divided in a grid. At each cell FAST are extracted imposing a minimum response.
 # Firstly we impose iniThFAST. If no corners are detected we impose a lower value minThFAST
 # You can lower these values if your images have low contrast	  HAN		
-ORBextractor.iniThFAST: 20 # 20
-ORBextractor.minThFAST: 5 # 7
+ORBextractor.iniThFAST: 15 # 20
+ORBextractor.minThFAST: 7 # 7
 
 #--------------------------------------------------------------------------------------------
 # Viewer Parameters

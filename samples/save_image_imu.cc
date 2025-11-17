@@ -33,12 +33,29 @@ CYPERSTEREO_USE_NAMESPACE
 
 std::queue<std::pair<double, std::array<double, 6>> > IMU;
 std::queue<std::pair<double, std::vector<cv::Mat>> > IMAGE;
+struct GnssRecord {
+  double gnss_timestamp;
+  std::string gnss_utc_time;
+  double latitude;
+  double longitude;
+  double altitude;
+  int fix_type;
+  int satellites_used;
+  double gps_geoid_height;
+  double velocity;
+  double heading;
+  double hdop;
+  double vdop;
+  double pdop;
+};
+std::queue<GnssRecord> GNSS;
 std::mutex m_buf;
 std::condition_variable con;
-void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<std::pair<double, std::vector<cv::Mat>> > &image_data);
+void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<std::pair<double, std::vector<cv::Mat>> > &image_data, std::queue<GnssRecord> &gnss_data);
 void DataFlow();
 void InputIMAGE(const double timestamp, const cv::Mat& cam0_img, const cv::Mat& cam1_img);
 void InputIMU(const double timestamp, double gyro_x, double gyro_y, double gyro_z, double acc_x, double acc_y, double acc_z);
+void InputGNSS(const cyperstereo::GNSSStreamData &gnss);
 
 int main(int argc, char *argv[]) {
   std::thread data_flow{DataFlow};
@@ -63,6 +80,13 @@ int main(int argc, char *argv[]) {
       InputIMU(frame_info.framestream.imu.imu_timestamp[i], frame_info.framestream.imu.gyro_x[i], frame_info.framestream.imu.gyro_y[i], frame_info.framestream.imu.gyro_z[i],
                 frame_info.framestream.imu.acc_x[i], frame_info.framestream.imu.acc_y[i], frame_info.framestream.imu.acc_z[i]);
     }
+    const auto &gnss_stream = frame_info.framestream.gnss;
+    static std::string last_gnss_time;
+    if (!gnss_stream.gnss_utc_time.empty() && gnss_stream.valid == true && gnss_stream.gnss_utc_time != last_gnss_time) {
+      InputGNSS(gnss_stream);
+      last_gnss_time = gnss_stream.gnss_utc_time;
+    }
+    
   }
   cyperstereo::uvc::stop_streaming(*cyperstereo_device);
   
@@ -76,6 +100,27 @@ void InputIMU(const double timestamp, double gyro_x, double gyro_y, double gyro_
     m_buf.unlock();
     con.notify_one();
 }
+
+void InputGNSS(const cyperstereo::GNSSStreamData &gnss) {
+    std::lock_guard<std::mutex> lk(m_buf);
+    GnssRecord record;
+    record.gnss_timestamp = gnss.gnss_timestamp;
+    record.gnss_utc_time = gnss.gnss_utc_time;
+    record.latitude = gnss.latitude;
+    record.longitude = gnss.longitude;
+    record.altitude = gnss.altitude;
+    record.fix_type = gnss.fix_type;
+    record.satellites_used = gnss.satellites_used;
+    record.gps_geoid_height = gnss.gps_geoid_height;
+    record.velocity = gnss.velocity;
+    record.heading = gnss.heading;
+    record.hdop = gnss.hdop;
+    record.vdop = gnss.vdop;
+    record.pdop = gnss.pdop;
+    GNSS.push(record);
+    con.notify_one();
+}
+
 
 void InputIMAGE(const double timestamp, const cv::Mat& cam0_img, const cv::Mat& cam1_img) {
     m_buf.lock();
@@ -92,10 +137,11 @@ void DataFlow() {
   while (true) {
       std::queue<std::pair<double, std::array<double, 6>> > imu_data;
       std::queue<std::pair<double, std::vector<cv::Mat>> > image_data;
+      std::queue<GnssRecord> gnss_data;
       std::unique_lock<std::mutex> lk(m_buf);
       con.wait(lk, [&] {
-        GetData(imu_data, image_data);
-        return imu_data.size() != 0 || image_data.size() != 0;});
+        GetData(imu_data, image_data, gnss_data);
+        return imu_data.size() != 0 || image_data.size() != 0 || gnss_data.size() != 0;});
       lk.unlock();
       while (!imu_data.empty()) {
         double imu_timestamp = imu_data.front().first;
@@ -107,7 +153,7 @@ void DataFlow() {
         double acc_z = imu_data.front().second[5];
         std::cout.setf(std::ios::fixed, std::ios::floatfield);
         std::cout.precision(6);
-        std::cout << "imu_timestamp " << imu_timestamp << " " << gyro_x << " "<< gyro_y << " "<< gyro_z << " " << acc_x << " "<< acc_y << " " << acc_z << std::endl;
+       // std::cout << "imu_timestamp " << imu_timestamp << " " << gyro_x << " "<< gyro_y << " "<< gyro_z << " " << acc_x << " "<< acc_y << " " << acc_z << std::endl;
         std::ofstream foutC("./imu/imu.csv", std::ios::app);
         foutC.setf(std::ios::fixed, std::ios::floatfield);
         foutC.precision(4);
@@ -123,12 +169,34 @@ void DataFlow() {
         foutC.close();
         imu_data.pop();
       }
+      while (!gnss_data.empty()) {
+        const auto &record = gnss_data.front();
+        std::ofstream foutG("./gnss/gnss.csv", std::ios::app);
+        foutG.setf(std::ios::fixed, std::ios::floatfield);
+        foutG.precision(6);
+        foutG << record.gnss_timestamp << ","
+              << record.gnss_utc_time << ","
+              << record.latitude << ","
+              << record.longitude << ","
+              << record.altitude << ","
+              << record.fix_type << ","
+              << record.satellites_used << ","
+              << record.gps_geoid_height << ","
+              << record.velocity << ","
+              << record.heading << ","
+              << record.hdop << ","
+              << record.vdop << ","
+              << record.pdop
+              << std::endl;
+        foutG.close();
+        gnss_data.pop();
+      }
       while (!image_data.empty()) {
         double image_timestamp = image_data.front().first;
         cv::Mat left_image = image_data.front().second[0];
         cv::Mat right_image = image_data.front().second[1];
         if (!left_image.empty() && !right_image.empty()) {
-          std::cout << "image_timestamp " << image_timestamp << std::endl;
+         // std::cout << "image_timestamp " << image_timestamp << std::endl;
           // TicToc tf;
           // float eps = 0.0001;//eps的取值很关键（乘于255的平方）
           // cv::Mat left_image_res = FastGuidedfilter(left_image, 9, eps, 3);
@@ -146,7 +214,7 @@ void DataFlow() {
   }
 }
 
-void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<std::pair<double, std::vector<cv::Mat>> > &image_data) {
+void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<std::pair<double, std::vector<cv::Mat>> > &image_data, std::queue<GnssRecord> &gnss_data) {
   while (!IMU.empty()) {
     imu_data.push(IMU.front());
     IMU.pop();
@@ -154,5 +222,9 @@ void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, st
   while (!IMAGE.empty()) {
     image_data.push(IMAGE.front());
     IMAGE.pop();
+  }
+  while (!GNSS.empty()) {
+    gnss_data.push(GNSS.front());
+    GNSS.pop();
   }
 }
