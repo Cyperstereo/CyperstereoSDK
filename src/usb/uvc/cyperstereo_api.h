@@ -232,11 +232,19 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
 	      }
         // ISP(frame_info.framestream.left_image, frame_info.framestream.right_image);
         // image data
-        // double count = ((uint16_t)((imu.at<uchar>(0, 1)) << 8) | imu.at<uchar>(0, 0));
-        // double image_count_begin_ms = ((uint16_t)((imu.at<uchar>(0, 3)) << 8) | imu.at<uchar>(0, 2));
+        uint32_t version1 = ((uint16_t)((imu.at<uchar>(0, 1)) << 8) | imu.at<uchar>(0, 0));
+        uint32_t version2 = ((uint16_t)((imu.at<uchar>(0, 3)) << 8) | imu.at<uchar>(0, 2));
+        bool image_count_hour_valid{false};
+        if(version1 == 0 && version2 == 2) {
+          image_count_hour_valid = true;
+        }
+
         double image_count_hour = ((uint16_t)((imu.at<uchar>(0, 5)) << 8) | imu.at<uchar>(0, 4));
         double image_count_ms = ((uint16_t)((imu.at<uchar>(0, 7)) << 8) | imu.at<uchar>(0, 6));
         double image_count_s = ((uint16_t)((imu.at<uchar>(0, 9)) << 8) | imu.at<uchar>(0, 8));
+        if(!image_count_hour_valid) {
+          image_count_hour = 0;
+        }
 
         frame_info.framestream.image_timestamp = image_count_hour * 12 * 3600 + image_count_s + image_count_ms / 10000.0;
         if (frame_info.framestream.image_timestamp - frame_info.last_image_timestamp < 0.015) {
