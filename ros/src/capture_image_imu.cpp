@@ -42,7 +42,7 @@ int main(int argc, char *argv[]) {
         cyperstereo::SetStreamData(frame_info, data, continuation);
       });
   cyperstereo::uvc::start_streaming(*cyperstereo_device, 0);
-  while (true) {
+  while (ros::ok()) {
     cyperstereo::WaitForStream(frame_info);
     double image_timestamp = frame_info.framestream.image_timestamp;
     cv::Mat left_image = frame_info.framestream.left_image;
