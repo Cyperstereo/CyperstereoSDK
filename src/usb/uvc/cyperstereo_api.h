@@ -330,7 +330,7 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
         }
         double gps_alt_integer = ((uint16_t)((imu.at<uchar>(0, 113) << 6 | imu.at<uchar>(0, 112) >> 2)));
         double gps_alt_fraction = (uint16_t)((imu.at<uchar>(0, 115) << 8) | imu.at<uchar>(0, 114));
-        double altitude = gps_alt_integer + gps_alt_fraction / 1000.0;
+        double altitude = gps_alt_integer + gps_alt_fraction / 10000.0;
         uint16_t gps_fix_quality = (uint16_t)(imu.at<uchar>(0, 117) >> 5);
         uint16_t gps_satellites = (uint16_t)(imu.at<uchar>(0, 116) >> 1);
         double gps_geoid_integer = (uint16_t)((imu.at<uchar>(0, 119) << 6) | (imu.at<uchar>(0, 118)  >> 2) );
@@ -361,7 +361,7 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
         double gps_angle_fraction = (uint16_t)((imu.at<uchar>(0, 141) << 2) | imu.at<uchar>(0, 140) >> 6);
         double gps_angle = gps_angle_integer + gps_angle_fraction / 1000.0;
         
-        if (!gnss_time_unchanged && gps_fix_quality >=1 && hdop < 100 && vdop < 100 && pdop < 100) {
+        if (!gnss_time_unchanged && gps_fix_quality >=1 && hdop < 50 && vdop < 50 && pdop < 50) {
           frame_info.framestream.gnss.valid = true;
           frame_info.framestream.gnss.gnss_timestamp = gnss_timestamp;
           frame_info.framestream.gnss.gnss_utc_time = gnss_utc_time;
