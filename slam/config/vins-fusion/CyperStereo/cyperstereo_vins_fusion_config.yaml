@@ -24,31 +24,31 @@ body_T_cam0: !!opencv-matrix
    rows: 4
    cols: 4
    dt: d
-   data: [-0.99997349, 0.0065894, -0.00309983, 0.15392222,
-           -0.00658008, -0.99997383, -0.00300765, -0.01216704,
-           -0.00311957, -0.00298717, 0.99999067, -0.00661104,
+   data: [-0.99996251, 0.00828459, 0.00251697, 0.13528204,
+           -0.0082806, -0.99996445, 0.00159314, 0.00309906,
+           0.00253007, 0.00157224, 0.99999556, 0.0094992,
            0, 0, 0, 1.]
 
 body_T_cam1: !!opencv-matrix
    rows: 4
    cols: 4
    dt: d
-   data: [-0.99999131, -0.00412096, 0.00062319,  0.01757916,
-           0.00412177,  -0.99999066,  0.00130302, -0.01215136,
-          0.00061782, 0.00130558,  0.99999896,  -0.00700107,
+   data: [-0.99999573, -0.00272408, 0.00105825,  -0.01475953,
+           0.00272355,  -0.99999616,  -0.00050543, 0.00279993,
+          0.00105963, -0.00050254,  0.99999931,  0.00969053,
           0, 0, 0, 1]
 
 #Multiple thread support
 multiple_thread: 1
 
 #feature traker paprameters
-max_cnt: 200            # max feature number in feature tracking
-min_dist: 10            # min distance between two features 
-freq: 20                # frequence (Hz) of publish tracking result. At least 10Hz for good estimation. If set 0, the frequence will be same as raw image 
+max_cnt: 250            # max feature number in feature tracking
+min_dist: 20            # min distance between two features 
+freq: 26                # frequence (Hz) of publish tracking result. At least 10Hz for good estimation. If set 0, the frequence will be same as raw image 
 F_threshold: 1.0        # ransac threshold (pixel)
 show_track: 1           # publish tracking image as topic
 flow_back: 1            # perform forward and backward optical flow to improve feature tracking accuracy
-equalize: 1 
+#equalize: 0 
 
 #optimization parameters
 max_solver_time: 0.04  # max solver itration time (ms), to guarantee real time
@@ -56,11 +56,11 @@ max_num_iterations: 8   # max solver itrations, to guarantee real time
 keyframe_parallax: 10.0 # keyframe selection threshold (pixel)
 
 #imu parameters       The more accurate parameters you provide, the better performance
-acc_n: 0.1          # accelerometer measurement noise standard deviation. 
-gyr_n: 0.01         # gyroscope measurement noise standard deviation.     
-acc_w: 0.0001        # accelerometer bias random work noise standard deviation.  
-gyr_w: 0.00001       # gyroscope bias random work noise standard deviation.     
-g_norm: 9.81007     # gravity magnitude
+acc_n: 0.3          # accelerometer measurement noise standard deviation. 
+gyr_n: 0.03         # gyroscope measurement noise standard deviation.     
+acc_w: 0.00038        # accelerometer bias random work noise standard deviation.  
+gyr_w: 0.000014       # gyroscope bias random work noise standard deviation.     
+g_norm: 9.7887     # gravity magnitude
 
 #unsynchronization parameters
 estimate_td: 0                      # online estimate time offset between camera and imu
@@ -68,5 +68,5 @@ td: 0.0                             # initial value of time offset. unit: s. rea
 
 #loop closure parameters
 load_previous_pose_graph: 0        # load and reuse previous pose graph; load from 'pose_graph_save_path'
-pose_graph_save_path: "~/output/pose_graph/" # save and load path
+pose_graph_save_path: "~/output/" # save and load path
 save_image: 1                   # save image in pose graph for visualization prupose; you can close this function by setting 0 
