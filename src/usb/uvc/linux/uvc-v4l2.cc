@@ -378,6 +378,15 @@ struct device {
         if (errno == EAGAIN)
           return;
         std::cout << "VIDIOC_DQBUF" << std::endl;
+        if (errno == ENODEV || errno == EIO) {  // device removed or I/O error
+          stop = true;
+          stop_capture();
+          if (fd != -1) {
+            close(fd);
+            fd = -1;
+          }
+          return;
+        }
       }
 
       if (callback) {

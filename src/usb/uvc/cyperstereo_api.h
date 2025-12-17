@@ -91,6 +91,16 @@ struct FrameInfo {
   double last_imu_count_s{0};
   double last_imu_count_ms{0};
   double last_image_count_s{0};
+  void ResetState() {
+    frame = nullptr;
+    framestream.imu.imu_count = 0;
+    framestream.gnss.valid = false;
+    last_imu_timestamp = 0;
+    last_image_timestamp = 0;
+    last_imu_count_s = 0;
+    last_imu_count_ms = 0;
+    last_image_count_s = 0;
+  }
   FrameInfo() {
     framestream.left_image.create(480, 752, CV_8U);
     framestream.right_image.create(480, 752, CV_8U);
