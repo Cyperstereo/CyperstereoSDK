@@ -70,6 +70,7 @@ struct device;   // Opaque type representing access to a specific UVC device
  std::string get_name(const device &device);
  int get_vendor_id(const device &device);
  int get_product_id(const device &device);
+ std::string get_serial_number(const device &device);
 
  std::string get_video_name(const device &device);
 

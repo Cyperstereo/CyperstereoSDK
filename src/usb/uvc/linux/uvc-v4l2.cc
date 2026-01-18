@@ -76,6 +76,24 @@ static int xioctl(int fh, int request, void *arg) {
   return r;
 }
 
+static std::string read_serial_number(const std::string &video_device) {
+  const std::string base =
+      "/sys/class/video4linux/" + video_device + "/device";
+  const std::vector<std::string> candidates{
+      base + "/../serial", base + "/../../serial", base + "/serial"};
+
+  for (const auto &path : candidates) {
+    std::ifstream serial_file(path);
+    if (serial_file) {
+      std::string serial;
+      std::getline(serial_file, serial);
+      if (!serial.empty())
+        return serial;
+    }
+  }
+  return "";
+}
+
 struct buffer {
   void *start;
   size_t length;
@@ -97,6 +115,7 @@ struct device {
   std::string dev_name;  // Device name (typically of the form /dev/video*)
 
   std::string name;  // Device description name
+  std::string serial_number;  // USB device serial number (if available)
   int vid, pid, mi;  // Vendor ID, product ID, and multiple interface index
   int fd = -1;       // File descriptor for this device
 
@@ -147,6 +166,8 @@ struct device {
               "/sys/class/video4linux/" + name + "/device/bInterfaceNumber") >>
           std::hex >> mi))
       throw_error() << "Failed to read interface number";
+
+    serial_number = read_serial_number(name);
 
     fd = open(dev_name.c_str(), O_RDWR | O_NONBLOCK, 0);
     if (fd < 0) {
@@ -500,6 +521,10 @@ int get_vendor_id(const device &device) {
 
 int get_product_id(const device &device) {
   return device.pid;
+}
+
+std::string get_serial_number(const device &device) {
+  return device.serial_number;
 }
 
 std::string get_video_name(const device &device) {

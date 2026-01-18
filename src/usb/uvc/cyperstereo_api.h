@@ -178,8 +178,9 @@ bool FindCyperstereoDevices(std::shared_ptr<uvc::device>& cyperstereo_device) {
     auto name = uvc::get_video_name(*device);
     auto vid = uvc::get_vendor_id(*device);
     auto pid = uvc::get_product_id(*device);
+    auto serial_num = uvc::get_serial_number(*device);
     std::cout << "  index: " << i << ", name: " << name << ", vid: 0x"
-              << std::hex << vid << ", pid: 0x" << std::hex << pid << std::endl;
+              << std::hex << vid << ", pid: 0x" << std::hex << pid << ", serial_num: " << std::hex << serial_num << std::endl;
   }
 
   if (n <= 1) {

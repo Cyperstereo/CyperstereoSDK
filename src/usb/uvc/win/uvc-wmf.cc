@@ -50,6 +50,7 @@
 #include <regex>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 #include <strsafe.h>
 
@@ -145,6 +146,15 @@ static std::string win_to_utf(const WCHAR *s) {
   std::string buffer(len - 1, ' ');
   len = WideCharToMultiByte(CP_UTF8, 0, s, -1, &buffer[0], (int)buffer.size()+1, NULL, NULL);
   if (len == 0) throw_error() << "WideCharToMultiByte(...) returned 0 and GetLastError() is " << GetLastError();
+  return buffer;
+}
+
+static std::wstring utf_to_win(const std::string &s) {
+  int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
+  if (len == 0) throw_error() << "MultiByteToWideChar(...) returned 0 and GetLastError() is " << GetLastError();
+  std::wstring buffer(len - 1, L' ');
+  len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &buffer[0], (int)buffer.size() + 1);
+  if (len == 0) throw_error() << "MultiByteToWideChar(...) returned 0 and GetLastError() is " << GetLastError();
   return buffer;
 }
 
@@ -298,6 +308,7 @@ struct device {
   int vid, pid;
   std::string unique_id;
   std::string name;
+  std::string serial_number;
 
   com_ptr<reader_callback> reader_callback;
   com_ptr<IMFActivate> mf_activate;
@@ -426,6 +437,72 @@ std::shared_ptr<context> create_context() {
   return std::make_shared<context>();
 }
 
+static std::string extract_serial_from_instance_id(const std::string &instance_id) {
+  auto pos = instance_id.rfind('\\');
+  if (pos == std::string::npos || pos + 1 >= instance_id.size()) return "";
+  return instance_id.substr(pos + 1);
+}
+
+static std::string query_serial_number_from_path(const std::string &device_path) {
+  // MF reports device paths prefixed with '@device:pnp:', but SetupDi calls expect
+  // the raw symbolic link path, so strip the prefix if it is present.
+  std::string normalized_path = device_path;
+  const std::string pnp_prefix = "@device:pnp:";
+  if (normalized_path.compare(0, pnp_prefix.size(), pnp_prefix) == 0) {
+    normalized_path = normalized_path.substr(pnp_prefix.size());
+  }
+
+  HDEVINFO dev_info = SetupDiCreateDeviceInfoList(NULL, NULL);
+  if (dev_info == INVALID_HANDLE_VALUE) return "";
+
+  SP_DEVICE_INTERFACE_DATA if_data;
+  ZeroMemory(&if_data, sizeof(if_data));
+  if_data.cbSize = sizeof(if_data);
+
+  auto wide_path = utf_to_win(normalized_path);
+  if (!SetupDiOpenDeviceInterfaceW(dev_info, wide_path.c_str(), 0, &if_data)) {
+    SetupDiDestroyDeviceInfoList(dev_info);
+    return "";
+  }
+
+  DWORD required_size = 0;
+  SetupDiGetDeviceInterfaceDetailW(dev_info, &if_data, NULL, 0, &required_size, NULL);
+  if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || required_size == 0) {
+    SetupDiDestroyDeviceInfoList(dev_info);
+    return "";
+  }
+
+  std::vector<BYTE> buffer(required_size);
+  auto detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buffer.data());
+  detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+  SP_DEVINFO_DATA dev_data;
+  ZeroMemory(&dev_data, sizeof(dev_data));
+  dev_data.cbSize = sizeof(dev_data);
+
+  if (!SetupDiGetDeviceInterfaceDetailW(dev_info, &if_data, detail, required_size, NULL, &dev_data)) {
+    SetupDiDestroyDeviceInfoList(dev_info);
+    return "";
+  }
+
+  WCHAR instance_id[MAX_DEVICE_ID_LEN];
+  std::string serial;
+  DEVINST parent_dev = 0;
+  if (CM_Get_Parent(&parent_dev, dev_data.DevInst, 0) == CR_SUCCESS) {
+    if (CM_Get_Device_IDW(parent_dev, instance_id, MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS) {
+      serial = extract_serial_from_instance_id(win_to_utf(instance_id));
+    }
+  }
+
+  if (serial.empty()) {
+    if (CM_Get_Device_IDW(dev_data.DevInst, instance_id, MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS) {
+      serial = extract_serial_from_instance_id(win_to_utf(instance_id));
+    }
+  }
+
+  SetupDiDestroyDeviceInfoList(dev_info);
+  return serial;
+}
+
 std::vector<std::shared_ptr<device>> query_devices(std::shared_ptr<context> context) {
   IMFAttributes *pAttributes = NULL;
   check("MFCreateAttributes", MFCreateAttributes(&pAttributes, 1));
@@ -478,6 +555,7 @@ std::vector<std::shared_ptr<device>> query_devices(std::shared_ptr<context> cont
     dev->mf_activate = pDevice;
     dev->vid = vid;
     dev->pid = pid;
+    dev->serial_number = query_serial_number_from_path(dev_name);
   }
 
   CoTaskMemFree(ppDevices);
@@ -494,6 +572,10 @@ int get_product_id(const device &device) {
 
 std::string get_name(const device &device) {
   return device.name;
+}
+
+std::string get_serial_number(const device &device) {
+  return device.serial_number;
 }
 
 std::string get_video_name(const device &device) {
