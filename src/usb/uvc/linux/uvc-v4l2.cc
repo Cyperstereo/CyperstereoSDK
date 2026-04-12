@@ -175,7 +175,7 @@ struct device {
                     << strerror(errno);
     }
 
-    v4l2_capability cap;
+    v4l2_capability cap{};
     if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
       if (errno == EINVAL)
         throw_error() << dev_name << " is no V4L2 device";
@@ -189,10 +189,10 @@ struct device {
       throw_error() << dev_name + " does not support streaming I/O";
 
     // Select video input, video standard and tune here.
-    v4l2_cropcap cropcap;
+    v4l2_cropcap cropcap{};
     cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (xioctl(fd, VIDIOC_CROPCAP, &cropcap) == 0) {
-      v4l2_crop crop;
+      v4l2_crop crop{};
       crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       crop.c = cropcap.defrect;  // reset to default
       if (xioctl(fd, VIDIOC_S_CROP, &crop) < 0) {
@@ -219,7 +219,7 @@ struct device {
 
   bool pu_control_range(
       uint32_t id, int32_t *min, int32_t *max, int32_t *def) const {
-    struct v4l2_queryctrl query;
+    struct v4l2_queryctrl query{};
     query.id = id;
     if (xioctl(fd, VIDIOC_QUERYCTRL, &query) < 0) {
       std::cout << "pu_control_range failed" << std::endl;
@@ -273,65 +273,87 @@ struct device {
       return;
     }
 
-    v4l2_format fmt;
+    v4l2_format fmt{};
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width = width;
     fmt.fmt.pix.height = height;
     fmt.fmt.pix.pixelformat = format;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
     // fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;
-    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
-      std::cout << "VIDIOC_S_FMT" << std::endl;
+    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+      std::cout << "VIDIOC_S_FMT failed: " << errno << ", "
+                << strerror(errno) << std::endl;
+      return;
+    }
 
-    v4l2_streamparm parm;
+    v4l2_streamparm parm{};
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (xioctl(fd, VIDIOC_G_PARM, &parm) < 0)
-      std::cout << "VIDIOC_G_PARM " << std::endl;
+    if (xioctl(fd, VIDIOC_G_PARM, &parm) < 0) {
+      std::cout << "VIDIOC_G_PARM failed: " << errno << ", "
+                << strerror(errno) << std::endl;
+      return;
+    }
     parm.parm.capture.timeperframe.numerator = 1;
     parm.parm.capture.timeperframe.denominator = fps;
-    if (xioctl(fd, VIDIOC_S_PARM, &parm) < 0)
-      std::cout << "VIDIOC_S_PARM" << std::endl;
+    if (xioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
+      std::cout << "VIDIOC_S_PARM failed: " << errno << ", "
+                << strerror(errno) << std::endl;
+      return;
+    }
 
     // Init memory mapped IO
-    v4l2_requestbuffers req;
+    v4l2_requestbuffers req{};
     req.count = 24;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
     if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-      if (errno == EINVAL)
+      if (errno == EINVAL) {
         std::cout << "does not support memory mapping " << std::endl;
-      else
-        std::cout << "VIDIOC_REQBUFS " << std::endl;
+      } else {
+        std::cout << "VIDIOC_REQBUFS failed: " << errno << ", "
+                  << strerror(errno) << std::endl;
+      }
+      return;
     }
     if (req.count < 2) {
       std::cout << "Insufficient buffer memory on " << std::endl;
+      return;
     }
 
     buffers.resize(req.count);
     for (size_t i = 0; i < buffers.size(); ++i) {
-      v4l2_buffer buf;
+      v4l2_buffer buf{};
       buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       buf.memory = V4L2_MEMORY_MMAP;
       buf.index = i;
-      if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0)
-        std::cout << "VIDIOC_QUERYBUF" << std::endl;
+      if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+        std::cout << "VIDIOC_QUERYBUF failed: " << errno << ", "
+                  << strerror(errno) << std::endl;
+        return;
+      }
 
       buffers[i].length = buf.length;
       buffers[i].start = mmap(
           NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
           buf.m.offset);
-      if (buffers[i].start == MAP_FAILED)
-        std::cout << "mmap" << std::endl;
+      if (buffers[i].start == MAP_FAILED) {
+        std::cout << "mmap failed: " << errno << ", " << strerror(errno)
+                  << std::endl;
+        return;
+      }
     }
 
     // Start capturing
     for (size_t i = 0; i < buffers.size(); ++i) {
-      v4l2_buffer buf;
+      v4l2_buffer buf{};
       buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       buf.memory = V4L2_MEMORY_MMAP;
       buf.index = i;
-      if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
-        std::cout << "VIDIOC_QBUF" << std::endl;
+      if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+        std::cout << "VIDIOC_QBUF failed: " << errno << ", "
+                  << strerror(errno) << std::endl;
+        return;
+      }
     }
 
     v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -343,8 +365,11 @@ struct device {
         return;
       }
     }
-    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0)
-      std::cout << "VIDIOC_STREAMON" << std::endl;
+    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+      std::cout << "VIDIOC_STREAMON failed: " << errno << ", "
+                << strerror(errno) << std::endl;
+      return;
+    }
     is_capturing = true;
   }
 
@@ -364,7 +389,7 @@ struct device {
     }
 
     // Close memory mapped IO
-    struct v4l2_requestbuffers req;
+    struct v4l2_requestbuffers req{};
     req.count = 0;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
@@ -392,7 +417,7 @@ struct device {
     }
 
     if (FD_ISSET(fd, &fds)) {
-      v4l2_buffer buf;
+      v4l2_buffer buf{};
       buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       buf.memory = V4L2_MEMORY_MMAP;
       if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
@@ -406,8 +431,13 @@ struct device {
             close(fd);
             fd = -1;
           }
-          return;
         }
+        return;
+      }
+
+      if (buf.index >= buffers.size()) {
+        std::cout << "VIDIOC_DQBUF invalid index " << buf.index << std::endl;
+        return;
       }
 
       if (callback) {
@@ -454,6 +484,10 @@ struct device {
     }
 
     start_capture();
+    if (!is_capturing) {
+      std::cout << " failed: start_capture did not succeed" << std::endl;
+      return;
+    }
 
     thread = std::thread([this]() {
       while (!stop)
