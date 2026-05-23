@@ -11,14 +11,14 @@ camera_name: camera
 image_width: 752
 image_height: 480
 projection_parameters:
-   k2: 0.09202048139495318
-   k3: 0.04589926195405795
-   k4: -0.02820754622080261
-   k5: 0.0035568127613466735
-   mu: 234.27613584875468
-   mv: 234.66446314015425
-   u0: 395.5301155067932
-   v0: 259.7726128077328
+   k2: 0.09423551523318084
+   k3: 0.02114654111564135
+   k4: 0.023111753378476006
+   k5: -0.02945823600334348
+   mu: 234.41399771320744
+   mv: 234.63169280686677
+   u0: 374.3781034097796
+   v0: 222.6642785307275
 
 # Extrinsic parameter between IMU and Camera.
 estimate_extrinsic: 0   # 0  Have an accurate extrinsic parameters. We will trust the following imu^R_cam, imu^T_cam, don't change it.
@@ -30,13 +30,12 @@ extrinsicRotation: !!opencv-matrix
    rows: 3
    cols: 3
    dt: d
-   data: [ -0.99996251, 0.00828459, 0.00251697,-0.0082806, -0.99996445, 0.00159314,0.00253007, 0.00157224, 0.99999556 ]
+   data: [-0.99999641, -0.00244770, 0.00108703, 0.00244058, -0.99997585, -0.00650786, 0.00110294, -0.00650518, 0.99997823]
 extrinsicTranslation: !!opencv-matrix
    rows: 3
    cols: 1
    dt: d
-   data: [ 0.13528204, 0.00309906,
-       0.0094992 ]
+   data: [0.05125453, 0.00118054, 0.01957265]
 
 #feature traker paprameters
 max_cnt: 250            # max feature number in feature tracking

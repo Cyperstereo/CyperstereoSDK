@@ -1,0 +1,2 @@
+#python3 generate_vinsfusion_config.py      --calib_txt kalibr标定文件 --vins_yaml vinsfuison总配置文件 --cam0_yaml 左目配置文件 --cam1_yaml 右目配置文件 
+python3 generate_vinsfusion_config.py      --calib_txt  '/home/han/bag/260512/m007/cyperstereo_imu_calibra-results-imucam.txt'      --vins_yaml  '/home/han/CyperstereoSDK/slam/config/vins-fusion/CyperStereo/cyperstereo_vins_fusion_config.yaml'      --cam0_yaml  '/home/han/CyperstereoSDK/slam/config/vins-fusion/CyperStereo/cam0_fisheye.yaml'      --cam1_yaml  '/home/han/CyperstereoSDK/slam/config/vins-fusion/CyperStereo/cam1_fisheye.yaml'
