@@ -24,7 +24,14 @@
 #include <array>
 #include <condition_variable>
 #include <thread>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 #include "../src/usb/uvc/cyperstereo_api.h"
+#include "../src/usb/uvc/tic_toc.h"
+#include "../src/usb/uvc/thread_priority.h"
 
 
 const double g = 9.7887;
@@ -53,40 +60,108 @@ std::mutex m_buf;
 std::condition_variable con;
 void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<std::pair<double, std::vector<cv::Mat>> > &image_data, std::queue<GnssRecord> &gnss_data);
 void DataFlow();
-void InputIMAGE(const double timestamp, const cv::Mat& cam0_img, const cv::Mat& cam1_img);
+void InputIMAGE(const double timestamp, const std::vector<cv::Mat>& images);
 void InputIMU(const double timestamp, double gyro_x, double gyro_y, double gyro_z, double acc_x, double acc_y, double acc_z);
 void InputGNSS(const cyperstereo::GNSSStreamData &gnss);
 
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+  _mkdir("left");
+  _mkdir("right");
+  _mkdir("left_front");
+  _mkdir("right_front");
+  _mkdir("imu");
+  _mkdir("gnss");
+#else
+  mkdir("left", 0755);
+  mkdir("right", 0755);
+  mkdir("left_front", 0755);
+  mkdir("right_front", 0755);
+  mkdir("imu", 0755);
+  mkdir("gnss", 0755);
+#endif
+  // We parallelise the per-camera work ourselves, so disable OpenCV's internal
+  // threading to avoid oversubscribing the cores.
+  cv::setNumThreads(1);
+  // Raise the main (capture) thread to real-time priority, just below the poll
+  // and worker threads. All priorities are configured in thread_priority.h.
+  cyperstereo::ApplyThreadPriority(cyperstereo::ThreadRole::kMain, "main");
   std::thread data_flow{DataFlow};
   std::shared_ptr<cyperstereo::uvc::device> cyperstereo_device{nullptr};
   if (!cyperstereo::FindCyperstereoDevices(cyperstereo_device)) {
     return 0;
   }
   cyperstereo::FrameInfo frame_info{};
+  // The USB serial number is a static device property, so read it once and use
+  // its prefix to auto-select the camera profile (MT9V034 vs SmartSens) before
+  // starting the stream; the profile drives resolution/fps and the per-frame
+  // deinterleave / metadata decode.
+  const std::string serial_num =
+      cyperstereo::uvc::get_serial_number(*cyperstereo_device);
+  const cyperstereo::CameraProfile &profile =
+      cyperstereo::SelectProfileBySerial(serial_num);
+  frame_info.Init(profile);
+  frame_info.framestream.serial_num = serial_num;
+  std::cout << "camera: " << profile.name << "  serial: " << serial_num << "  "
+            << profile.frame_width << "x" << profile.frame_height << "@"
+            << profile.fps << "  cameras: " << profile.num_cameras << std::endl;
+  const int num_cameras = profile.num_cameras;
   cyperstereo::uvc::set_device_mode(
-      *cyperstereo_device, 752, 480, static_cast<int>(cyperstereo::Format::YUYV), 60,
+      *cyperstereo_device, profile.frame_width, profile.frame_height,
+      static_cast<int>(cyperstereo::Format::YUYV), profile.fps,
       [&frame_info](const void *data, std::function<void()> continuation) {
         cyperstereo::SetStreamData(frame_info, data, continuation);
       });
   cyperstereo::uvc::start_streaming(*cyperstereo_device, 0);
+
+  // Persistent per-camera buffers, swapped with the framestream planes under
+  // the lock (O(1), like capture_image_imu) so the USB poll thread is never
+  // blocked while we copy pixels. The unused planes stay allocated but idle for
+  // the 2-camera (MT9V034) profile.
+  cv::Mat left_image(profile.frame_height, profile.cam_width, CV_8U);
+  cv::Mat right_image(profile.frame_height, profile.cam_width, CV_8U);
+  cv::Mat left_front_image(profile.frame_height, profile.cam_width, CV_8U);
+  cv::Mat right_front_image(profile.frame_height, profile.cam_width, CV_8U);
+
   while (true) {
     cyperstereo::WaitForStream(frame_info);
-    double image_timestamp = frame_info.framestream.image_timestamp;
-    cv::Mat left_image = frame_info.framestream.left_image;
-    cv::Mat right_image = frame_info.framestream.right_image;
-    InputIMAGE(image_timestamp, left_image, right_image);
-    for (int i = 0; i <= frame_info.framestream.imu.imu_count; ++i) {
-      InputIMU(frame_info.framestream.imu.imu_timestamp[i], frame_info.framestream.imu.gyro_x[i], frame_info.framestream.imu.gyro_y[i], frame_info.framestream.imu.gyro_z[i],
-                frame_info.framestream.imu.acc_x[i], frame_info.framestream.imu.acc_y[i], frame_info.framestream.imu.acc_z[i]);
+
+    double image_timestamp = 0.0;
+    cyperstereo::IMUStreamData imu_data{};
+    cyperstereo::GNSSStreamData gnss_data{};
+
+    {
+      std::lock_guard<std::mutex> lock(frame_info.mtx);
+      image_timestamp = frame_info.framestream.image_timestamp;
+      cv::swap(frame_info.framestream.left_image, left_image);
+      cv::swap(frame_info.framestream.right_image, right_image);
+      if (num_cameras >= 4) {
+        cv::swap(frame_info.framestream.left_front_image, left_front_image);
+        cv::swap(frame_info.framestream.right_front_image, right_front_image);
+      }
+      imu_data = frame_info.framestream.imu;
+      gnss_data = frame_info.framestream.gnss;
     }
-    const auto &gnss_stream = frame_info.framestream.gnss;
+
+    std::vector<cv::Mat> images;
+    images.push_back(left_image);
+    images.push_back(right_image);
+    if (num_cameras >= 4) {
+      images.push_back(left_front_image);
+      images.push_back(right_front_image);
+    }
+    InputIMAGE(image_timestamp, images);  // clones into the save queue
+    for (int i = 0; i < imu_data.imu_count; ++i) {
+      InputIMU(imu_data.imu_timestamp[i], imu_data.gyro_x[i], imu_data.gyro_y[i],
+               imu_data.gyro_z[i], imu_data.acc_x[i], imu_data.acc_y[i],
+               imu_data.acc_z[i]);
+    }
     static std::string last_gnss_time;
-    if (!gnss_stream.gnss_utc_time.empty() && gnss_stream.valid == true && gnss_stream.gnss_utc_time != last_gnss_time) {
-      InputGNSS(gnss_stream);
-      last_gnss_time = gnss_stream.gnss_utc_time;
+    if (!gnss_data.gnss_utc_time.empty() && gnss_data.valid == true &&
+        gnss_data.gnss_utc_time != last_gnss_time) {
+      InputGNSS(gnss_data);
+      last_gnss_time = gnss_data.gnss_utc_time;
     }
-    
   }
   cyperstereo::uvc::stop_streaming(*cyperstereo_device);
   
@@ -122,18 +197,28 @@ void InputGNSS(const cyperstereo::GNSSStreamData &gnss) {
 }
 
 
-void InputIMAGE(const double timestamp, const cv::Mat& cam0_img, const cv::Mat& cam1_img) {
+void InputIMAGE(const double timestamp, const std::vector<cv::Mat>& images) {
     m_buf.lock();
     std::vector<cv::Mat> image_data;
-    image_data.push_back(cam0_img.clone());
-    image_data.push_back(cam1_img.clone());
+    image_data.reserve(images.size());
+    for (const auto &img : images) {
+      image_data.push_back(img.clone());
+    }
     IMAGE.push(make_pair(timestamp, image_data));
     m_buf.unlock();
     con.notify_one();
 }
 
 void DataFlow() {
+  // This thread does the heavy per-camera work (WB + demosaic + PNG encode),
+  // so run it at real-time worker priority (configured in thread_priority.h).
+  cyperstereo::ApplyThreadPriority(cyperstereo::ThreadRole::kWorker, "dataflow");
+
   int count = 0;
+  // Pre-allocated demosaic output buffers for the 4-camera (SmartSens) path,
+  // reused every processed frame to avoid reallocating on the hot path. Sized
+  // lazily on first use so the same binary works for either camera profile.
+  cv::Mat left_color, right_color, left_front_color, right_front_color;
   while (true) {
       std::queue<std::pair<double, std::array<double, 6>> > imu_data;
       std::queue<std::pair<double, std::vector<cv::Mat>> > image_data;
@@ -193,19 +278,44 @@ void DataFlow() {
       }
       while (!image_data.empty()) {
         double image_timestamp = image_data.front().first;
-        cv::Mat left_image = image_data.front().second[0];
-        cv::Mat right_image = image_data.front().second[1];
-        if (!left_image.empty() && !right_image.empty()) {
-         // std::cout << "image_timestamp " << image_timestamp << std::endl;
-          // TicToc tf;
-          // float eps = 0.0001;//eps的取值很关键（乘于255的平方）
-          // cv::Mat left_image_res = FastGuidedfilter(left_image, 9, eps, 3);
-          // cv::Mat right_image_res = FastGuidedfilter(right_image, 9, eps, 3);
-          // double tic2 = static_cast<double>(cv::getTickCount());
-          // std::cout <<tf.toc() << std::endl;
-          if (count % 2 != 0) {         
-            cv::imwrite("./left/" + std::to_string(static_cast<int>(image_timestamp * 10000)) + ".png", left_image);
-            cv::imwrite("./right/" + std::to_string(static_cast<int>(image_timestamp * 10000)) + ".png", right_image);
+        const std::vector<cv::Mat> &imgs = image_data.front().second;
+        const size_t n = imgs.size();
+        // 4-camera (SmartSens) path: RAW Bayer -> white balance + demosaic, save
+        // as colour. 2-camera (MT9V034) path: monochrome, saved as-is.
+        const bool four_ok =
+            n >= 4 && !imgs[0].empty() && !imgs[1].empty() &&
+            !imgs[2].empty() && !imgs[3].empty();
+        const bool two_ok =
+            n >= 2 && !imgs[0].empty() && !imgs[1].empty();
+        if (four_ok) {
+          if (count % 3 == 0) {
+            cv::Mat left_image = imgs[0];
+            cv::Mat right_image = imgs[1];
+            cv::Mat left_front_image = imgs[2];
+            cv::Mat right_front_image = imgs[3];
+            
+            static WhiteBalance wb1, wb2, wb3, wb4;
+            std::thread t2([&] { ApplyISP(right_image, right_color, wb2, "wb-cam2"); });
+            std::thread t3([&] { ApplyISP(left_front_image, left_front_color, wb3, "wb-cam3"); });
+            std::thread t4([&] { ApplyISP(right_front_image, right_front_color, wb4, "wb-cam4"); });
+            ApplyISP(left_image, left_color, wb1, "wb-cam1");
+            t2.join();
+            t3.join();
+            t4.join();
+
+            const std::string image_name = std::to_string(static_cast<int>(image_timestamp * 10000)) + ".png";
+            cv::imwrite("./left/" + image_name, left_color);
+            cv::imwrite("./right/" + image_name, right_color);
+            cv::imwrite("./left_front/" + image_name, left_front_color);
+            cv::imwrite("./right_front/" + image_name, right_front_color);
+          }
+          count++;
+        } else if (two_ok) {
+          if (count % 3 == 0) {
+            // MT9V034 is monochrome: save the two raw planes directly.
+            const std::string image_name = std::to_string(static_cast<int>(image_timestamp * 10000)) + ".png";
+            cv::imwrite("./left/" + image_name, imgs[0]);
+            cv::imwrite("./right/" + image_name, imgs[1]);
           }
           count++;
         }

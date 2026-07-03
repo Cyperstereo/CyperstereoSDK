@@ -70,9 +70,11 @@ struct device;   // Opaque type representing access to a specific UVC device
  std::string get_name(const device &device);
  int get_vendor_id(const device &device);
  int get_product_id(const device &device);
- std::string get_serial_number(const device &device);
 
  std::string get_video_name(const device &device);
+
+ // USB device serial number (empty string if unavailable).
+ std::string get_serial_number(const device &device);
 
 // Access PU (Processing Unit) controls
 inline bool is_pu_control(Option option) {

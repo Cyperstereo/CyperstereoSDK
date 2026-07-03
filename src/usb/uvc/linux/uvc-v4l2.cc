@@ -15,6 +15,7 @@
 #define CYPERSTEREO_UVC_V4L2_H_
 
 #include "../uvc.h"
+#include "../thread_priority.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -43,8 +44,22 @@ CYPERSTEREO_BEGIN_NAMESPACE
 
 namespace uvc {
 
-#define NO_DATA_MAX_COUNT 200
+// select() timeout (microseconds).  A larger window reduces busy-looping and
+// avoids false "no data" judgments when the system is briefly loaded; 100ms
+// keeps the polling thread responsive while not burning CPU.
+#define UVC_V4L2_SELECT_TIMEOUT_US 100000
+
+// How many consecutive select() timeouts (with no dequeued frame) are tolerated
+// before declaring a stream timeout.  Combined with the timeout above this
+// yields roughly the same ~2s window as the previous 200 * 10ms scheme.
+#define NO_DATA_MAX_COUNT 20
 #define LIVING_MAX_COUNT 9000
+
+// Number of V4L2 (kernel) capture buffers.  A deeper queue lets the kernel keep
+// DMA'ing while the user thread is briefly preempted, and rides out short
+// bursts of USB errors.  This is harmless headroom; it does NOT fix transfer
+// errors (e.g. -EPROTO/-71) that originate at the USB/controller layer.
+#define UVC_V4L2_BUFFER_COUNT 32
 
 
 struct throw_error {
@@ -76,6 +91,9 @@ static int xioctl(int fh, int request, void *arg) {
   return r;
 }
 
+// Read the USB device serial number from sysfs. V4L2 exposes the video node
+// under /sys/class/video4linux/<name>/device, whose parent (the USB interface)
+// or grandparent (the USB device) carries the "serial" attribute.
 static std::string read_serial_number(const std::string &video_device) {
   const std::string base =
       "/sys/class/video4linux/" + video_device + "/device";
@@ -175,7 +193,7 @@ struct device {
                     << strerror(errno);
     }
 
-    v4l2_capability cap{};
+    v4l2_capability cap;
     if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
       if (errno == EINVAL)
         throw_error() << dev_name << " is no V4L2 device";
@@ -189,10 +207,10 @@ struct device {
       throw_error() << dev_name + " does not support streaming I/O";
 
     // Select video input, video standard and tune here.
-    v4l2_cropcap cropcap{};
+    v4l2_cropcap cropcap;
     cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (xioctl(fd, VIDIOC_CROPCAP, &cropcap) == 0) {
-      v4l2_crop crop{};
+      v4l2_crop crop;
       crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       crop.c = cropcap.defrect;  // reset to default
       if (xioctl(fd, VIDIOC_S_CROP, &crop) < 0) {
@@ -219,7 +237,7 @@ struct device {
 
   bool pu_control_range(
       uint32_t id, int32_t *min, int32_t *max, int32_t *def) const {
-    struct v4l2_queryctrl query{};
+    struct v4l2_queryctrl query;
     query.id = id;
     if (xioctl(fd, VIDIOC_QUERYCTRL, &query) < 0) {
       std::cout << "pu_control_range failed" << std::endl;
@@ -273,87 +291,65 @@ struct device {
       return;
     }
 
-    v4l2_format fmt{};
+    v4l2_format fmt;
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width = width;
     fmt.fmt.pix.height = height;
     fmt.fmt.pix.pixelformat = format;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
     // fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;
-    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-      std::cout << "VIDIOC_S_FMT failed: " << errno << ", "
-                << strerror(errno) << std::endl;
-      return;
-    }
+    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
+      std::cout << "VIDIOC_S_FMT" << std::endl;
 
-    v4l2_streamparm parm{};
+    v4l2_streamparm parm;
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (xioctl(fd, VIDIOC_G_PARM, &parm) < 0) {
-      std::cout << "VIDIOC_G_PARM failed: " << errno << ", "
-                << strerror(errno) << std::endl;
-      return;
-    }
+    if (xioctl(fd, VIDIOC_G_PARM, &parm) < 0)
+      std::cout << "VIDIOC_G_PARM " << std::endl;
     parm.parm.capture.timeperframe.numerator = 1;
     parm.parm.capture.timeperframe.denominator = fps;
-    if (xioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
-      std::cout << "VIDIOC_S_PARM failed: " << errno << ", "
-                << strerror(errno) << std::endl;
-      return;
-    }
+    if (xioctl(fd, VIDIOC_S_PARM, &parm) < 0)
+      std::cout << "VIDIOC_S_PARM" << std::endl;
 
     // Init memory mapped IO
-    v4l2_requestbuffers req{};
-    req.count = 24;
+    v4l2_requestbuffers req;
+    req.count = UVC_V4L2_BUFFER_COUNT;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
     if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-      if (errno == EINVAL) {
+      if (errno == EINVAL)
         std::cout << "does not support memory mapping " << std::endl;
-      } else {
-        std::cout << "VIDIOC_REQBUFS failed: " << errno << ", "
-                  << strerror(errno) << std::endl;
-      }
-      return;
+      else
+        std::cout << "VIDIOC_REQBUFS " << std::endl;
     }
     if (req.count < 2) {
       std::cout << "Insufficient buffer memory on " << std::endl;
-      return;
     }
 
     buffers.resize(req.count);
     for (size_t i = 0; i < buffers.size(); ++i) {
-      v4l2_buffer buf{};
+      v4l2_buffer buf;
       buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       buf.memory = V4L2_MEMORY_MMAP;
       buf.index = i;
-      if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
-        std::cout << "VIDIOC_QUERYBUF failed: " << errno << ", "
-                  << strerror(errno) << std::endl;
-        return;
-      }
+      if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0)
+        std::cout << "VIDIOC_QUERYBUF" << std::endl;
 
       buffers[i].length = buf.length;
       buffers[i].start = mmap(
           NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
           buf.m.offset);
-      if (buffers[i].start == MAP_FAILED) {
-        std::cout << "mmap failed: " << errno << ", " << strerror(errno)
-                  << std::endl;
-        return;
-      }
+      if (buffers[i].start == MAP_FAILED)
+        std::cout << "mmap" << std::endl;
     }
 
     // Start capturing
     for (size_t i = 0; i < buffers.size(); ++i) {
-      v4l2_buffer buf{};
+      v4l2_buffer buf;
       buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       buf.memory = V4L2_MEMORY_MMAP;
       buf.index = i;
-      if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-        std::cout << "VIDIOC_QBUF failed: " << errno << ", "
-                  << strerror(errno) << std::endl;
-        return;
-      }
+      if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
+        std::cout << "VIDIOC_QBUF" << std::endl;
     }
 
     v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -365,11 +361,8 @@ struct device {
         return;
       }
     }
-    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
-      std::cout << "VIDIOC_STREAMON failed: " << errno << ", "
-                << strerror(errno) << std::endl;
-      return;
-    }
+    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0)
+      std::cout << "VIDIOC_STREAMON" << std::endl;
     is_capturing = true;
   }
 
@@ -389,7 +382,7 @@ struct device {
     }
 
     // Close memory mapped IO
-    struct v4l2_requestbuffers req{};
+    struct v4l2_requestbuffers req;
     req.count = 0;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
@@ -404,40 +397,40 @@ struct device {
   }
 
   void poll() {
+    // Bail out early if the device has been closed (e.g. during a soft
+    // restart triggered by stop_capture()/start_capture()).  Continuing to
+    // select() on a stale/closed fd reports EBADF and would falsely inflate
+    // no_data_count, producing spurious "stream time out" warnings during the
+    // restart transition.
+    if (fd == -1 || !is_capturing) {
+      no_data_count = 0;
+      return;
+    }
+
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(fd, &fds);
 
-    struct timeval tv = {0, 10000};
+    struct timeval tv = {0, UVC_V4L2_SELECT_TIMEOUT_US};
 
     if (select(fd + 1, &fds, NULL, NULL, &tv) < 0) {
       if (errno == EINTR)
+        return;
+      // fd may have just been closed by stop_capture(); don't treat this as a
+      // stream stall, just exit this iteration quietly.
+      if (errno == EBADF)
         return;
       std::cout << "select" << std::endl;
     }
 
     if (FD_ISSET(fd, &fds)) {
-      v4l2_buffer buf{};
+      v4l2_buffer buf;
       buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
       buf.memory = V4L2_MEMORY_MMAP;
       if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
         if (errno == EAGAIN)
           return;
         std::cout << "VIDIOC_DQBUF" << std::endl;
-        if (errno == ENODEV || errno == EIO) {  // device removed or I/O error
-          stop = true;
-          stop_capture();
-          if (fd != -1) {
-            close(fd);
-            fd = -1;
-          }
-        }
-        return;
-      }
-
-      if (buf.index >= buffers.size()) {
-        std::cout << "VIDIOC_DQBUF invalid index " << buf.index << std::endl;
-        return;
       }
 
       if (callback) {
@@ -484,12 +477,10 @@ struct device {
     }
 
     start_capture();
-    if (!is_capturing) {
-      std::cout << " failed: start_capture did not succeed" << std::endl;
-      return;
-    }
 
     thread = std::thread([this]() {
+      // Highest priority: a late dequeue means a permanently dropped frame.
+      ApplyThreadPriority(ThreadRole::kPoll, "uvc-poll");
       while (!stop)
         poll();
     });
@@ -557,12 +548,12 @@ int get_product_id(const device &device) {
   return device.pid;
 }
 
-std::string get_serial_number(const device &device) {
-  return device.serial_number;
-}
-
 std::string get_video_name(const device &device) {
   return device.dev_name;
+}
+
+std::string get_serial_number(const device &device) {
+  return device.serial_number;
 }
 
 static uint32_t get_cid(Option option) {

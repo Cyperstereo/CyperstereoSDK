@@ -50,7 +50,6 @@
 #include <regex>
 #include <sstream>
 #include <thread>
-#include <vector>
 
 #include <strsafe.h>
 
@@ -146,15 +145,6 @@ static std::string win_to_utf(const WCHAR *s) {
   std::string buffer(len - 1, ' ');
   len = WideCharToMultiByte(CP_UTF8, 0, s, -1, &buffer[0], (int)buffer.size()+1, NULL, NULL);
   if (len == 0) throw_error() << "WideCharToMultiByte(...) returned 0 and GetLastError() is " << GetLastError();
-  return buffer;
-}
-
-static std::wstring utf_to_win(const std::string &s) {
-  int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
-  if (len == 0) throw_error() << "MultiByteToWideChar(...) returned 0 and GetLastError() is " << GetLastError();
-  std::wstring buffer(len - 1, L' ');
-  len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &buffer[0], (int)buffer.size() + 1);
-  if (len == 0) throw_error() << "MultiByteToWideChar(...) returned 0 and GetLastError() is " << GetLastError();
   return buffer;
 }
 
@@ -308,7 +298,6 @@ struct device {
   int vid, pid;
   std::string unique_id;
   std::string name;
-  std::string serial_number;
 
   com_ptr<reader_callback> reader_callback;
   com_ptr<IMFActivate> mf_activate;
@@ -402,12 +391,62 @@ struct device {
 
 HRESULT reader_callback::OnReadSample(HRESULT hrStatus, DWORD dwStreamIndex, DWORD dwStreamFlags, LONGLONG llTimestamp, IMFSample *sample) {
   if (auto owner_ptr = owner.lock()) {
+    // ---- USB/transfer integrity check (candidate (1): detect dropped /
+    // corrupted frames at the transfer layer and log them).  The configured
+    // stream is 2560x1024 YUYV (2 bytes/pixel), so one complete frame is
+    // exactly kExpectedFrameBytes.  A USB dropout shows up as: a failed read
+    // status, an MF stream ERROR/STREAMTICK flag, a per-sample "discontinuity"
+    // attribute, or a short buffer.  Any of these means this frame is (partly)
+    // garbage -> the "snowy top stripes" the user sees.
+    static const DWORD kExpectedFrameBytes = 2560u * 1024u * 2u;
+    static unsigned long long s_frame_count = 0;
+    static unsigned long long s_corrupt_count = 0;
+    const unsigned long long this_frame = s_frame_count;
+
+    if (FAILED(hrStatus)) {
+      std::cout << "[FRAME-CORRUPT] frame#" << this_frame
+                << " OnReadSample failed, hrStatus=0x" << std::hex << (uint32_t)hrStatus
+                << std::dec << std::endl;
+    }
+    if (dwStreamFlags & MF_SOURCE_READERF_ERROR) {
+      std::cout << "[FRAME-CORRUPT] frame#" << this_frame
+                << " MF_SOURCE_READERF_ERROR (stream error)" << std::endl;
+    }
+    if (dwStreamFlags & MF_SOURCE_READERF_STREAMTICK) {
+      std::cout << "[FRAME-CORRUPT] frame#" << this_frame
+                << " MF_SOURCE_READERF_STREAMTICK (stream gap / missing data)" << std::endl;
+    }
+
     if (sample) {
+      ++s_frame_count;
+      bool frame_bad = (dwStreamFlags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_STREAMTICK)) != 0;
+
+      // A discontinuity flag means data was dropped upstream before this sample.
+      UINT32 discontinuity = 0;
+      if (SUCCEEDED(sample->GetUINT32(MFSampleExtension_Discontinuity, &discontinuity)) && discontinuity) {
+        std::cout << "[FRAME-CORRUPT] frame#" << s_frame_count
+                  << " sample discontinuity (data dropped upstream / USB)" << std::endl;
+        frame_bad = true;
+      }
+
       com_ptr<IMFMediaBuffer> buffer = NULL;
       if (SUCCEEDED(sample->GetBufferByIndex(0, &buffer))) {
         BYTE *byte_buffer;
         DWORD max_length, current_length;
         if (SUCCEEDED(buffer->Lock(&byte_buffer, &max_length, &current_length))) {
+          if (current_length != kExpectedFrameBytes) {
+            std::cout << "[FRAME-CORRUPT] frame#" << s_frame_count
+                      << " size mismatch: got " << current_length
+                      << " B, expected " << kExpectedFrameBytes
+                      << " B (USB transfer dropout / partial frame)" << std::endl;
+            frame_bad = true;
+          }
+          if (frame_bad) {
+            ++s_corrupt_count;
+            std::cout << "[FRAME-CORRUPT] frame#" << s_frame_count
+                      << " <-- corrupted frame (total corrupt so far: "
+                      << s_corrupt_count << ")" << std::endl;
+          }
           auto continuation = [buffer, this]() {
             buffer->Unlock();
           };
@@ -435,72 +474,6 @@ HRESULT reader_callback::OnReadSample(HRESULT hrStatus, DWORD dwStreamIndex, DWO
 
 std::shared_ptr<context> create_context() {
   return std::make_shared<context>();
-}
-
-static std::string extract_serial_from_instance_id(const std::string &instance_id) {
-  auto pos = instance_id.rfind('\\');
-  if (pos == std::string::npos || pos + 1 >= instance_id.size()) return "";
-  return instance_id.substr(pos + 1);
-}
-
-static std::string query_serial_number_from_path(const std::string &device_path) {
-  // MF reports device paths prefixed with '@device:pnp:', but SetupDi calls expect
-  // the raw symbolic link path, so strip the prefix if it is present.
-  std::string normalized_path = device_path;
-  const std::string pnp_prefix = "@device:pnp:";
-  if (normalized_path.compare(0, pnp_prefix.size(), pnp_prefix) == 0) {
-    normalized_path = normalized_path.substr(pnp_prefix.size());
-  }
-
-  HDEVINFO dev_info = SetupDiCreateDeviceInfoList(NULL, NULL);
-  if (dev_info == INVALID_HANDLE_VALUE) return "";
-
-  SP_DEVICE_INTERFACE_DATA if_data;
-  ZeroMemory(&if_data, sizeof(if_data));
-  if_data.cbSize = sizeof(if_data);
-
-  auto wide_path = utf_to_win(normalized_path);
-  if (!SetupDiOpenDeviceInterfaceW(dev_info, wide_path.c_str(), 0, &if_data)) {
-    SetupDiDestroyDeviceInfoList(dev_info);
-    return "";
-  }
-
-  DWORD required_size = 0;
-  SetupDiGetDeviceInterfaceDetailW(dev_info, &if_data, NULL, 0, &required_size, NULL);
-  if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || required_size == 0) {
-    SetupDiDestroyDeviceInfoList(dev_info);
-    return "";
-  }
-
-  std::vector<BYTE> buffer(required_size);
-  auto detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buffer.data());
-  detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-  SP_DEVINFO_DATA dev_data;
-  ZeroMemory(&dev_data, sizeof(dev_data));
-  dev_data.cbSize = sizeof(dev_data);
-
-  if (!SetupDiGetDeviceInterfaceDetailW(dev_info, &if_data, detail, required_size, NULL, &dev_data)) {
-    SetupDiDestroyDeviceInfoList(dev_info);
-    return "";
-  }
-
-  WCHAR instance_id[MAX_DEVICE_ID_LEN];
-  std::string serial;
-  DEVINST parent_dev = 0;
-  if (CM_Get_Parent(&parent_dev, dev_data.DevInst, 0) == CR_SUCCESS) {
-    if (CM_Get_Device_IDW(parent_dev, instance_id, MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS) {
-      serial = extract_serial_from_instance_id(win_to_utf(instance_id));
-    }
-  }
-
-  if (serial.empty()) {
-    if (CM_Get_Device_IDW(dev_data.DevInst, instance_id, MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS) {
-      serial = extract_serial_from_instance_id(win_to_utf(instance_id));
-    }
-  }
-
-  SetupDiDestroyDeviceInfoList(dev_info);
-  return serial;
 }
 
 std::vector<std::shared_ptr<device>> query_devices(std::shared_ptr<context> context) {
@@ -555,7 +528,6 @@ std::vector<std::shared_ptr<device>> query_devices(std::shared_ptr<context> cont
     dev->mf_activate = pDevice;
     dev->vid = vid;
     dev->pid = pid;
-    dev->serial_number = query_serial_number_from_path(dev_name);
   }
 
   CoTaskMemFree(ppDevices);
@@ -574,12 +546,13 @@ std::string get_name(const device &device) {
   return device.name;
 }
 
-std::string get_serial_number(const device &device) {
-  return device.serial_number;
-}
-
 std::string get_video_name(const device &device) {
   return device.name;
+}
+
+std::string get_serial_number(const device &device) {
+  // Not read on this backend yet.
+  return "";
 }
 
 static long get_cid(Option option) {

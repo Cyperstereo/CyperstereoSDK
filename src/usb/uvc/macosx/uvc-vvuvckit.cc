@@ -305,6 +305,11 @@ MYNTEYE_API std::string get_video_name(const device &device) {
   return device.get_video_name();
 }
 
+MYNTEYE_API std::string get_serial_number(const device &device) {
+  // Not read on this backend yet.
+  return "";
+}
+
 MYNTEYE_API bool pu_control_range(
     const device &device, Option option, int32_t *min, int32_t *max,
     int32_t *def) {
