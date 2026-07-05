@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include "string"
@@ -30,6 +31,21 @@ CYPERSTEREO_USE_NAMESPACE
 
 int main(int argc, char *argv[]) {
   cv::setNumThreads(1);
+
+  // --no-display: skip all imshow/GUI work. The preview path (X11/GTK) can
+  // block the consumer loop for tens of ms (much worse over SSH X-forwarding);
+  // when the pipeline falls behind, the camera's FX3 firmware overruns its
+  // internal FIFO and the stream stalls ("v4l2 get stream time out").
+  bool show_preview = true;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--no-display")
+      show_preview = false;
+  }
+  if (show_preview && std::getenv("DISPLAY") == nullptr) {
+    std::cout << "[gui] DISPLAY not set, disabling preview (use X forwarding "
+                 "or a local session to enable)" << std::endl;
+    show_preview = false;
+  }
   
   // camera config init
   std::shared_ptr<cyperstereo::uvc::device> cyperstereo_device{nullptr};
@@ -72,8 +88,7 @@ int main(int argc, char *argv[]) {
 
   //imshow windows init
   constexpr int kShowEvery = 5;
-  {
-    const bool kShowPreview = true;
+  if (show_preview) {
     const int win_w = profile.cam_width * 3 / 4.0;
     const int win_h = profile.frame_height * 3 / 4.0;
     const char *wins[4] = {"image1", "image2", "image3", "image4"};
@@ -118,26 +133,26 @@ int main(int argc, char *argv[]) {
       t4.join();
       //std::cout << "proc(wb+cvt) " << proc.toc() << std::endl;
       
-      if (count % kShowEvery == 0) {
+      /*if (show_preview && count % kShowEvery == 0) {
         cv::imshow("image1", left_color);
         cv::imshow("image2", right_color);
         cv::imshow("image3", left_front_color);
         cv::imshow("image4", right_front_color);
         cv::waitKey(1);
-      }
+      }*/
     }
     else
     {
       // MT9V034 is monochrome (no Bayer): display the two raw planes directly.
-      if (count % kShowEvery == 0) {
+      /*if (show_preview && count % kShowEvery == 0) {
         cv::imshow("image1", left_image);
         cv::imshow("image2", right_image);
         cv::waitKey(1);
-      }
+      }*/
     }
 
     // Image timestamp + IMU samples, printed every frame (no count%2 gate).
-    std::cout << std::fixed << std::setprecision(6)
+    /*std::cout << std::fixed << std::setprecision(6)
               << "[meta] image_ts=" << image_timestamp
               << "  imu_n=" << imu_data.imu_count << std::endl;
     if (imu_data.imu_count > 0) {
@@ -151,7 +166,7 @@ int main(int argc, char *argv[]) {
                   << imu_data.gyro_y[i] << "," << imu_data.gyro_z[i] << ")"
                   << "  T[" << i << "]=" << imu_data.temperature[i] << std::endl;
       }
-    }
+    }*/
 
     // GNSS: print valid, non-duplicate records, every frame.
     if (gnss_data.valid && !gnss_data.gnss_utc_time.empty()) {

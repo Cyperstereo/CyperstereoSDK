@@ -50,9 +50,10 @@ namespace uvc {
 #define UVC_V4L2_SELECT_TIMEOUT_US 100000
 
 // How many consecutive select() timeouts (with no dequeued frame) are tolerated
-// before declaring a stream timeout.  Combined with the timeout above this
-// yields roughly the same ~2s window as the previous 200 * 10ms scheme.
-#define NO_DATA_MAX_COUNT 20
+// before declaring a stream timeout.  5 * 100ms = 0.5s: a healthy 30fps stream
+// never goes silent for 500ms, so this cannot false-positive, and it cuts the
+// outage from ~2.3s (old 2s window) to ~0.8s including the restart itself.
+#define NO_DATA_MAX_COUNT 5
 #define LIVING_MAX_COUNT 9000
 
 // Number of V4L2 (kernel) capture buffers.  A deeper queue lets the kernel keep
@@ -149,6 +150,61 @@ struct device {
   int no_data_count = 0;
   int living_count = 0;
   std::atomic<bool> stop{false};
+
+  // --- stall diagnostics -----------------------------------------------------
+  // Collected per-frame so that when a "stream time out" fires we can tell
+  // WHERE the pipeline broke:
+  //   - poll gap large  -> this (capture) thread was starved of CPU
+  //                        (host overload / scheduling problem)
+  //   - callback slow   -> consumer side too slow (SetStreamData / main-thread
+  //                        mutex contention backing up into the poll thread)
+  //   - both small      -> frames simply stopped arriving from the device
+  //                        (USB link / FX3 / FPGA side; check dmesg for EPROTO)
+  using diag_clock = std::chrono::steady_clock;
+  diag_clock::time_point last_dqbuf_time{};    // last successful VIDIOC_DQBUF
+  diag_clock::time_point last_poll_time{};     // previous poll() entry
+  double max_poll_gap_ms = 0;    // worst poll-loop starvation since last report
+  double max_cb_ms = 0;          // worst callback (consumer) time
+  double max_frame_gap_ms = 0;   // worst inter-frame arrival gap
+  uint64_t diag_frames = 0;
+
+  static double ms_between(diag_clock::time_point a, diag_clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  }
+
+  void print_stall_diagnosis() {
+    const auto now = diag_clock::now();
+    const double since_last_frame =
+        last_dqbuf_time.time_since_epoch().count() == 0
+            ? -1.0 : ms_between(last_dqbuf_time, now);
+
+    double load1 = -1.0;
+    std::ifstream la("/proc/loadavg");
+    if (la) la >> load1;
+
+    std::cout << "[stall-diag] last_frame_age=" << since_last_frame << "ms"
+              << "  max_poll_gap=" << max_poll_gap_ms << "ms"
+              << "  max_callback=" << max_cb_ms << "ms"
+              << "  max_frame_gap=" << max_frame_gap_ms << "ms"
+              << "  frames_since_last_report=" << diag_frames
+              << "  loadavg1m=" << load1 << std::endl;
+
+    // One-line verdict. Thresholds: the poll loop normally iterates every
+    // <=100ms (select timeout) and a 30fps frame arrives every ~33ms.
+    if (max_poll_gap_ms > 300.0) {
+      std::cout << "[stall-diag] verdict: capture thread was STARVED of CPU "
+                   "(host overload) - check system load / RT priority" << std::endl;
+    } else if (max_cb_ms > 100.0) {
+      std::cout << "[stall-diag] verdict: consumer callback too SLOW "
+                   "(main-thread/processing backlog stalled the poll thread)" << std::endl;
+    } else {
+      std::cout << "[stall-diag] verdict: host side healthy - device STOPPED "
+                   "sending (USB link/FX3/FPGA; check `dmesg | grep -i uvc` "
+                   "for EPROTO -71)" << std::endl;
+    }
+    max_poll_gap_ms = max_cb_ms = max_frame_gap_ms = 0;
+    diag_frames = 0;
+  }
   
 
   device(std::shared_ptr<context> parent, const std::string &name)
@@ -407,6 +463,22 @@ struct device {
       return;
     }
 
+    // Poll-loop starvation detector: consecutive poll() entries are normally
+    // <= ~100ms apart (the select timeout). A much larger gap means THIS
+    // thread did not get CPU time -> host-side scheduling problem.
+    {
+      const auto now = diag_clock::now();
+      if (last_poll_time.time_since_epoch().count() != 0) {
+        const double gap = ms_between(last_poll_time, now);
+        if (gap > max_poll_gap_ms) max_poll_gap_ms = gap;
+        if (gap > 300.0) {
+          std::cout << "[stall-diag] WARN poll loop starved for " << gap
+                    << "ms (capture thread lost the CPU)" << std::endl;
+        }
+      }
+      last_poll_time = now;
+    }
+
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(fd, &fds);
@@ -433,7 +505,19 @@ struct device {
         std::cout << "VIDIOC_DQBUF" << std::endl;
       }
 
+      // Frame arrived: update inter-frame gap stats (healthy 30fps ~= 33ms).
+      {
+        const auto now = diag_clock::now();
+        if (last_dqbuf_time.time_since_epoch().count() != 0) {
+          const double gap = ms_between(last_dqbuf_time, now);
+          if (gap > max_frame_gap_ms) max_frame_gap_ms = gap;
+        }
+        last_dqbuf_time = now;
+        ++diag_frames;
+      }
+
       if (callback) {
+        const auto cb_start = diag_clock::now();
         callback(buffers[buf.index].start, [buf, this]() mutable {
           std::lock_guard<std::mutex> lock(device_mutex);
           if (is_capturing && fd != -1) {
@@ -447,6 +531,15 @@ struct device {
           }  
         }
         );
+        // Consumer-side cost of this frame (deinterleave + meta parse + any
+        // wait on the main-thread mutex). If this exceeds the 33ms frame
+        // budget the pipeline is falling behind on the host.
+        const double cb_ms = ms_between(cb_start, diag_clock::now());
+        if (cb_ms > max_cb_ms) max_cb_ms = cb_ms;
+        if (cb_ms > 100.0) {
+          std::cout << "[stall-diag] WARN consumer callback took " << cb_ms
+                    << "ms (frame budget is ~33ms)" << std::endl;
+        }
         if (living_count < LIVING_MAX_COUNT) {
           living_count++;
         } else {
@@ -464,6 +557,7 @@ struct device {
       no_data_count = 0;
       living_count = 0;
       std::cout << " failed: v4l2 get stream time out, Try to reboot!" << std::endl;
+      print_stall_diagnosis();
       stop_capture();
       start_capture();
     }

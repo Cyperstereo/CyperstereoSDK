@@ -211,6 +211,12 @@ struct FrameInfo {
   std::shared_ptr<Frame> frame{nullptr};
   CameraProfile profile{kProfileM60};
   FrameStreamData framestream{};
+  // Host-side (steady_clock) arrival time of the previous frame. Used to tell
+  // a REAL transport drop (host gap ~= camera-timestamp gap) apart from a
+  // camera/FPGA timestamp jump (host gap stays ~33ms while the embedded
+  // timestamp leaps).
+  std::chrono::steady_clock::time_point last_arrival{};
+  double host_gap_ms{-1.0};
   double last_imu_timestamp{0};
   double last_image_timestamp{0};
   double last_imu_count_s{0};
@@ -437,6 +443,12 @@ void WaitForStream(FrameInfo& frame_info) {
 void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()> continuation) {
   const auto t_cb_start = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lock(frame_info.mtx);
+  frame_info.host_gap_ms =
+      frame_info.last_arrival.time_since_epoch().count() == 0
+          ? -1.0
+          : std::chrono::duration<double, std::milli>(
+                t_cb_start - frame_info.last_arrival).count();
+  frame_info.last_arrival = t_cb_start;
         if (frame_info.frame == nullptr) {
           frame_info.frame = std::make_shared<struct Frame>();
         } else {
@@ -535,7 +547,22 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
                         << std::setprecision(3) << image_gap * 1000.0
                         << " ms (threshold " << kImageGapThresholdSec * 1000.0
                         << " ms)  prev_ts=" << frame_info.last_image_timestamp
-                        << "  cur_ts=" << fs.image_timestamp << std::endl;
+                        << "  cur_ts=" << fs.image_timestamp
+                        << "  host_gap=" << frame_info.host_gap_ms << " ms"
+                        << std::endl;
+              // Camera-timestamp gap vs host arrival gap disagree by a lot ->
+              // frames kept flowing and only the embedded timestamp leapt.
+              if (frame_info.host_gap_ms >= 0.0 &&
+                  frame_info.host_gap_ms < image_gap * 1000.0 * 0.5) {
+                std::cout << "[drop] note: frames arrived continuously "
+                             "(host_gap ~ frame period) -> camera/FPGA "
+                             "TIMESTAMP JUMP, not a real transport drop"
+                          << std::endl;
+              } else if (frame_info.host_gap_ms >= 0.0) {
+                std::cout << "[drop] note: host arrival gap matches -> REAL "
+                             "transport drop (USB/device stopped delivering)"
+                          << std::endl;
+              }
             }
           }
           frame_info.last_image_count_s = image_count_s;
@@ -580,7 +607,9 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
                           << std::setprecision(3) << imu_gap * 1000.0
                           << " ms (threshold " << kImuGapThresholdSec * 1000.0
                           << " ms)  prev_ts=" << frame_info.last_imu_timestamp
-                          << "  cur_ts=" << ts << std::endl;
+                          << "  cur_ts=" << ts
+                          << "  host_gap=" << frame_info.host_gap_ms << " ms"
+                          << std::endl;
               }
             }
             frame_info.last_imu_timestamp = ts;
