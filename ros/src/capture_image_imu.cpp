@@ -41,11 +41,11 @@ int main(int argc, char *argv[]) {
   }
   cyperstereo::FrameInfo frame_info{};
   // Auto-select the camera profile (MT9V034 vs SmartSens) from the USB serial
-  // prefix before streaming; it drives resolution/fps and the per-frame decode.
+  // prefix, or from UVC frame size when no SN is burned.
   const std::string serial_num =
       cyperstereo::uvc::get_serial_number(*cyperstereo_device);
   const cyperstereo::CameraProfile &profile =
-      cyperstereo::SelectProfileBySerial(serial_num);
+      cyperstereo::SelectProfile(serial_num, *cyperstereo_device);
   frame_info.Init(profile);
   frame_info.framestream.serial_num = serial_num;
   const int num_cameras = profile.num_cameras;

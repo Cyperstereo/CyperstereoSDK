@@ -76,6 +76,22 @@ inline int PriorityForRole(ThreadRole role) {
   return c.main_priority;
 }
 
+// Pin the CURRENT thread to one logical CPU. x86 gives each of the 4 ISP
+// workers its own physical core (CPU0-3, with SMT siblings CPU4-7). A board
+// that declares a known topology may also use it: TARGET_BOARD=rk3588 pins
+// the workers to its Cortex-A76 cluster CPU4-7. Unknown ARM big.LITTLE
+// layouts remain unpinned rather than guessing and landing on LITTLE cores.
+inline void PinThreadToCpu(int cpu) {
+#if defined(__linux__)
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(cpu, &set);
+  pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+  (void)cpu;
+#endif
+}
+
 // Apply the configured real-time priority to the CURRENT thread. Call it once
 // at each thread's entry. On failure (usually missing privilege) it warns once
 // and leaves the thread at default scheduling, so the program keeps running

@@ -76,6 +76,10 @@ struct device;   // Opaque type representing access to a specific UVC device
  // USB device serial number (empty string if unavailable).
  std::string get_serial_number(const device &device);
 
+ // True if the device advertises the given frame size under any pixel format.
+ // Used to pick MT9V034 vs SmartSens when no USB serial is burned.
+ bool has_frame_size(const device &device, int width, int height);
+
 // Access PU (Processing Unit) controls
 inline bool is_pu_control(Option option) {
   return option >= Option::GAIN && option <= Option::CONTRAST;

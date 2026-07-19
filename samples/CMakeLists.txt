@@ -102,6 +102,14 @@ set(OPT_FLAGS "-O3 -funroll-loops ${ARCH_FLAGS}")
 set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} ${OPT_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OPT_FLAGS} -pthread")
 
+# RK3588 Linux enumerates the four Cortex-A55 efficiency cores as CPU0-3 and
+# the four Cortex-A76 performance cores as CPU4-7. Expose the selected board
+# to the header-only ISP scheduler so its four camera workers can be pinned
+# one per A76. Keep this board-specific: other ARM SoCs use different layouts.
+if(TARGET_BOARD STREQUAL "rk3588")
+  add_definitions(-DCYPERSTEREO_RK3588=1)
+endif()
+
 message(STATUS "Target processor: ${CMAKE_SYSTEM_PROCESSOR}  (board=${TARGET_BOARD})")
 message(STATUS "Arch opt flags:   ${ARCH_FLAGS}")
 message(STATUS "C_FLAGS: ${CMAKE_C_FLAGS}")

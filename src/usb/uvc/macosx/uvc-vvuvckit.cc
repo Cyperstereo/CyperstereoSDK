@@ -310,6 +310,13 @@ MYNTEYE_API std::string get_serial_number(const device &device) {
   return "";
 }
 
+MYNTEYE_API bool has_frame_size(const device &device, int width, int height) {
+  (void)device;
+  (void)width;
+  (void)height;
+  return false;
+}
+
 MYNTEYE_API bool pu_control_range(
     const device &device, Option option, int32_t *min, int32_t *max,
     int32_t *def) {

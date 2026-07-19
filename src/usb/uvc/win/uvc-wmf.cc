@@ -555,6 +555,13 @@ std::string get_serial_number(const device &device) {
   return "";
 }
 
+bool has_frame_size(const device &device, int width, int height) {
+  (void)device;
+  (void)width;
+  (void)height;
+  return false;
+}
+
 static long get_cid(Option option) {
   switch (option) {
     case Option::GAIN:

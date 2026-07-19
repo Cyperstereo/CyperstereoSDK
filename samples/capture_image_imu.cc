@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <chrono>
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <execinfo.h>
 #include <iomanip>
 #include <iostream>
 #include "string"
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
-#include <array>
 #include <mutex>
-#include <thread>
 #include "../src/usb/uvc/cyperstereo_api.h"
 #include "../src/usb/uvc/tic_toc.h"
 #include "../src/usb/uvc/thread_priority.h"
@@ -29,7 +30,21 @@ const double g = 9.7887;
 
 CYPERSTEREO_USE_NAMESPACE
 
+// Crash triage without gdb on the target: dump raw return addresses from the
+// faulting thread, resolvable offline with addr2line against this binary.
+extern "C" void crash_handler(int sig) {
+  void *frames[32];
+  const int n = backtrace(frames, 32);
+  fprintf(stderr, "\n[crash] signal %d, backtrace (%d frames):\n", sig, n);
+  backtrace_symbols_fd(frames, n, 2);
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
 int main(int argc, char *argv[]) {
+  signal(SIGSEGV, crash_handler);
+  signal(SIGABRT, crash_handler);
+  signal(SIGBUS, crash_handler);
   cv::setNumThreads(1);
 
   // --no-display: skip all imshow/GUI work. The preview path (X11/GTK) can
@@ -56,10 +71,11 @@ int main(int argc, char *argv[]) {
   const std::string serial_num =
       cyperstereo::uvc::get_serial_number(*cyperstereo_device);
   const cyperstereo::CameraProfile &profile =
-      cyperstereo::SelectProfileBySerial(serial_num);
+      cyperstereo::SelectProfile(serial_num, *cyperstereo_device);
   frame_info.Init(profile);
   frame_info.framestream.serial_num = serial_num;
-  std::cout << "camera: " << profile.name << "  serial: " << serial_num << "  "
+  std::cout << "camera: " << profile.name << "  serial: "
+            << (serial_num.empty() ? "(none)" : serial_num) << "  "
           << profile.frame_width << "x" << profile.frame_height << "@"
           << profile.fps << "  cameras: " << profile.num_cameras << std::endl;
   cyperstereo::uvc::set_device_mode(
@@ -89,8 +105,8 @@ int main(int argc, char *argv[]) {
   //imshow windows init
   constexpr int kShowEvery = 5;
   if (show_preview) {
-    const int win_w = profile.cam_width * 3 / 4.0;
-    const int win_h = profile.frame_height * 3 / 4.0;
+    const int win_w = profile.cam_width  / 2.0;
+    const int win_h = profile.frame_height / 2.0;
     const char *wins[4] = {"image1", "image2", "image3", "image4"};
     for (int i = 0; i < num_cameras; ++i) {
       cv::namedWindow(wins[i], cv::WINDOW_NORMAL);
@@ -123,36 +139,35 @@ int main(int argc, char *argv[]) {
     {
       TicToc proc;
       static WhiteBalance wb1, wb2, wb3, wb4;
-      std::thread t2([&] { ApplyISP(right_image, right_color, wb2, "wb-cam2"); });
-      std::thread t3([&] { ApplyISP(left_front_image, left_front_color, wb3, "wb-cam3"); });
-      std::thread t4([&] { ApplyISP(right_front_image, right_front_color, wb4, "wb-cam4"); });
-      // cam1 on this (main) thread.
-      ApplyISP(left_image, left_color, wb1, "wb-cam1");
-      t2.join();
-      t3.join();
-      t4.join();
+      // jobs[0] on this thread; rest on persistent IspWorkers (see ApplyISPParallel).
+      ApplyISPParallel({
+          {left_image, left_color, wb1, "wb-cam1"},
+          {right_image, right_color, wb2, "wb-cam2"},
+          {left_front_image, left_front_color, wb3, "wb-cam3"},
+          {right_front_image, right_front_color, wb4, "wb-cam4"},
+      });
       //std::cout << "proc(wb+cvt) " << proc.toc() << std::endl;
       
-      /*if (show_preview && count % kShowEvery == 0) {
+     if (show_preview && count % kShowEvery == 0) {
         cv::imshow("image1", left_color);
         cv::imshow("image2", right_color);
         cv::imshow("image3", left_front_color);
         cv::imshow("image4", right_front_color);
         cv::waitKey(1);
-      }*/
+      }
     }
     else
     {
       // MT9V034 is monochrome (no Bayer): display the two raw planes directly.
-      /*if (show_preview && count % kShowEvery == 0) {
+      if (show_preview && count % kShowEvery == 0) {
         cv::imshow("image1", left_image);
         cv::imshow("image2", right_image);
         cv::waitKey(1);
-      }*/
+      }
     }
 
     // Image timestamp + IMU samples, printed every frame (no count%2 gate).
-    /*std::cout << std::fixed << std::setprecision(6)
+    /* std::cout << std::fixed << std::setprecision(6)
               << "[meta] image_ts=" << image_timestamp
               << "  imu_n=" << imu_data.imu_count << std::endl;
     if (imu_data.imu_count > 0) {
@@ -189,8 +204,8 @@ int main(int argc, char *argv[]) {
       }
     }
     ++count;
-    if (count % 100 == 0) {
-    	double frame_rate = 100 / (t_frame.toc() / 1000);
+    if (count % 1000 == 0) {
+    	double frame_rate = 1000 / (t_frame.toc() / 1000);
     	t_frame.tic();
     	std::cout << "frame_rate " << frame_rate
                 << "  image_drops=" << frame_info.image_drop_count

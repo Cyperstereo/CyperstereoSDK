@@ -93,16 +93,16 @@ int main(int argc, char *argv[]) {
   }
   cyperstereo::FrameInfo frame_info{};
   // The USB serial number is a static device property, so read it once and use
-  // its prefix to auto-select the camera profile (MT9V034 vs SmartSens) before
-  // starting the stream; the profile drives resolution/fps and the per-frame
-  // deinterleave / metadata decode.
+  // it (or, when unset, the advertised UVC size) to auto-select the camera
+  // profile (MT9V034 vs SmartSens) before starting the stream.
   const std::string serial_num =
       cyperstereo::uvc::get_serial_number(*cyperstereo_device);
   const cyperstereo::CameraProfile &profile =
-      cyperstereo::SelectProfileBySerial(serial_num);
+      cyperstereo::SelectProfile(serial_num, *cyperstereo_device);
   frame_info.Init(profile);
   frame_info.framestream.serial_num = serial_num;
-  std::cout << "camera: " << profile.name << "  serial: " << serial_num << "  "
+  std::cout << "camera: " << profile.name << "  serial: "
+            << (serial_num.empty() ? "(none)" : serial_num) << "  "
             << profile.frame_width << "x" << profile.frame_height << "@"
             << profile.fps << "  cameras: " << profile.num_cameras << std::endl;
   const int num_cameras = profile.num_cameras;
@@ -288,26 +288,23 @@ void DataFlow() {
         const bool two_ok =
             n >= 2 && !imgs[0].empty() && !imgs[1].empty();
         if (four_ok) {
-          if (count % 3 == 0) {
+          if (count % 2 == 0) {
             cv::Mat left_image = imgs[0];
             cv::Mat right_image = imgs[1];
             cv::Mat left_front_image = imgs[2];
             cv::Mat right_front_image = imgs[3];
             
             static WhiteBalance wb1, wb2, wb3, wb4;
-            std::thread t2([&] { ApplyISP(right_image, right_color, wb2, "wb-cam2"); });
-            std::thread t3([&] { ApplyISP(left_front_image, left_front_color, wb3, "wb-cam3"); });
-            std::thread t4([&] { ApplyISP(right_front_image, right_front_color, wb4, "wb-cam4"); });
+            const std::string image_name = std::to_string(static_cast<int>(image_timestamp * 10000)) + ".png";
+            std::thread t2([&] { ApplyISP(right_image, right_color, wb2, "wb-cam2"); cv::imwrite("./right/" + image_name, right_color); });
+            std::thread t3([&] { ApplyISP(left_front_image, left_front_color, wb3, "wb-cam3"); cv::imwrite("./left_front/" + image_name, left_front_color); });
+            std::thread t4([&] { ApplyISP(right_front_image, right_front_color, wb4, "wb-cam4"); cv::imwrite("./right_front/" + image_name, right_front_color); });
             ApplyISP(left_image, left_color, wb1, "wb-cam1");
+            cv::imwrite("./left/" + image_name, left_color);
             t2.join();
             t3.join();
             t4.join();
 
-            const std::string image_name = std::to_string(static_cast<int>(image_timestamp * 10000)) + ".png";
-            cv::imwrite("./left/" + image_name, left_color);
-            cv::imwrite("./right/" + image_name, right_color);
-            cv::imwrite("./left_front/" + image_name, left_front_color);
-            cv::imwrite("./right_front/" + image_name, right_front_color);
           }
           count++;
         } else if (two_ok) {
