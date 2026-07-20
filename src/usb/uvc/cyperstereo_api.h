@@ -43,6 +43,43 @@
 
 CYPERSTEREO_BEGIN_NAMESPACE
 
+// OpenCV 4.11 (PR opencv#26109) removed the arithmetic/bitwise/shift
+// operators on universal intrinsics in favour of v_add/v_sub/v_mul/v_and/
+// v_shl/v_shr (they clash with the RISC-V RVV built-in vector types). Our
+// CV_SIMD128 fallback loops are written with operators -- which keeps them
+// bit-exact and still builds against the 4.5.x that ships with most
+// distros. Restore the operators for newer OpenCV, scoped to this SDK's
+// namespace so ordinary lookup finds them inside our code while we never
+// redefine (and clash with) OpenCV's own operators on < 4.11.
+#if (CV_VERSION_MAJOR > 4) || (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR >= 11)
+#define CYPERSTEREO_VOP_BIN(OP, FUN, TYPE)             \
+  static inline cv::TYPE operator OP(const cv::TYPE &a, \
+                                     const cv::TYPE &b) { return cv::FUN(a, b); }
+#define CYPERSTEREO_VOP_ALL(TYPE)     \
+  CYPERSTEREO_VOP_BIN(+, v_add, TYPE) \
+  CYPERSTEREO_VOP_BIN(-, v_sub, TYPE) \
+  CYPERSTEREO_VOP_BIN(*, v_mul, TYPE) \
+  CYPERSTEREO_VOP_BIN(&, v_and, TYPE)
+CYPERSTEREO_VOP_ALL(v_uint16x8)
+CYPERSTEREO_VOP_ALL(v_uint32x4)
+CYPERSTEREO_VOP_ALL(v_int16x8)
+CYPERSTEREO_VOP_ALL(v_int32x4)
+#undef CYPERSTEREO_VOP_ALL
+#undef CYPERSTEREO_VOP_BIN
+#define CYPERSTEREO_VOP_SHIFT(TYPE)                                       \
+  static inline cv::TYPE operator<<(const cv::TYPE &a, int n) {           \
+    return cv::v_shl(a, n);                                               \
+  }                                                                      \
+  static inline cv::TYPE operator>>(const cv::TYPE &a, int n) {           \
+    return cv::v_shr(a, n);                                               \
+  }
+CYPERSTEREO_VOP_SHIFT(v_uint16x8)
+CYPERSTEREO_VOP_SHIFT(v_uint32x4)
+CYPERSTEREO_VOP_SHIFT(v_int16x8)
+CYPERSTEREO_VOP_SHIFT(v_int32x4)
+#undef CYPERSTEREO_VOP_SHIFT
+#endif
+
 static inline void DeinterleaveFourPlanes(
     const unsigned char *src, int src_stride,
     unsigned char *p0, unsigned char *p1,
