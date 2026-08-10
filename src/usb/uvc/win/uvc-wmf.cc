@@ -556,9 +556,44 @@ std::string get_serial_number(const device &device) {
 }
 
 bool has_frame_size(const device &device, int width, int height) {
-  (void)device;
-  (void)width;
-  (void)height;
+  // Used by SelectProfile() BEFORE set_device_mode() to discriminate the
+  // SmartSens (2560x1024) from the MT9V034 (752x480) families on units with
+  // no USB serial.  Returning a stub "false" here made the picker fall back
+  // to MT9V034 on a SmartSens camera; set_device_mode(752x480) then found no
+  // matching media type and threw -> instant crash at startup.
+  // Create the same async source reader set_device_mode would create (it is
+  // reused there) and walk the native media types the UVC descriptor
+  // advertises.
+  uvc::device &dev = const_cast<uvc::device &>(device);
+  try {
+    if (!dev.mf_source_reader) {
+      com_ptr<IMFAttributes> pAttributes;
+      check("MFCreateAttributes", MFCreateAttributes(&pAttributes, 1));
+      check("IMFAttributes::SetUnknown",
+            pAttributes->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK,
+                                    static_cast<IUnknown *>(dev.reader_callback)));
+      check("MFCreateSourceReaderFromMediaSource",
+            MFCreateSourceReaderFromMediaSource(dev.get_media_source(),
+                                                pAttributes,
+                                                &dev.mf_source_reader));
+    }
+    for (DWORD j = 0;; j++) {
+      com_ptr<IMFMediaType> media_type;
+      HRESULT hr = dev.mf_source_reader->GetNativeMediaType(
+          (DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, j, &media_type);
+      if (hr == MF_E_NO_MORE_TYPES) break;
+      if (FAILED(hr)) break;
+      UINT32 w = 0, h = 0;
+      if (FAILED(MFGetAttributeSize(media_type, MF_MT_FRAME_SIZE, &w, &h)))
+        continue;
+      if (static_cast<int>(w) == width && static_cast<int>(h) == height)
+        return true;
+    }
+  } catch (const std::exception &e) {
+    // Enumeration failure just means "unknown"; the caller falls back.
+    std::cout << "[uvc] has_frame_size enumeration failed: " << e.what()
+              << std::endl;
+  }
   return false;
 }
 

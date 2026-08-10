@@ -15,7 +15,9 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#ifndef _WIN32
 #include <execinfo.h>
+#endif
 #include <iomanip>
 #include <iostream>
 #include "string"
@@ -23,6 +25,7 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <mutex>
 #include "../src/usb/uvc/cyperstereo_api.h"
+#include "../src/usb/uvc/hdr_isp.h"
 #include "../src/usb/uvc/tic_toc.h"
 #include "../src/usb/uvc/thread_priority.h"
 
@@ -30,6 +33,7 @@ const double g = 9.7887;
 
 CYPERSTEREO_USE_NAMESPACE
 
+#ifndef _WIN32
 // Crash triage without gdb on the target: dump raw return addresses from the
 // faulting thread, resolvable offline with addr2line against this binary.
 extern "C" void crash_handler(int sig) {
@@ -40,11 +44,9 @@ extern "C" void crash_handler(int sig) {
   signal(sig, SIG_DFL);
   raise(sig);
 }
+#endif
 
-int main(int argc, char *argv[]) {
-  signal(SIGSEGV, crash_handler);
-  signal(SIGABRT, crash_handler);
-  signal(SIGBUS, crash_handler);
+static int run(int argc, char *argv[]) {
   cv::setNumThreads(1);
 
   // --no-display: skip all imshow/GUI work. The preview path (X11/GTK) can
@@ -52,15 +54,24 @@ int main(int argc, char *argv[]) {
   // when the pipeline falls behind, the camera's FX3 firmware overruns its
   // internal FIFO and the stream stalls ("v4l2 get stream time out").
   bool show_preview = true;
+  bool use_fast_balanced = FastBalancedIspEnabled();
   for (int i = 1; i < argc; ++i) {
-    if (std::string(argv[i]) == "--no-display")
+    const std::string arg(argv[i]);
+    if (arg == "--no-display")
       show_preview = false;
+    else if (arg == "--isp-fast" || arg == "--isp-fast-balanced")
+      use_fast_balanced = true;
+    else if (arg == "--isp-quality")
+      use_fast_balanced = false;
   }
+#ifndef _WIN32
+  // X11-only check; Windows has no DISPLAY variable and HighGUI works natively.
   if (show_preview && std::getenv("DISPLAY") == nullptr) {
     std::cout << "[gui] DISPLAY not set, disabling preview (use X forwarding "
                  "or a local session to enable)" << std::endl;
     show_preview = false;
   }
+#endif
   
   // camera config init
   std::shared_ptr<cyperstereo::uvc::device> cyperstereo_device{nullptr};
@@ -101,16 +112,30 @@ int main(int argc, char *argv[]) {
   cv::Mat right_color(profile.frame_height, profile.cam_width, CV_8UC3);
   cv::Mat left_front_color(profile.frame_height, profile.cam_width, CV_8UC3);
   cv::Mat right_front_color(profile.frame_height, profile.cam_width, CV_8UC3);
+  WhiteBalance fast_wb[4];
+  std::cout << "ISP mode: "
+            << (use_fast_balanced ? "fast-balanced" : "quality-reference")
+            << std::endl;
+  if (use_fast_balanced) {
+    std::cout << "Fast ISP: gamma="
+              << (FastBalancedGammaEnabled() ? "on" : "off")
+              << " hue_guard="
+              << (FastBalancedHueGuardEnabled() ? "on" : "off")
+              << " bayer_nr="
+              << (FastBalancedBayerNrEnabled() ? "adaptive>=3x" : "off")
+              << " demosaic="
+              << FastBalancedDemosaicName()
+              << " saturation=" << IspSaturation() << std::endl;
+  }
 
   //imshow windows init
   constexpr int kShowEvery = 5;
   if (show_preview) {
-    const int win_w = profile.cam_width  / 2.0;
-    const int win_h = profile.frame_height / 2.0;
     const char *wins[4] = {"image1", "image2", "image3", "image4"};
     for (int i = 0; i < num_cameras; ++i) {
-      cv::namedWindow(wins[i], cv::WINDOW_NORMAL);
-      cv::resizeWindow(wins[i], win_w, win_h);
+      // WINDOW_AUTOSIZE keeps the preview at the Mat's native resolution.
+      // Do not resize the window: scaling can hide fine noise and false color.
+      cv::namedWindow(wins[i], cv::WINDOW_AUTOSIZE);
     }
     cv::startWindowThread();
   }
@@ -119,17 +144,32 @@ int main(int argc, char *argv[]) {
     cyperstereo::WaitForStream(frame_info);
 
     double image_timestamp = 0.0;
+    double exposure_time[4]{};
+    uint16_t exposure_lines[4]{};
+    double camera_gain[4]{};
+    double camera_temperature[4]{};
+    uint32_t hardware_version = 0;
+    uint32_t software_version = 0;
     cyperstereo::IMUStreamData imu_data{};
     cyperstereo::GNSSStreamData gnss_data{};
 
     {
       std::lock_guard<std::mutex> lock(frame_info.mtx);
       image_timestamp = frame_info.framestream.image_timestamp;
+      hardware_version = frame_info.framestream.hardware_version;
+      software_version = frame_info.framestream.software_version;
       cv::swap(frame_info.framestream.left_image, left_image);
       cv::swap(frame_info.framestream.right_image, right_image);
       if (num_cameras >= 4) {
         cv::swap(frame_info.framestream.left_front_image, left_front_image);
         cv::swap(frame_info.framestream.right_front_image, right_front_image);
+        for (int i = 0; i < 4; ++i) {
+          exposure_time[i] = frame_info.framestream.exposure_time[i];
+          exposure_lines[i] = frame_info.framestream.exposure_lines[i];
+          camera_gain[i] = frame_info.framestream.camera_gain[i];
+          camera_temperature[i] =
+              frame_info.framestream.camera_temperature[i];
+        }
       }
       imu_data = frame_info.framestream.imu;
       gnss_data = frame_info.framestream.gnss;
@@ -138,14 +178,31 @@ int main(int argc, char *argv[]) {
     if (num_cameras >= 4)
     {
       TicToc proc;
-      static WhiteBalance wb1, wb2, wb3, wb4;
-      // jobs[0] on this thread; rest on persistent IspWorkers (see ApplyISPParallel).
-      ApplyISPParallel({
-          {left_image, left_color, wb1, "wb-cam1"},
-          {right_image, right_color, wb2, "wb-cam2"},
-          {left_front_image, left_front_color, wb3, "wb-cam3"},
-          {right_front_image, right_front_color, wb4, "wb-cam4"},
-      });
+      // Run the selected ISP pipeline. Fast-balanced is the default; the
+      // HDR-ISP quality reference remains available through --isp-quality.
+      // Each camera uses its own live AEC gain from the metadata row.
+      const BayerConversion image13_bayer =
+          SelectBayerConversion(hardware_version, software_version, 0);
+      if (use_fast_balanced) {
+        ApplyFastBalancedISPParallel({
+            {left_image, left_color, fast_wb[0], "fast-cam1",
+             camera_gain[0], image13_bayer},
+            {right_image, right_color, fast_wb[1], "fast-cam2",
+             camera_gain[1]},
+            {left_front_image, left_front_color, fast_wb[2], "fast-cam3",
+             camera_gain[2], image13_bayer},
+            {right_front_image, right_front_color, fast_wb[3], "fast-cam4",
+             camera_gain[3]},
+        });
+      } else {
+        ApplyHdrIspParallel({
+            {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
+            {right_image, right_color, "cam2", camera_gain[1]},
+            {left_front_image, left_front_color, "cam3", camera_gain[2],
+             image13_bayer},
+            {right_front_image, right_front_color, "cam4", camera_gain[3]},
+        });
+      }
       //std::cout << "proc(wb+cvt) " << proc.toc() << std::endl;
       
      if (show_preview && count % kShowEvery == 0) {
@@ -167,7 +224,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Image timestamp + IMU samples, printed every frame (no count%2 gate).
-    /* std::cout << std::fixed << std::setprecision(6)
+     std::cout << std::fixed << std::setprecision(6)
               << "[meta] image_ts=" << image_timestamp
               << "  imu_n=" << imu_data.imu_count << std::endl;
     if (imu_data.imu_count > 0) {
@@ -181,7 +238,27 @@ int main(int argc, char *argv[]) {
                   << imu_data.gyro_y[i] << "," << imu_data.gyro_z[i] << ")"
                   << "  T[" << i << "]=" << imu_data.temperature[i] << std::endl;
       }
-    }*/
+    }
+
+    // Print every frame's FPGA AEC targets.  These values are forwarded from
+    // the controller state and are not sensor-register readback values.
+    if (num_cameras >= 4) {
+      static const char *kCameraNames[4] = {
+          "image1(L,C1)", "image2(R,C2)",
+          "image3(LF,C4)", "image4(RF,C3)"};
+      std::cout << std::fixed << std::setprecision(6)
+                << "[cam] frame_end_ts=" << image_timestamp << std::endl;
+      for (int i = 0; i < 4; ++i) {
+        std::cout << "  " << kCameraNames[i]
+                  << "  aec_exp=" << std::setprecision(3)
+                  << exposure_time[i] * 1000.0 << "ms ("
+                  << exposure_lines[i] << " lines)"
+                  << "  aec_gain=" << std::setprecision(2)
+                  << camera_gain[i] << "x"
+                  << "  sensor_temp=" << camera_temperature[i] << "C"
+                  << std::endl;
+      }
+    }
 
     // GNSS: print valid, non-duplicate records, every frame.
     if (gnss_data.valid && !gnss_data.gnss_utc_time.empty()) {
@@ -215,4 +292,21 @@ int main(int argc, char *argv[]) {
   cyperstereo::uvc::stop_streaming(*cyperstereo_device);
   
   return 0;
+}
+
+int main(int argc, char *argv[]) {
+#ifndef _WIN32
+  signal(SIGSEGV, crash_handler);
+  signal(SIGABRT, crash_handler);
+  signal(SIGBUS, crash_handler);
+#endif
+  // The UVC backends report unrecoverable setup errors (no matching media
+  // type, COM/V4L2 failures) as std::runtime_error.  Without this handler the
+  // program dies with no message ("flash crash"); print the reason instead.
+  try {
+    return run(argc, argv);
+  } catch (const std::exception &e) {
+    std::cerr << "[fatal] " << e.what() << std::endl;
+    return 1;
+  }
 }

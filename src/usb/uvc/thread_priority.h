@@ -30,6 +30,7 @@
 // kPollPriority == kWorkerPriority below.
 
 #include <iostream>
+#include <mutex>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -92,6 +93,45 @@ inline void PinThreadToCpu(int cpu) {
 #endif
 }
 
+// Temporarily bind the CURRENT thread to one CPU, then restore the affinity
+// mask it had on entry. This is used when the caller itself executes one shard
+// of a multi-camera batch: worker threads can stay permanently pinned, while a
+// caller owned by an application must not retain an SDK-specific affinity.
+class ScopedThreadAffinity {
+ public:
+  explicit ScopedThreadAffinity(int cpu) {
+#if defined(__linux__)
+    if (cpu < 0 ||
+        pthread_getaffinity_np(pthread_self(), sizeof(saved_), &saved_) != 0)
+      return;
+    cpu_set_t target;
+    CPU_ZERO(&target);
+    CPU_SET(cpu, &target);
+    restore_ = pthread_setaffinity_np(
+                   pthread_self(), sizeof(target), &target) == 0;
+#else
+    (void)cpu;
+#endif
+  }
+
+  ~ScopedThreadAffinity() {
+#if defined(__linux__)
+    if (restore_)
+      (void)pthread_setaffinity_np(
+          pthread_self(), sizeof(saved_), &saved_);
+#endif
+  }
+
+  ScopedThreadAffinity(const ScopedThreadAffinity &) = delete;
+  ScopedThreadAffinity &operator=(const ScopedThreadAffinity &) = delete;
+
+ private:
+#if defined(__linux__)
+  cpu_set_t saved_{};
+  bool restore_ = false;
+#endif
+};
+
 // Apply the configured real-time priority to the CURRENT thread. Call it once
 // at each thread's entry. On failure (usually missing privilege) it warns once
 // and leaves the thread at default scheduling, so the program keeps running
@@ -107,25 +147,25 @@ inline void ApplyThreadPriority(ThreadRole role, const char* name = "") {
 
   const int rc = pthread_setschedparam(pthread_self(), c.policy, &sp);
   if (rc != 0) {
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
+    static std::once_flag warned;
+    std::call_once(warned, [rc] {
       std::cerr << "[prio] cannot set real-time priority (" << std::strerror(rc)
                 << "). Grant CAP_SYS_NICE (e.g. `sudo setcap cap_sys_nice+ep "
                    "<binary>`), run as root, or raise rtprio in "
                    "/etc/security/limits.conf. Continuing with default "
                    "scheduling." << std::endl;
-    }
+    });
     return;
   }
 
-  static bool logged[3] = {false, false, false};
+  static std::once_flag logged[3];
   const int idx = static_cast<int>(role);
-  if (idx >= 0 && idx < 3 && !logged[idx]) {
-    logged[idx] = true;
-    std::cout << "[prio] thread '" << name << "' policy="
-              << (c.policy == SCHED_RR ? "RR" : "FIFO")
-              << " prio=" << sp.sched_priority << std::endl;
+  if (idx >= 0 && idx < 3) {
+    std::call_once(logged[idx], [&c, name, &sp] {
+      std::cout << "[prio] thread '" << name << "' policy="
+                << (c.policy == SCHED_RR ? "RR" : "FIFO")
+                << " prio=" << sp.sched_priority << std::endl;
+    });
   }
 #else
   (void)role;

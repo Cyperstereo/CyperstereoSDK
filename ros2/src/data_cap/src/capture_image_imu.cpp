@@ -5,6 +5,8 @@
 #include <stdio.h>
 
 #include <map>
+#include <array>
+#include <atomic>
 #include <string>
 #include <memory>
 #include <chrono>
@@ -46,6 +48,9 @@ private:
 public:
     CameraImuPublisher() : Node("data_publisher")
     {
+        // The SDK parallelises the four cameras with persistent workers.
+        // Disable nested OpenCV worker pools to avoid CPU oversubscription.
+        cv::setNumThreads(1);
         cam0_image_pub = this->create_publisher<sensor_msgs::msg::Image>("/cam0/image_raw", 10);
         cam1_image_pub = this->create_publisher<sensor_msgs::msg::Image>("/cam1/image_raw", 10);
         cam2_image_pub = this->create_publisher<sensor_msgs::msg::Image>("/cam2/image_raw", 10);
@@ -112,16 +117,23 @@ public:
             cyperstereo::WaitForStream(frame_info);
 
             double image_timestamp = 0.0;
+            uint32_t hardware_version = 0;
+            uint32_t software_version = 0;
+            std::array<double, 4> camera_gain{{1.0, 1.0, 1.0, 1.0}};
             cyperstereo::IMUStreamData imu_data{};
 
             {
                 std::lock_guard<std::mutex> lock(frame_info.mtx);
                 image_timestamp = frame_info.framestream.image_timestamp;
+                hardware_version = frame_info.framestream.hardware_version;
+                software_version = frame_info.framestream.software_version;
                 cv::swap(frame_info.framestream.left_image, left_image);
                 cv::swap(frame_info.framestream.right_image, right_image);
                 if (num_cameras >= 4) {
                     cv::swap(frame_info.framestream.left_front_image, left_front_image);
                     cv::swap(frame_info.framestream.right_front_image, right_front_image);
+                    for (int i = 0; i < 4; ++i)
+                        camera_gain[i] = frame_info.framestream.camera_gain[i];
                 }
                 imu_data = frame_info.framestream.imu;
             }
@@ -131,17 +143,24 @@ public:
 
             if (num_cameras >= 4)
             {
-                // SmartSens: each plane is RAW Bayer with no on-chip AWB.
-                // White-balance + demosaic to BGR (three cameras on worker
-                // threads, one on this thread) and publish as bgr8 colour.
-                static WhiteBalance wb1, wb2, wb3, wb4;
-                std::thread t2([&] { ApplyISP(right_image, right_color, wb2, "wb-cam2"); });
-                std::thread t3([&] { ApplyISP(left_front_image, left_front_color, wb3, "wb-cam3"); });
-                std::thread t4([&] { ApplyISP(right_front_image, right_front_color, wb4, "wb-cam4"); });
-                ApplyISP(left_image, left_color, wb1, "wb-cam1");
-                t2.join();
-                t3.join();
-                t4.join();
+                // SmartSens: use the SDK's persistent fast-balanced worker
+                // pool instead of constructing three threads every frame.
+                // Keep independent AWB state for every sensor. Cameras 1 and
+                // 3 use the hardware-dependent Bayer phase, while 2 and 4
+                // retain the default RG2BGR mapping.
+                static WhiteBalance wb[4];
+                const BayerConversion image13_bayer =
+                    SelectBayerConversion(hardware_version, software_version, 0);
+                ApplyFastBalancedISPParallel({
+                    {left_image, left_color, wb[0], "fast-cam1",
+                     camera_gain[0], image13_bayer},
+                    {right_image, right_color, wb[1], "fast-cam2",
+                     camera_gain[1]},
+                    {left_front_image, left_front_color, wb[2], "fast-cam3",
+                     camera_gain[2], image13_bayer},
+                    {right_front_image, right_front_color, wb[3], "fast-cam4",
+                     camera_gain[3]},
+                });
 
                 msg0.encoding = "bgr8";
                 msg0.image = left_color;
@@ -224,4 +243,3 @@ int main(int argc, char *argv[])
     rclcpp::shutdown();
     return 0;
 }
-

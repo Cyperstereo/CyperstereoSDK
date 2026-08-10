@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #endif
 #include "../src/usb/uvc/cyperstereo_api.h"
+#include "../src/usb/uvc/hdr_isp.h"
 #include "../src/usb/uvc/tic_toc.h"
 #include "../src/usb/uvc/thread_priority.h"
 
@@ -39,7 +40,14 @@ const double g = 9.7887;
 CYPERSTEREO_USE_NAMESPACE
 
 std::queue<std::pair<double, std::array<double, 6>> > IMU;
-std::queue<std::pair<double, std::vector<cv::Mat>> > IMAGE;
+struct ImageRecord {
+  double timestamp;
+  uint32_t hardware_version;
+  uint32_t software_version;
+  std::array<double, 4> camera_gain{};
+  std::vector<cv::Mat> images;
+};
+std::queue<ImageRecord> IMAGE;
 struct GnssRecord {
   double gnss_timestamp;
   std::string gnss_utc_time;
@@ -58,9 +66,12 @@ struct GnssRecord {
 std::queue<GnssRecord> GNSS;
 std::mutex m_buf;
 std::condition_variable con;
-void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<std::pair<double, std::vector<cv::Mat>> > &image_data, std::queue<GnssRecord> &gnss_data);
+void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<ImageRecord> &image_data, std::queue<GnssRecord> &gnss_data);
 void DataFlow();
-void InputIMAGE(const double timestamp, const std::vector<cv::Mat>& images);
+void InputIMAGE(const double timestamp, uint32_t hardware_version,
+                uint32_t software_version,
+                const std::array<double, 4> &camera_gain,
+                const std::vector<cv::Mat>& images);
 void InputIMU(const double timestamp, double gyro_x, double gyro_y, double gyro_z, double acc_x, double acc_y, double acc_z);
 void InputGNSS(const cyperstereo::GNSSStreamData &gnss);
 
@@ -127,17 +138,24 @@ int main(int argc, char *argv[]) {
     cyperstereo::WaitForStream(frame_info);
 
     double image_timestamp = 0.0;
+    uint32_t hardware_version = 0;
+    uint32_t software_version = 0;
+    std::array<double, 4> camera_gain{};
     cyperstereo::IMUStreamData imu_data{};
     cyperstereo::GNSSStreamData gnss_data{};
 
     {
       std::lock_guard<std::mutex> lock(frame_info.mtx);
       image_timestamp = frame_info.framestream.image_timestamp;
+      hardware_version = frame_info.framestream.hardware_version;
+      software_version = frame_info.framestream.software_version;
       cv::swap(frame_info.framestream.left_image, left_image);
       cv::swap(frame_info.framestream.right_image, right_image);
       if (num_cameras >= 4) {
         cv::swap(frame_info.framestream.left_front_image, left_front_image);
         cv::swap(frame_info.framestream.right_front_image, right_front_image);
+        for (int i = 0; i < 4; ++i)
+          camera_gain[i] = frame_info.framestream.camera_gain[i];
       }
       imu_data = frame_info.framestream.imu;
       gnss_data = frame_info.framestream.gnss;
@@ -150,7 +168,8 @@ int main(int argc, char *argv[]) {
       images.push_back(left_front_image);
       images.push_back(right_front_image);
     }
-    InputIMAGE(image_timestamp, images);  // clones into the save queue
+    InputIMAGE(image_timestamp, hardware_version, software_version,
+               camera_gain, images);  // clones into the save queue
     for (int i = 0; i < imu_data.imu_count; ++i) {
       InputIMU(imu_data.imu_timestamp[i], imu_data.gyro_x[i], imu_data.gyro_y[i],
                imu_data.gyro_z[i], imu_data.acc_x[i], imu_data.acc_y[i],
@@ -197,14 +216,18 @@ void InputGNSS(const cyperstereo::GNSSStreamData &gnss) {
 }
 
 
-void InputIMAGE(const double timestamp, const std::vector<cv::Mat>& images) {
+void InputIMAGE(const double timestamp, uint32_t hardware_version,
+                 uint32_t software_version,
+                 const std::array<double, 4> &camera_gain,
+                 const std::vector<cv::Mat>& images) {
     m_buf.lock();
-    std::vector<cv::Mat> image_data;
-    image_data.reserve(images.size());
+    ImageRecord record{
+        timestamp, hardware_version, software_version, camera_gain, {}};
+    record.images.reserve(images.size());
     for (const auto &img : images) {
-      image_data.push_back(img.clone());
+      record.images.push_back(img.clone());
     }
-    IMAGE.push(make_pair(timestamp, image_data));
+    IMAGE.push(std::move(record));
     m_buf.unlock();
     con.notify_one();
 }
@@ -219,9 +242,25 @@ void DataFlow() {
   // reused every processed frame to avoid reallocating on the hot path. Sized
   // lazily on first use so the same binary works for either camera profile.
   cv::Mat left_color, right_color, left_front_color, right_front_color;
+  WhiteBalance fast_wb[4];
+  const bool use_fast_balanced = FastBalancedIspEnabled();
+  std::cout << "ISP mode: "
+            << (use_fast_balanced ? "fast-balanced" : "quality-reference")
+            << std::endl;
+  if (use_fast_balanced) {
+    std::cout << "Fast ISP: gamma="
+              << (FastBalancedGammaEnabled() ? "on" : "off")
+              << " hue_guard="
+              << (FastBalancedHueGuardEnabled() ? "on" : "off")
+              << " bayer_nr="
+              << (FastBalancedBayerNrEnabled() ? "adaptive>=3x" : "off")
+              << " demosaic="
+              << FastBalancedDemosaicName()
+              << " saturation=" << IspSaturation() << std::endl;
+  }
   while (true) {
       std::queue<std::pair<double, std::array<double, 6>> > imu_data;
-      std::queue<std::pair<double, std::vector<cv::Mat>> > image_data;
+      std::queue<ImageRecord> image_data;
       std::queue<GnssRecord> gnss_data;
       std::unique_lock<std::mutex> lk(m_buf);
       con.wait(lk, [&] {
@@ -277,8 +316,9 @@ void DataFlow() {
         gnss_data.pop();
       }
       while (!image_data.empty()) {
-        double image_timestamp = image_data.front().first;
-        const std::vector<cv::Mat> &imgs = image_data.front().second;
+        const ImageRecord &record = image_data.front();
+        double image_timestamp = record.timestamp;
+        const std::vector<cv::Mat> &imgs = record.images;
         const size_t n = imgs.size();
         // 4-camera (SmartSens) path: RAW Bayer -> white balance + demosaic, save
         // as colour. 2-camera (MT9V034) path: monochrome, saved as-is.
@@ -294,12 +334,51 @@ void DataFlow() {
             cv::Mat left_front_image = imgs[2];
             cv::Mat right_front_image = imgs[3];
             
-            static WhiteBalance wb1, wb2, wb3, wb4;
+            // Run the selected ISP pipeline; fast-balanced is the default.
             const std::string image_name = std::to_string(static_cast<int>(image_timestamp * 10000)) + ".png";
-            std::thread t2([&] { ApplyISP(right_image, right_color, wb2, "wb-cam2"); cv::imwrite("./right/" + image_name, right_color); });
-            std::thread t3([&] { ApplyISP(left_front_image, left_front_color, wb3, "wb-cam3"); cv::imwrite("./left_front/" + image_name, left_front_color); });
-            std::thread t4([&] { ApplyISP(right_front_image, right_front_color, wb4, "wb-cam4"); cv::imwrite("./right_front/" + image_name, right_front_color); });
-            ApplyISP(left_image, left_color, wb1, "wb-cam1");
+            const BayerConversion image13_bayer = SelectBayerConversion(
+                record.hardware_version, record.software_version, 0);
+            if (use_fast_balanced) {
+              ApplyFastBalancedISPParallel({
+                  {left_image, left_color, fast_wb[0], "fast-cam1",
+                   record.camera_gain[0], image13_bayer},
+                  {right_image, right_color, fast_wb[1], "fast-cam2",
+                   record.camera_gain[1]},
+                  {left_front_image, left_front_color, fast_wb[2], "fast-cam3",
+                   record.camera_gain[2], image13_bayer},
+                  {right_front_image, right_front_color, fast_wb[3], "fast-cam4",
+                   record.camera_gain[3]},
+              });
+            } else {
+              std::thread t2([&] {
+                ApplyHdrIsp(right_image, right_color, "cam2",
+                            BayerConversion::kColorBayerRg2Bgr,
+                            record.camera_gain[1]);
+              });
+              std::thread t3([&] {
+                ApplyHdrIsp(left_front_image, left_front_color, "cam3",
+                            image13_bayer, record.camera_gain[2]);
+              });
+              std::thread t4([&] {
+                ApplyHdrIsp(right_front_image, right_front_color, "cam4",
+                            BayerConversion::kColorBayerRg2Bgr,
+                            record.camera_gain[3]);
+              });
+              ApplyHdrIsp(left_image, left_color, "cam1", image13_bayer,
+                          record.camera_gain[0]);
+              t2.join();
+              t3.join();
+              t4.join();
+            }
+            std::thread t2([&] {
+              cv::imwrite("./right/" + image_name, right_color);
+            });
+            std::thread t3([&] {
+              cv::imwrite("./left_front/" + image_name, left_front_color);
+            });
+            std::thread t4([&] {
+              cv::imwrite("./right_front/" + image_name, right_front_color);
+            });
             cv::imwrite("./left/" + image_name, left_color);
             t2.join();
             t3.join();
@@ -321,7 +400,7 @@ void DataFlow() {
   }
 }
 
-void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<std::pair<double, std::vector<cv::Mat>> > &image_data, std::queue<GnssRecord> &gnss_data) {
+void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<ImageRecord> &image_data, std::queue<GnssRecord> &gnss_data) {
   while (!IMU.empty()) {
     imu_data.push(IMU.front());
     IMU.pop();
