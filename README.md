@@ -30,15 +30,15 @@ msbuild ALL_BUILD.vcxproj /property:Configuration=Release
 ```
 
 # 3.Arm Compile
-The build auto-detects the CPU and enables NEON/SIMD. When you build **on the
-device itself**, the default already picks the optimal `-mcpu=native`, so a
-plain build is enough:
+The build auto-detects the CPU and enables NEON/SIMD. A native build is enough
+for generic ARM processing, but RK3588 topology-aware scheduling (the four ISP
+camera owners on CPU4-7 A76) requires `TARGET_BOARD=rk3588`:
 ```c
-cd ~/CyperstereoSDK/samples
-mkdir build
-cd build
-cmake ..
-make
+cd ~/CyperstereoSDK
+cmake -S samples -B samples/build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTARGET_BOARD=rk3588
+cmake --build samples/build --parallel 4
 ```
 
 When **cross-compiling** (or to force a specific tuning), pass `-DTARGET_BOARD`:
@@ -92,9 +92,35 @@ mkdir imu
 ./capture_image_imu
 ```
 
+The fast-balanced capture path outputs packed UYVY422 by default on every
+platform (`CV_8UC2`, byte order
+`Cb,Y0,Cr,Y1`). It uses BT.601 full-range values and vertically duplicates the
+ISP's 4:2:0 chroma rows. RGB tone mapping is deliberately deferred, so a
+consumer that needs the former BGR888 appearance must perform a full-range
+UYVY-to-BGR conversion and then apply the same tone mapping. Do not decode
+this stream as studio/limited-range YUV. The quality-reference ISP continues
+to output BGR888.
 
+On RK3588, the four-camera sample is additionally headless by default and
+restricts the complete capture process to the four Cortex-A76 cores CPU4-7
+before any UVC, OpenCV, or ISP thread is created. The Cortex-A55 cores CPU0-3
+are not used. The sample also disables LITTLE-core assistance and nested
+per-frame ISP sharding.
 
+Useful overrides are:
 
+```c
+# Show the local preview explicitly.
+./capture_image_imu --display --isp-fast
 
+# Restore the legacy BGR888 fast output (including RGB tone mapping).
+./capture_image_imu --output-bgr --isp-fast
+
+# Select packed full-range UYVY422 explicitly.
+./capture_image_imu --output-yuv422 --isp-fast
+
+# Restore per-frame metadata logging (RK3588 defaults to one sample/second).
+./capture_image_imu --verbose
+```
 
 

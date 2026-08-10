@@ -161,6 +161,7 @@ struct device {
   video_channel_callback callback = nullptr;
 
   bool is_capturing = false;
+  int last_start_error = 0;
   std::vector<buffer> buffers;
 
   std::thread thread;
@@ -347,7 +348,7 @@ struct device {
       // Two nodes match (video capture + metadata); take the one that
       // reports the video-capture capability.
       const std::string cand = "/dev/" + name;
-      const int tfd = open(cand.c_str(), O_RDWR | O_NONBLOCK, 0);
+      const int tfd = open(cand.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC, 0);
       if (tfd < 0)
         continue;
       v4l2_capability cap = {};
@@ -390,14 +391,14 @@ struct device {
 
     // Give uvcvideo a moment to release the old file-handle state.
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    fd = open(dev_name.c_str(), O_RDWR | O_NONBLOCK, 0);
+    fd = open(dev_name.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC, 0);
     if (fd < 0 && errno == ENOENT) {
       // Node gone: the device disconnected and re-enumerated under a new
       // number (e.g. /dev/video0 -> /dev/video2).  Look it up by VID/PID
       // instead of burning a whole retry cycle waiting for the port reset
       // escalation to do the same rediscovery.
       if (rediscover_dev_name())
-        fd = open(dev_name.c_str(), O_RDWR | O_NONBLOCK, 0);
+        fd = open(dev_name.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC, 0);
     }
     if (fd < 0) {
       fd = -1;
@@ -542,11 +543,24 @@ struct device {
 
     serial_number = read_serial_number(name);
 
-    fd = open(dev_name.c_str(), O_RDWR | O_NONBLOCK, 0);
+    fd = open(dev_name.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC, 0);
     if (fd < 0) {
       throw_error() << "Cannot open '" << dev_name << "': " << errno << ", "
                     << strerror(errno);
     }
+    // A throwing constructor does not run ~device().  Keep the just-opened fd
+    // guarded until all capability checks have completed so enumeration of an
+    // unsupported node cannot leak a V4L2 handle into the capture process.
+    struct ConstructorFdGuard {
+      int *fd;
+      ~ConstructorFdGuard() {
+        if (fd != nullptr && *fd != -1) {
+          close(*fd);
+          *fd = -1;
+        }
+      }
+      void release() { fd = nullptr; }
+    } fd_guard{&fd};
 
     v4l2_capability cap;
     if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
@@ -579,6 +593,7 @@ struct device {
     } else {
       throw_error() << dev_name + " is no video capture device";
     }  // Errors ignored
+    fd_guard.release();
   }
 
   ~device() {
@@ -666,7 +681,8 @@ struct device {
   // a wedged device left poll() dereferencing unmapped/MAP_FAILED buffers
   // (segfault) while the retry churn of half-built 32 x 5 MB buffer sets
   // drove the kernel into the OOM killer (both observed on Orange Pi 5).
-  bool start_capture() {
+  bool start_capture(bool suppress_busy_log = false) {
+    last_start_error = 0;
     if (is_capturing) {
       std::cout << "Start capture failed, is capturing already" << std::endl;
       return true;
@@ -681,7 +697,11 @@ struct device {
     fmt.fmt.pix.pixelformat = format;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
     if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-      std::cout << "VIDIOC_S_FMT failed: " << strerror(errno) << std::endl;
+      last_start_error = errno;
+      if (!suppress_busy_log || last_start_error != EBUSY) {
+        std::cout << "VIDIOC_S_FMT failed: " << strerror(last_start_error)
+                  << std::endl;
+      }
       return false;
     }
     // Validate what the driver actually negotiated.  A wedged device can
@@ -722,6 +742,7 @@ struct device {
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
     if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+      last_start_error = errno;
       if (errno == EINVAL)
         std::cout << "does not support memory mapping " << std::endl;
       else
@@ -777,6 +798,7 @@ struct device {
     v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     for (int i = 0; i < 10; ++i) {
       if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        last_start_error = errno;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       } else {
         capture_start_time = diag_clock::now();
@@ -1242,22 +1264,75 @@ struct device {
   }
 
   void start_streaming() {
-  std::lock_guard<std::mutex> lock(device_mutex);
+    std::unique_lock<std::mutex> lock(device_mutex);
     if (!callback) {
-      std::cout << " failed: video_channel_callback is empty" << std::endl;
-      return;
+      throw_error() << "[v4l2] cannot start " << dev_name
+                    << ": video callback is empty";
     }
 
-    start_capture();
+    if (thread.joinable() || is_capturing) {
+      throw_error() << "[v4l2] streaming thread already running for "
+                    << dev_name;
+    }
 
-    thread = std::thread([this]() {
-      // Highest priority: a late dequeue means a permanently dropped frame.
-      ApplyThreadPriority(ThreadRole::kPoll, "uvc-poll");
-      while (!stop) {
-        poll();
-        poll_fx3_link_stats();
+    bool started = start_capture();
+    if (!started && last_start_error == EBUSY) {
+      // After the previous process closes its V4L2 fd, some uvcvideo/vb2
+      // versions keep S_FMT busy for a short asynchronous teardown window.
+      // Retry only here, before any recovery thread exists.  This also handles
+      // a user restarting the sample immediately at the shell prompt without
+      // confusing a transient release delay with a wedged camera.  A genuine
+      // second owner remains bounded and fails below; it is never reopened or
+      // USB-reset behind that owner's back.
+      constexpr int kBusyRetryCount = 20;
+      constexpr int kBusyRetryDelayMs = 100;
+      std::cout << "[v4l2] " << dev_name
+                << " is still being released; waiting up to "
+                << kBusyRetryCount * kBusyRetryDelayMs << " ms" << std::endl;
+      for (int attempt = 0;
+           attempt < kBusyRetryCount && last_start_error == EBUSY;
+           ++attempt) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kBusyRetryDelayMs));
+        started = start_capture(true);
+        if (started)
+          break;
       }
-    });
+      if (started) {
+        std::cout << "[v4l2] " << dev_name
+                  << " released; capture started" << std::endl;
+      }
+    }
+    if (!started) {
+      if (last_start_error == EBUSY) {
+        throw_error()
+            << "[v4l2] " << dev_name
+            << " is busy; another process still owns the camera. Stop the old "
+               "capture process (check `fuser -v "
+            << dev_name << "`) and retry.";
+      }
+      throw_error() << "[v4l2] cannot start capture on " << dev_name
+                    << (last_start_error == 0
+                            ? std::string()
+                            : std::string(": ") +
+                                  strerror(last_start_error));
+    }
+
+    try {
+      thread = std::thread([this]() {
+        // Highest priority: a late dequeue means a permanently dropped frame.
+        ApplyThreadPriority(ThreadRole::kPoll, "uvc-poll");
+        while (!stop) {
+          poll();
+          poll_fx3_link_stats();
+        }
+      });
+    } catch (...) {
+      // stop_capture() takes device_mutex itself.
+      lock.unlock();
+      stop_capture();
+      throw;
+    }
   }
 
   void stop_streaming() {
@@ -1265,9 +1340,10 @@ struct device {
       stop = true;
       thread.join();
       stop = false;
-
-      stop_capture();
     }
+    // Also covers the narrow case where STREAMON succeeded but constructing
+    // the polling std::thread threw: the kernel queue must still be released.
+    stop_capture();
   }
 };
 

@@ -250,44 +250,48 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
 else()
   message(FATAL_ERROR "Unsupported OS.")
 endif()
-# ---- HDR-ISP-main software ISP (stored under src/ISP) ----------------------
-# Replaces the legacy header-only ApplyISP/ApplyISPParallel pipeline. The
-# HDR-ISP-main sources are compiled as-is (main.cpp and the JSON config
-# parser are excluded; parameters are filled in code by hdr_isp.cc).
-set(HDR_ISP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../src/ISP")
-if(NOT EXISTS "${HDR_ISP_ROOT}/srcs/include/common/pipeline.h")
+# ---- Fast-ISP quality pipeline (stored under src/ISP) ----------------------
+# Compile the pipeline objects directly into Cyperlib so the SDK has one
+# self-contained static archive. main.cpp and the JSON parser are excluded;
+# the SDK bridge supplies parameters directly in code.
+set(FAST_ISP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../src/ISP")
+if(NOT EXISTS "${FAST_ISP_ROOT}/srcs/include/common/pipeline.h")
   message(FATAL_ERROR
-      "HDR-ISP sources were not found under '${HDR_ISP_ROOT}'")
+      "Fast-ISP sources were not found under '${FAST_ISP_ROOT}'")
 endif()
-file(GLOB HDR_ISP_MOD_SRCS ${HDR_ISP_ROOT}/srcs/sources/modules/*.cpp)
-add_library(hdr_isp STATIC
-  ${HDR_ISP_MOD_SRCS}
-  ${HDR_ISP_ROOT}/srcs/sources/common/common.cpp
-  ${HDR_ISP_ROOT}/srcs/sources/common/frame.cpp
-  ${HDR_ISP_ROOT}/srcs/sources/common/modules.cpp
-  ${HDR_ISP_ROOT}/srcs/sources/common/pipeline.cpp
-  ${HDR_ISP_ROOT}/thirdparty/easylog/easylogging++.cc
-  ../src/usb/uvc/hdr_isp.cc)
-target_include_directories(hdr_isp PUBLIC
-  ${HDR_ISP_ROOT}/srcs/include
-  ${HDR_ISP_ROOT}/thirdparty/easylog
-  ${OpenCV_INCLUDE_DIRS})
+file(GLOB FAST_ISP_MODULE_SOURCES
+  "${FAST_ISP_ROOT}/srcs/sources/modules/*.cpp")
+set(FAST_ISP_SOURCES
+  ${FAST_ISP_MODULE_SOURCES}
+  ${FAST_ISP_ROOT}/srcs/sources/common/common.cpp
+  ${FAST_ISP_ROOT}/srcs/sources/common/frame.cpp
+  ${FAST_ISP_ROOT}/srcs/sources/common/modules.cpp
+  ${FAST_ISP_ROOT}/srcs/sources/common/pipeline.cpp
+  ${FAST_ISP_ROOT}/thirdparty/easylog/easylogging++.cc
+  ../src/usb/uvc/fast_isp.cc)
+target_sources(Cyperlib PRIVATE ${FAST_ISP_SOURCES})
+target_include_directories(Cyperlib
+  PRIVATE
+    ${FAST_ISP_ROOT}/srcs/include
+    ${FAST_ISP_ROOT}/thirdparty/easylog
+  PUBLIC
+    ${OpenCV_INCLUDE_DIRS})
 # ELPP_THREAD_SAFE: 4 camera pipelines log from their own threads.
 # ELPP_NO_DEFAULT_LOG_FILE: don't litter myeasylog.log next to the binary.
-target_compile_definitions(hdr_isp PUBLIC
+target_compile_definitions(Cyperlib PRIVATE
   ELPP_THREAD_SAFE
   ELPP_NO_DEFAULT_LOG_FILE)
 if (MSVC)
-  target_compile_definitions(hdr_isp PRIVATE _CRT_SECURE_NO_WARNINGS)
+  target_compile_definitions(Cyperlib PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
-target_link_libraries(hdr_isp ${OpenCV_LIBRARIES})
+target_link_libraries(Cyperlib PUBLIC ${OpenCV_LIBRARIES})
 
 add_executable(capture_image_imu
   capture_image_imu.cc)
 add_executable(save_image_imu
   save_image_imu.cc)
-target_link_libraries(capture_image_imu Cyperlib hdr_isp ${OpenCV_LIBRARIES})
-target_link_libraries(save_image_imu Cyperlib hdr_isp ${OpenCV_LIBRARIES})
+target_link_libraries(capture_image_imu Cyperlib ${OpenCV_LIBRARIES})
+target_link_libraries(save_image_imu Cyperlib ${OpenCV_LIBRARIES})
 
 # The deployed Windows x64 platform (Intel family 6 model 158) supports AVX2.
 # Compile the header-only fast ISP consumers accordingly; without this option

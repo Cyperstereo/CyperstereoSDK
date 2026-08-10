@@ -93,6 +93,43 @@ inline void PinThreadToCpu(int cpu) {
 #endif
 }
 
+// Restrict the CURRENT thread to an inclusive CPU range. Threads created
+// afterwards inherit this mask on Linux, so applications can establish a
+// process-wide cluster boundary before starting worker or capture threads.
+// Returns a pthread error number (zero on success).
+inline int RestrictCurrentThreadToCpuRange(int first_cpu, int last_cpu) {
+#if defined(__linux__)
+  if (first_cpu < 0 || last_cpu < first_cpu || last_cpu >= CPU_SETSIZE)
+    return EINVAL;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  for (int cpu = first_cpu; cpu <= last_cpu; ++cpu)
+    CPU_SET(cpu, &set);
+  int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+  if (rc != 0)
+    return rc;
+
+  // Linux may intersect the requested mask with a cpuset/cgroup constraint.
+  // Treat a silently narrowed mask as failure: the caller asked for this
+  // exact cluster, not merely any non-empty subset of it.
+  cpu_set_t actual;
+  CPU_ZERO(&actual);
+  rc = pthread_getaffinity_np(pthread_self(), sizeof(actual), &actual);
+  if (rc != 0)
+    return rc;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    const bool expected = cpu >= first_cpu && cpu <= last_cpu;
+    if ((CPU_ISSET(cpu, &actual) != 0) != expected)
+      return EINVAL;
+  }
+  return 0;
+#else
+  (void)first_cpu;
+  (void)last_cpu;
+  return 0;
+#endif
+}
+
 // Temporarily bind the CURRENT thread to one CPU, then restore the affinity
 // mask it had on entry. This is used when the caller itself executes one shard
 // of a multi-camera batch: worker threads can stay permanently pinned, while a
