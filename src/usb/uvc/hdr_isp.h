@@ -44,6 +44,10 @@ struct HdrIspJob {
   BayerConversion bayer;
   double sensor_gain;  // per-camera analogue/AEC target gain, nominally 1..8x
 
+  HdrIspJob()
+      : raw(nullptr), color(nullptr), name(nullptr),
+        bayer(BayerConversion::kColorBayerRg2Bgr), sensor_gain(1.0) {}
+
   HdrIspJob(
       const cv::Mat &r, cv::Mat &c, const char *n,
       BayerConversion b = BayerConversion::kColorBayerRg2Bgr)

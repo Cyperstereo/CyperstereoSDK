@@ -18,6 +18,7 @@
 #include "hdr_isp.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -694,5 +695,28 @@ void ApplyHdrIspParallel(const HdrIspJob *jobs, int n) {
 void ApplyHdrIspParallel(std::initializer_list<HdrIspJob> jobs) {
   ApplyHdrIspParallel(jobs.begin(), static_cast<int>(jobs.size()));
 }
+
+namespace detail {
+void ApplyQualityReferenceISPParallel(
+    const cv::Mat *const *raws, cv::Mat *const *outputs,
+    const char *const *names, const double *sensor_gains,
+    const BayerConversion *bayers, int n) {
+  if (n <= 0) return;
+  CV_Assert(raws != nullptr && outputs != nullptr && names != nullptr &&
+            sensor_gains != nullptr && bayers != nullptr);
+  n = std::min(n, 4);
+  std::array<HdrIspJob, 4> jobs{};
+  for (int i = 0; i < n; ++i) {
+    CV_Assert(raws[i] != nullptr && outputs[i] != nullptr &&
+              names[i] != nullptr);
+    jobs[i].raw = raws[i];
+    jobs[i].color = outputs[i];
+    jobs[i].name = names[i];
+    jobs[i].sensor_gain = sensor_gains[i];
+    jobs[i].bayer = bayers[i];
+  }
+  ApplyHdrIspParallel(jobs.data(), n);
+}
+}  // namespace detail
 
 }  // namespace cyperstereo

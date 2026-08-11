@@ -4214,27 +4214,70 @@ inline void Gauss5NeonU8(const cv::Mat &src, cv::Mat &dst, cv::Mat &tmp16) {
   }
 }
 
+#if defined(__aarch64__)
+// Exact vertical Gaussian for two adjacent rows.  The two 5-tap windows
+// share four horizontal-sum rows, so six vector loads replace ten.  Each
+// accumulator follows Gauss5VRowNeon's operation and rounding order.
+inline void Gauss5VPair8Neon(
+    const ushort *r0, const ushort *r1, const ushort *r2,
+    const ushort *r3, const ushort *r4, const ushort *r5, int x,
+    uint8x8_t &top, uint8x8_t &bottom) {
+  const uint16x8_t a0 = vld1q_u16(r0 + x);
+  const uint16x8_t a1 = vld1q_u16(r1 + x);
+  const uint16x8_t a2 = vld1q_u16(r2 + x);
+  const uint16x8_t a3 = vld1q_u16(r3 + x);
+  const uint16x8_t a4 = vld1q_u16(r4 + x);
+  const uint16x8_t a5 = vld1q_u16(r5 + x);
+  uint16x8_t sum_top = vaddq_u16(a0, a4);
+  sum_top = vmlaq_n_u16(sum_top, vaddq_u16(a1, a3), 4);
+  sum_top = vmlaq_n_u16(sum_top, a2, 6);
+  uint16x8_t sum_bottom = vaddq_u16(a1, a5);
+  sum_bottom = vmlaq_n_u16(sum_bottom, vaddq_u16(a2, a4), 4);
+  sum_bottom = vmlaq_n_u16(sum_bottom, a3, 6);
+  top = vrshrn_n_u16(sum_top, 8);
+  bottom = vrshrn_n_u16(sum_bottom, 8);
+}
+
+// Exact (c0+c1+c2+c3+8)>>4 pooling.  LD4 gathers eight groups of
+// consecutive four columns, and RSHRN performs the established +8/shift/
+// narrow in one instruction.  All sums are <=4080, so u16 is lossless.
+inline void PoolLumaAbs4Neon(const ushort *colsum, uchar *output,
+                             int quarter_width) {
+  int xq = 0;
+  for (; xq + 8 <= quarter_width; xq += 8) {
+    const uint16x8x4_t columns = vld4q_u16(colsum + 4 * xq);
+    const uint16x8_t sum = vaddq_u16(
+        vaddq_u16(columns.val[0], columns.val[1]),
+        vaddq_u16(columns.val[2], columns.val[3]));
+    vst1_u8(output + xq, vrshrn_n_u16(sum, 4));
+  }
+  for (; xq < quarter_width; ++xq) {
+    const int x = xq << 2;
+    const int sum = colsum[x] + colsum[x + 1] +
+                    colsum[x + 2] + colsum[x + 3];
+    output[xq] = static_cast<uchar>((sum + 8) >> 4);
+  }
+}
+#endif
+
+#if defined(__aarch64__)
 // Fully-fused luma chain (gauss5 + |y8-blur| 4x4 pooling + guided-stats
-// decimation) built on the row kernels above. The blurred plane lives only
-// as an 8-row u16 ring + a single u8 row: the 2.6MB tmp16 and the 1.3MB
-// y_bl plane are never written or re-read. Outputs are bit-exact vs the
-// separate stages (same kernels, same order). Board, 4 workers in
-// parallel: 1.90 -> 1.47 ms per camera; 1-core 1.41 -> 1.38 ms (the win
-// is DRAM bandwidth, not ALU).
+// decimation) built on the paired row kernel above. The blurred plane and
+// single-row temporary are never materialized: only the 8-row u16 ring is
+// retained. Outputs use the exact equations and rounding of the established
+// path; paired adjacent rows share four horizontal-sum loads.
 inline void FusedLumaChainNeon(const cv::Mat &y8, cv::Mat &hf_q8,
                                cv::Mat &colsum, cv::Mat &yq8, cv::Mat &sq16,
-                               cv::Mat &ring, cv::Mat &row_buf) {
+                               cv::Mat &ring) {
   const int W = y8.cols, H = y8.rows, qW = W / 4, qH = H / 4;
   hf_q8.create(qH, qW, CV_8U);
   colsum.create(1, W, CV_16U);
   yq8.create(qH, qW, CV_8U);
   sq16.create(qH, qW, CV_16U);
   ring.create(8, W, CV_16U);
-  row_buf.create(1, W, CV_8U);
   ushort *rr[8];
   for (int i = 0; i < 8; ++i) rr[i] = ring.ptr<ushort>(i);
   ushort *cs = colsum.ptr<ushort>(0);
-  uchar *rb = row_buf.ptr<uchar>(0);
 
   int next_h = 0;
   const auto fill_h = [&](int upto) {
@@ -4243,54 +4286,88 @@ inline void FusedLumaChainNeon(const cv::Mat &y8, cv::Mat &hf_q8,
   };
   for (int yq = 0; yq < qH; ++yq) {
     std::memset(cs, 0, W * sizeof(ushort));
-    for (int r = 0; r < 4; ++r) {
-      const int y = 4 * yq + r;
-      fill_h(y + 2);
-      const int ym2 = y - 2 < 0 ? 2 - y : y - 2;
-      const int ym1 = y - 1 < 0 ? 1 - y : y - 1;
-      const int yp1 = y + 1 >= H ? 2 * H - 2 - (y + 1) : y + 1;
-      const int yp2 = y + 2 >= H ? 2 * H - 2 - (y + 2) : y + 2;
-      Gauss5VRowNeon(rr[ym2 & 7], rr[ym1 & 7], rr[y & 7], rr[yp1 & 7],
-                     rr[yp2 & 7], rb, W);
-      // band-pass energy accumulate: colsum += |y8_row - blur_row|
-      const uchar *py = y8.ptr<uchar>(y);
-      int x = 0;
-      for (; x + 16 <= W; x += 16) {
-        const uint8x16_t d = vabdq_u8(vld1q_u8(py + x), vld1q_u8(rb + x));
-        vst1q_u16(cs + x, vaddw_u8(vld1q_u16(cs + x), vget_low_u8(d)));
-        vst1q_u16(cs + x + 8,
-                  vaddw_u8(vld1q_u16(cs + x + 8), vget_high_u8(d)));
-      }
-      for (; x < W; ++x)
-        cs[x] = static_cast<ushort>(cs[x] + std::abs(py[x] - rb[x]));
-      if (r == 0) {
-        // guided-stats source: NN decimation of blurred row 4*yq + squares
-        uchar *d = yq8.ptr<uchar>(yq);
-        ushort *sq = sq16.ptr<ushort>(yq);
-        int xq = 0;
-        for (; xq + 16 <= qW; xq += 16) {
-          const uint8x16x4_t v4 = vld4q_u8(rb + 4 * xq);
-          const uint8x16_t v = v4.val[0];
-          vst1q_u8(d + xq, v);
-          vst1q_u16(sq + xq, vmull_u8(vget_low_u8(v), vget_low_u8(v)));
-          vst1q_u16(sq + xq + 8,
-                    vmull_u8(vget_high_u8(v), vget_high_u8(v)));
+    {
+      // TBL returns zero for the out-of-range lanes; only the low four
+      // selected bytes are stored. This extracts blur[x+0,4,8,12] without
+      // materialising and then reloading a full blurred row.
+      static const uint8_t kEveryFourthBytes[16] = {
+          0, 4, 8, 12, 255, 255, 255, 255,
+          255, 255, 255, 255, 255, 255, 255, 255};
+      const uint8x16_t every_fourth = vld1q_u8(kEveryFourthBytes);
+      uchar *quarter_luma = yq8.ptr<uchar>(yq);
+      ushort *quarter_square = sq16.ptr<ushort>(yq);
+      const auto reflect_y = [&](int y) {
+        return y < 0 ? -y : (y >= H ? 2 * H - 2 - y : y);
+      };
+      for (int pair = 0; pair < 2; ++pair) {
+        const int y0 = 4 * yq + 2 * pair;
+        const int y1 = y0 + 1;
+        fill_h(y1 + 2);
+        const ushort *rows[6];
+        for (int k = -2; k <= 3; ++k)
+          rows[k + 2] = rr[reflect_y(y0 + k) & 7];
+        const uchar *source0 = y8.ptr<uchar>(y0);
+        const uchar *source1 = y8.ptr<uchar>(y1);
+        int x = 0;
+        for (; x + 16 <= W; x += 16) {
+          uint8x8_t top_lo, bottom_lo, top_hi, bottom_hi;
+          Gauss5VPair8Neon(rows[0], rows[1], rows[2], rows[3],
+                            rows[4], rows[5], x, top_lo, bottom_lo);
+          Gauss5VPair8Neon(rows[0], rows[1], rows[2], rows[3],
+                            rows[4], rows[5], x + 8, top_hi, bottom_hi);
+          const uint8x16_t top = vcombine_u8(top_lo, top_hi);
+          const uint8x16_t bottom = vcombine_u8(bottom_lo, bottom_hi);
+          const uint8x16_t delta0 =
+              vabdq_u8(vld1q_u8(source0 + x), top);
+          const uint8x16_t delta1 =
+              vabdq_u8(vld1q_u8(source1 + x), bottom);
+          uint16x8_t sum_lo = vld1q_u16(cs + x);
+          uint16x8_t sum_hi = vld1q_u16(cs + x + 8);
+          sum_lo = vaddw_u8(sum_lo, vget_low_u8(delta0));
+          sum_lo = vaddw_u8(sum_lo, vget_low_u8(delta1));
+          sum_hi = vaddw_u8(sum_hi, vget_high_u8(delta0));
+          sum_hi = vaddw_u8(sum_hi, vget_high_u8(delta1));
+          vst1q_u16(cs + x, sum_lo);
+          vst1q_u16(cs + x + 8, sum_hi);
+          if (pair == 0) {
+            const uint8x8_t samples =
+                vget_low_u8(vqtbl1q_u8(top, every_fourth));
+            // Use memcpy for the four-byte scalar store: cv::Mat guarantees
+            // byte access here, but casting that address to uint32_t * would
+            // impose an unnecessary alignment/effective-type requirement.
+            const uint32_t packed =
+                vget_lane_u32(vreinterpret_u32_u8(samples), 0);
+            std::memcpy(quarter_luma + (x >> 2), &packed, sizeof(packed));
+            const uint16x8_t squares = vmull_u8(samples, samples);
+            vst1_u16(quarter_square + (x >> 2),
+                     vget_low_u16(squares));
+          }
         }
-        for (; xq < qW; ++xq) {
-          const uchar v = rb[4 * xq];
-          d[xq] = v;
-          sq[xq] = static_cast<ushort>(v * v);
+        for (; x < W; ++x) {
+          const int top_sum = rows[0][x] + 4 * rows[1][x] +
+                              6 * rows[2][x] + 4 * rows[3][x] + rows[4][x];
+          const int bottom_sum = rows[1][x] + 4 * rows[2][x] +
+                                 6 * rows[3][x] + 4 * rows[4][x] + rows[5][x];
+          const uchar top = static_cast<uchar>((top_sum + 128) >> 8);
+          const uchar bottom = static_cast<uchar>((bottom_sum + 128) >> 8);
+          cs[x] = static_cast<ushort>(
+              cs[x] + std::abs(source0[x] - top) +
+              std::abs(source1[x] - bottom));
+          // qW intentionally floors W/4, matching the established path.
+          // Do not emit a partial group when W is not divisible by four.
+          if (pair == 0 && (x & 3) == 0 && x < 4 * qW) {
+            const int xq = x >> 2;
+            quarter_luma[xq] = top;
+            quarter_square[xq] = static_cast<ushort>(top * top);
+          }
         }
       }
     }
     uchar *po = hf_q8.ptr<uchar>(yq);
-    for (int xq = 0; xq < qW; ++xq) {
-      const int s =
-          cs[4 * xq] + cs[4 * xq + 1] + cs[4 * xq + 2] + cs[4 * xq + 3];
-      po[xq] = static_cast<uchar>((s + 8) >> 4);
-    }
+    PoolLumaAbs4Neon(cs, po, qW);
   }
 }
+#endif  // defined(__aarch64__)
 #endif
 
 #if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
@@ -7367,7 +7444,6 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   static thread_local cv::Mat cr_med_h, cb_med_h;            // u8 half
   static thread_local cv::Mat base_cr_q, base_cb_q;          // u8 quarter
   static thread_local cv::Mat g5_tmp_full, g5_tmp_half;      // u16 scratch
-  static thread_local cv::Mat g5_row_buf;                    // u8 one row
 #if (defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)) || \
     defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
   // Persistent 8-row rings for exact Gauss5 -> area/2 -> box7 streaming.
@@ -7492,10 +7568,9 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   bool luma_fused = false;
   bool guided_strength_fused = false;
   bool quarter_texture_fused = false;
-#if defined(CYPERSTEREO_HAVE_NEON)
+#if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
   if (UseNeonGauss5() && UseNeonGuided() && UseFusedLumaChain()) {
-    FusedLumaChainNeon(y8, hf_q8, colsum, yq8, sq_q, g5_tmp_full,
-                       g5_row_buf);
+    FusedLumaChainNeon(y8, hf_q8, colsum, yq8, sq_q, g5_tmp_full);
     if (UseStreamedGuidedStatsNeon()) {
       GuidedStatsStreamedNeon(yq8, sq_q, a_q16, b_q16, mean_i,
                               guided_strength_q8);
@@ -8981,6 +9056,112 @@ inline void ApplyFastBalancedISPUyvy422Parallel(
   ApplyFastBalancedISPUyvy422Parallel(
       jobs.begin(), static_cast<int>(jobs.size()));
 }
+
+// Unified public ISP facade.  Applications select the pipeline once and then
+// submit the same job type for every frame.  IspProcessor owns the independent
+// per-camera fast white-balance histories; the quality-reference backend keeps
+// its existing per-camera state keyed by IspFrameJob::name.
+enum class IspMode : uint8_t {
+  kFastBalancedUyvy422Bt601FullRange,
+  kFastBalancedBgr888,
+  kQualityReferenceBgr888,
+};
+
+inline bool IspModeUsesFastBalanced(IspMode mode) {
+  return mode != IspMode::kQualityReferenceBgr888;
+}
+
+inline bool IspModeUsesUyvy422(IspMode mode) {
+  return mode == IspMode::kFastBalancedUyvy422Bt601FullRange;
+}
+
+inline int IspModeOutputCvType(IspMode mode) {
+  return IspModeUsesUyvy422(mode) ? CV_8UC2 : CV_8UC3;
+}
+
+struct IspFrameJob {
+  cv::Mat *raw;
+  cv::Mat *output;
+  const char *name;
+  double sensor_gain;
+  BayerConversion bayer;
+
+  IspFrameJob(
+      cv::Mat &r, cv::Mat &o, const char *n, double gain = 1.0,
+      BayerConversion b = BayerConversion::kColorBayerRg2Bgr)
+      : raw(&r), output(&o), name(n), sensor_gain(gain), bayer(b) {}
+};
+
+namespace detail {
+// Implemented by the quality pipeline object inside libCyperlib.a.  Primitive
+// parallel arrays keep its private HdrIspJob type out of this public header.
+void ApplyQualityReferenceISPParallel(
+    const cv::Mat *const *raws, cv::Mat *const *outputs,
+    const char *const *names, const double *sensor_gains,
+    const BayerConversion *bayers, int n);
+}  // namespace detail
+
+class IspProcessor {
+ public:
+  explicit IspProcessor(IspMode mode) : mode_(mode) {}
+
+  IspProcessor(const IspProcessor &) = delete;
+  IspProcessor &operator=(const IspProcessor &) = delete;
+
+  IspMode mode() const { return mode_; }
+  bool UsesFastBalanced() const { return IspModeUsesFastBalanced(mode_); }
+  bool UsesUyvy422() const { return IspModeUsesUyvy422(mode_); }
+  int OutputCvType() const { return IspModeOutputCvType(mode_); }
+
+  void ApplyParallel(const IspFrameJob *jobs, int n) {
+    if (n <= 0) return;
+    CV_Assert(jobs != nullptr);
+    n = std::min(n, 4);
+
+    if (UsesFastBalanced()) {
+      std::array<detail::FastBalancedIspDispatchJob, 4> dispatch{};
+      const IspPixelFormat output_format =
+          UsesUyvy422() ? IspPixelFormat::kUyvy422Bt601FullRange
+                        : IspPixelFormat::kBgr888;
+      for (int i = 0; i < n; ++i) {
+        CV_Assert(jobs[i].raw != nullptr && jobs[i].output != nullptr);
+        dispatch[i].raw = jobs[i].raw;
+        dispatch[i].output = jobs[i].output;
+        dispatch[i].wb = &fast_wb_[i];
+        dispatch[i].name = jobs[i].name;
+        dispatch[i].sensor_gain = jobs[i].sensor_gain;
+        dispatch[i].bayer = jobs[i].bayer;
+        dispatch[i].output_format = output_format;
+      }
+      detail::ApplyFastBalancedISPParallelImpl(dispatch.data(), n);
+      return;
+    }
+
+    const cv::Mat *raws[4]{};
+    cv::Mat *outputs[4]{};
+    const char *names[4]{};
+    double sensor_gains[4]{};
+    BayerConversion bayers[4]{};
+    for (int i = 0; i < n; ++i) {
+      CV_Assert(jobs[i].raw != nullptr && jobs[i].output != nullptr &&
+                jobs[i].name != nullptr);
+      raws[i] = jobs[i].raw;
+      outputs[i] = jobs[i].output;
+      names[i] = jobs[i].name;
+      sensor_gains[i] = jobs[i].sensor_gain;
+      bayers[i] = jobs[i].bayer;
+    }
+    detail::ApplyQualityReferenceISPParallel(
+        raws, outputs, names, sensor_gains, bayers, n);
+  }
+  void ApplyParallel(std::initializer_list<IspFrameJob> jobs) {
+    ApplyParallel(jobs.begin(), static_cast<int>(jobs.size()));
+  }
+
+ private:
+  IspMode mode_;
+  std::array<WhiteBalance, 4> fast_wb_{};
+};
 
 inline bool FastBalancedIspEnabled() {
   const char *mode = std::getenv("CYPERSTEREO_ISP_MODE");

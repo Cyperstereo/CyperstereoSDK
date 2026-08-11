@@ -26,7 +26,6 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <mutex>
 #include "../src/usb/uvc/cyperstereo_api.h"
-#include "../src/usb/uvc/hdr_isp.h"
 #include "../src/usb/uvc/tic_toc.h"
 #include "../src/usb/uvc/thread_priority.h"
 
@@ -127,6 +126,163 @@ static void Uyvy422Bt601FullRangeToBgrPreview(const cv::Mat &uyvy,
       }
     }
   }
+}
+
+static IspMode ConfigureCaptureIsp(bool use_fast_balanced,
+                                   bool use_uyvy422,
+                                   bool show_preview,
+                                   int capture_log_every,
+                                   size_t output_stride,
+                                   int num_cameras) {
+  const IspMode mode =
+      !use_fast_balanced
+          ? IspMode::kQualityReferenceBgr888
+          : (use_uyvy422
+                 ? IspMode::kFastBalancedUyvy422Bt601FullRange
+                 : IspMode::kFastBalancedBgr888);
+
+  std::cout << "ISP mode: "
+            << (use_fast_balanced ? "fast-balanced" : "quality-reference")
+            << std::endl;
+  if (use_uyvy422) {
+    std::cout << "ISP output: UYVY422 CV_8UC2, bytes=[Cb Y0 Cr Y1], "
+                 "BT.601 full-range, chroma=4:2:0-derived/vertically "
+                 "duplicated, stride="
+              << output_stride << " bytes; output RGB tone deferred"
+              << std::endl;
+    if (show_preview) {
+      std::cout << "Preview: sampled full-range UYVY-to-BGR conversion; "
+                << (FastBalancedGammaEnabled() ? "RGB tone applied"
+                                               : "RGB tone disabled")
+                << std::endl;
+    }
+  } else {
+    std::cout << "ISP output: BGR888 CV_8UC3"
+              << (use_fast_balanced ? " (RGB tone follows ISP setting)"
+                                    : " (quality-reference/HDR)")
+              << std::endl;
+  }
+
+  if (capture_log_every == 0)
+    std::cout << "Capture metadata log: quiet" << std::endl;
+  else
+    std::cout << "Capture metadata log: every " << capture_log_every
+              << " frame(s)" << std::endl;
+
+  if (use_fast_balanced) {
+    std::cout << "Fast ISP: rgb_tone="
+              << (use_uyvy422
+                      ? "bypassed-for-direct-YUV"
+                      : (FastBalancedGammaEnabled() ? "on" : "off"))
+              << " hue_guard="
+              << (FastBalancedHueGuardEnabled() ? "on" : "off")
+              << " bayer_nr="
+              << (FastBalancedBayerNrEnabled() ? "adaptive>=3x" : "off")
+              << " demosaic=" << FastBalancedDemosaicName()
+              << " saturation=" << IspSaturation() << std::endl;
+#if defined(CYPERSTEREO_RK3588) && defined(__aarch64__) && defined(__linux__)
+    if (num_cameras >= 4) {
+      std::cout << "RK3588 capture CPUs: CPU4-7 only "
+                   "(four Cortex-A76; A55 disabled)"
+                << std::endl;
+    }
+#else
+    (void)num_cameras;
+#endif
+  }
+  return mode;
+}
+
+static void LogCaptureDiagnostics(
+    int count, int capture_log_every, int num_cameras,
+    double image_timestamp, const double exposure_time[4],
+    const uint16_t exposure_lines[4], const double camera_gain[4],
+    const double camera_temperature[4],
+    const cyperstereo::IMUStreamData &imu_data,
+    const cyperstereo::GNSSStreamData &gnss_data,
+    const cyperstereo::FrameInfo &frame_info, TicToc &frame_timer,
+    std::ostringstream &capture_log) {
+  const bool log_this_frame =
+      capture_log_every > 0 && count % capture_log_every == 0;
+  bool log_new_gnss = false;
+  if (gnss_data.valid && !gnss_data.gnss_utc_time.empty()) {
+    static std::string last_gnss_time;
+    if (gnss_data.gnss_utc_time != last_gnss_time) {
+      log_new_gnss = capture_log_every > 0;
+      last_gnss_time = gnss_data.gnss_utc_time;
+    }
+  }
+
+  const bool log_status = (count + 1) % 1000 == 0;
+  double frame_rate = 0.0;
+  if (log_status) {
+    frame_rate = 1000 / (frame_timer.toc() / 1000);
+    frame_timer.tic();
+  }
+
+  const bool have_output =
+      log_this_frame || log_new_gnss ||
+      (log_status && capture_log_every > 0);
+  if (!have_output) return;
+
+  capture_log.str(std::string());
+  capture_log.clear();
+  if (log_this_frame) {
+    capture_log << std::fixed << std::setprecision(6)
+                << "[meta] image_ts=" << image_timestamp
+                << "  imu_n=" << imu_data.imu_count << '\n';
+    for (int i = 0; i < imu_data.imu_count; ++i) {
+      capture_log << std::fixed << std::setprecision(4)
+                  << "  imu_ts[" << i << "]=" << imu_data.imu_timestamp[i]
+                  << "  acc[" << i << "]=(" << imu_data.acc_x[i] * g << ","
+                  << imu_data.acc_y[i] * g << ","
+                  << imu_data.acc_z[i] * g << ")"
+                  << std::setprecision(6)
+                  << "  gyro[" << i << "]=(" << imu_data.gyro_x[i] << ","
+                  << imu_data.gyro_y[i] << "," << imu_data.gyro_z[i] << ")"
+                  << "  T[" << i << "]=" << imu_data.temperature[i] << '\n';
+    }
+
+    // FPGA AEC targets are controller state, not sensor-register readback.
+    if (num_cameras >= 4) {
+      static const char *const kCameraNames[4] = {
+          "image1(L,C1)", "image2(R,C2)",
+          "image3(LF,C4)", "image4(RF,C3)"};
+      capture_log << std::fixed << std::setprecision(6)
+                  << "[cam] frame_end_ts=" << image_timestamp << '\n';
+      for (int i = 0; i < 4; ++i) {
+        capture_log << "  " << kCameraNames[i]
+                    << "  aec_exp=" << std::setprecision(3)
+                    << exposure_time[i] * 1000.0 << "ms ("
+                    << exposure_lines[i] << " lines)"
+                    << "  aec_gain=" << std::setprecision(2)
+                    << camera_gain[i] << "x"
+                    << "  sensor_temp=" << camera_temperature[i] << "C\n";
+      }
+    }
+  }
+
+  if (log_new_gnss) {
+    capture_log << std::fixed << std::setprecision(6)
+                << "[gnss] ts=" << gnss_data.gnss_timestamp
+                << "  utc=" << gnss_data.gnss_utc_time
+                << "  lat=" << gnss_data.latitude
+                << "  lon=" << gnss_data.longitude
+                << "  alt=" << gnss_data.altitude
+                << "  fix=" << gnss_data.fix_type
+                << "  sat=" << gnss_data.satellites_used
+                << "  vel=" << gnss_data.velocity
+                << "  heading=" << gnss_data.heading
+                << "  hdop=" << gnss_data.hdop
+                << "  vdop=" << gnss_data.vdop
+                << "  pdop=" << gnss_data.pdop << '\n';
+  }
+  if (log_status && capture_log_every > 0) {
+    capture_log << "frame_rate " << frame_rate
+                << "  image_drops=" << frame_info.image_drop_count
+                << "  imu_drops=" << frame_info.imu_drop_count << '\n';
+  }
+  std::cout << capture_log.str() << std::flush;
 }
 
 #ifndef _WIN32
@@ -292,54 +448,10 @@ static int run(int argc, char *argv[]) {
   // Empty in headless operation. Full-range UYVY is converted only for the
   // sampled frames that are actually sent to HighGUI.
   cv::Mat preview_color[4];
-  WhiteBalance fast_wb[4];
-  std::cout << "ISP mode: "
-            << (use_fast_balanced ? "fast-balanced" : "quality-reference")
-            << std::endl;
-  if (use_uyvy422) {
-    std::cout << "ISP output: UYVY422 CV_8UC2, bytes=[Cb Y0 Cr Y1], "
-                 "BT.601 full-range, chroma=4:2:0-derived/vertically "
-                 "duplicated, stride="
-              << left_color.step[0]
-              << " bytes; output RGB tone deferred"
-              << std::endl;
-    if (show_preview) {
-      std::cout << "Preview: sampled full-range UYVY-to-BGR conversion; "
-                << (FastBalancedGammaEnabled() ? "RGB tone applied"
-                                               : "RGB tone disabled")
-                << std::endl;
-    }
-  } else {
-    std::cout << "ISP output: BGR888 CV_8UC3"
-              << (use_fast_balanced ? " (RGB tone follows ISP setting)"
-                                    : " (quality-reference/HDR)")
-              << std::endl;
-  }
-  if (capture_log_every == 0)
-    std::cout << "Capture metadata log: quiet" << std::endl;
-  else
-    std::cout << "Capture metadata log: every " << capture_log_every
-              << " frame(s)" << std::endl;
-  if (use_fast_balanced) {
-    std::cout << "Fast ISP: rgb_tone="
-              << (use_uyvy422
-                      ? "bypassed-for-direct-YUV"
-                      : (FastBalancedGammaEnabled() ? "on" : "off"))
-              << " hue_guard="
-              << (FastBalancedHueGuardEnabled() ? "on" : "off")
-              << " bayer_nr="
-              << (FastBalancedBayerNrEnabled() ? "adaptive>=3x" : "off")
-              << " demosaic="
-              << FastBalancedDemosaicName()
-              << " saturation=" << IspSaturation() << std::endl;
-#if defined(CYPERSTEREO_RK3588) && defined(__aarch64__) && defined(__linux__)
-    if (num_cameras >= 4) {
-      std::cout << "RK3588 capture CPUs: CPU4-7 only "
-                   "(four Cortex-A76; A55 disabled)"
-                << std::endl;
-    }
-#endif
-  }
+  const IspMode isp_mode = ConfigureCaptureIsp(
+      use_fast_balanced, use_uyvy422, show_preview, capture_log_every,
+      left_color.step[0], num_cameras);
+  IspProcessor isp(isp_mode);
 
   //imshow windows init
   constexpr int kShowEvery = 5;
@@ -439,37 +551,13 @@ static int run(int argc, char *argv[]) {
       // Each camera uses its own live AEC gain from the metadata row.
       const BayerConversion image13_bayer =
           SelectBayerConversion(hardware_version, software_version, 0);
-      if (use_uyvy422) {
-        ApplyFastBalancedISPUyvy422Parallel({
-            {left_image, left_color, fast_wb[0], "fast-cam1",
-             camera_gain[0], image13_bayer},
-            {right_image, right_color, fast_wb[1], "fast-cam2",
-             camera_gain[1]},
-            {left_front_image, left_front_color, fast_wb[2], "fast-cam3",
-             camera_gain[2], image13_bayer},
-            {right_front_image, right_front_color, fast_wb[3], "fast-cam4",
-             camera_gain[3]},
-        });
-      } else if (use_fast_balanced) {
-        ApplyFastBalancedISPParallel({
-            {left_image, left_color, fast_wb[0], "fast-cam1",
-             camera_gain[0], image13_bayer},
-            {right_image, right_color, fast_wb[1], "fast-cam2",
-             camera_gain[1]},
-            {left_front_image, left_front_color, fast_wb[2], "fast-cam3",
-             camera_gain[2], image13_bayer},
-            {right_front_image, right_front_color, fast_wb[3], "fast-cam4",
-             camera_gain[3]},
-        });
-      } else {
-        ApplyHdrIspParallel({
-            {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
-            {right_image, right_color, "cam2", camera_gain[1]},
-            {left_front_image, left_front_color, "cam3", camera_gain[2],
-             image13_bayer},
-            {right_front_image, right_front_color, "cam4", camera_gain[3]},
-        });
-      }
+      isp.ApplyParallel({
+          {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
+          {right_image, right_color, "cam2", camera_gain[1]},
+          {left_front_image, left_front_color, "cam3", camera_gain[2],
+           image13_bayer},
+          {right_front_image, right_front_color, "cam4", camera_gain[3]},
+      });
       //std::cout << "proc(wb+cvt) " << proc.toc() << std::endl;
       
       if (show_preview && count % kShowEvery == 0) {
@@ -509,94 +597,10 @@ static int run(int argc, char *argv[]) {
       }
     }
 
-    // Runtime metadata is diagnostic, not part of the image pipeline.  Build
-    // one frame's report off-line and write/flush it once so verbose logging
-    // does not issue one syscall per IMU/camera line.  RK3588 defaults to a
-    // one-second sample (30 frames); --verbose restores the legacy per-frame
-    // stream and --quiet removes recurring metadata output entirely.
-    const bool log_this_frame =
-        capture_log_every > 0 && count % capture_log_every == 0;
-    bool log_new_gnss = false;
-    if (gnss_data.valid && !gnss_data.gnss_utc_time.empty()) {
-      static std::string last_gnss_time;
-      if (gnss_data.gnss_utc_time != last_gnss_time) {
-        log_new_gnss = capture_log_every > 0;
-        last_gnss_time = gnss_data.gnss_utc_time;
-      }
-    }
-    const bool log_status = (count + 1) % 1000 == 0;
-    double frame_rate = 0.0;
-    if (log_status) {
-      frame_rate = 1000 / (t_frame.toc() / 1000);
-      t_frame.tic();
-    }
-
-    // GNSS is sparse, so preserve immediate non-duplicate reporting even
-    // when frame metadata is sampled.  --quiet suppresses recurring output.
-    if (log_this_frame || log_new_gnss ||
-        (log_status && capture_log_every > 0)) {
-      capture_log.str(std::string());
-      capture_log.clear();
-    }
-    if (log_this_frame) {
-      capture_log << std::fixed << std::setprecision(6)
-                  << "[meta] image_ts=" << image_timestamp
-                  << "  imu_n=" << imu_data.imu_count << '\n';
-      for (int i = 0; i < imu_data.imu_count; ++i) {
-        capture_log << std::fixed << std::setprecision(4)
-                    << "  imu_ts[" << i << "]=" << imu_data.imu_timestamp[i]
-                    << "  acc[" << i << "]=(" << imu_data.acc_x[i] * g << ","
-                    << imu_data.acc_y[i] * g << ","
-                    << imu_data.acc_z[i] * g << ")"
-                    << std::setprecision(6)
-                    << "  gyro[" << i << "]=(" << imu_data.gyro_x[i] << ","
-                    << imu_data.gyro_y[i] << "," << imu_data.gyro_z[i] << ")"
-                    << "  T[" << i << "]=" << imu_data.temperature[i]
-                    << '\n';
-      }
-
-      // FPGA AEC targets are controller state, not sensor-register readback.
-      if (num_cameras >= 4) {
-        static const char *kCameraNames[4] = {
-            "image1(L,C1)", "image2(R,C2)",
-            "image3(LF,C4)", "image4(RF,C3)"};
-        capture_log << std::fixed << std::setprecision(6)
-                    << "[cam] frame_end_ts=" << image_timestamp << '\n';
-        for (int i = 0; i < 4; ++i) {
-          capture_log << "  " << kCameraNames[i]
-                      << "  aec_exp=" << std::setprecision(3)
-                      << exposure_time[i] * 1000.0 << "ms ("
-                      << exposure_lines[i] << " lines)"
-                      << "  aec_gain=" << std::setprecision(2)
-                      << camera_gain[i] << "x"
-                      << "  sensor_temp=" << camera_temperature[i] << "C\n";
-        }
-      }
-    }
-
-    if (log_new_gnss) {
-      capture_log << std::fixed << std::setprecision(6)
-                  << "[gnss] ts=" << gnss_data.gnss_timestamp
-                  << "  utc=" << gnss_data.gnss_utc_time
-                  << "  lat=" << gnss_data.latitude
-                  << "  lon=" << gnss_data.longitude
-                  << "  alt=" << gnss_data.altitude
-                  << "  fix=" << gnss_data.fix_type
-                  << "  sat=" << gnss_data.satellites_used
-                  << "  vel=" << gnss_data.velocity
-                  << "  heading=" << gnss_data.heading
-                  << "  hdop=" << gnss_data.hdop
-                  << "  vdop=" << gnss_data.vdop
-                  << "  pdop=" << gnss_data.pdop << '\n';
-    }
-    if (log_status && capture_log_every > 0) {
-      capture_log << "frame_rate " << frame_rate
-                  << "  image_drops=" << frame_info.image_drop_count
-                  << "  imu_drops=" << frame_info.imu_drop_count << '\n';
-    }
-    if (log_this_frame || log_new_gnss ||
-        (log_status && capture_log_every > 0))
-      std::cout << capture_log.str() << std::flush;
+    LogCaptureDiagnostics(
+        count, capture_log_every, num_cameras, image_timestamp, exposure_time,
+        exposure_lines, camera_gain, camera_temperature, imu_data, gnss_data,
+        frame_info, t_frame, capture_log);
     ++count;
   }
   stream.Stop();
