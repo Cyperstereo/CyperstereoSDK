@@ -28,6 +28,11 @@ set(TARGET_BOARD "auto" CACHE STRING
 set_property(CACHE TARGET_BOARD PROPERTY STRINGS
     auto native rk3588 sunrise-x5 pi5 pi4 pi3
     jetson-xavier jetson-orin jetson-thor generic)
+string(TOLOWER "${TARGET_BOARD}" TARGET_BOARD)
+if(NOT TARGET_BOARD MATCHES
+   "^(auto|native|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic)$")
+  message(FATAL_ERROR "Unknown TARGET_BOARD=${TARGET_BOARD}")
+endif()
 
 function(cyperstereo_pick_first_supported_flag out_var)
   set(_selected "")
@@ -120,21 +125,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     endif()
     if(CYPERSTEREO_CPU_TUNE STREQUAL "portable")
       set(_cyper_arm_candidates
-          "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard"
-          "-march=armv7-a -mfpu=neon -mfloat-abi=hard")
+          "-march=armv7-a -mfpu=neon-vfpv4"
+          "-march=armv7-a -mfpu=neon")
     elseif(TARGET_BOARD STREQUAL "native" OR
        (TARGET_BOARD STREQUAL "auto" AND NOT CMAKE_CROSSCOMPILING))
       set(_cyper_arm_candidates
-          "-mcpu=native -mfpu=neon-vfpv4 -mfloat-abi=hard"
-          "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard")
+          "-mcpu=native -mfpu=neon-vfpv4"
+          "-march=armv7-a -mfpu=neon-vfpv4")
     elseif(TARGET_BOARD MATCHES "^(rk3588|sunrise-x5|pi5|pi4|pi3)$")
       set(_cyper_arm_candidates
-          "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard"
-          "-march=armv7-a -mfpu=neon -mfloat-abi=hard")
+          "-march=armv7-a -mfpu=neon-vfpv4"
+          "-march=armv7-a -mfpu=neon")
     elseif(TARGET_BOARD STREQUAL "auto" OR TARGET_BOARD STREQUAL "generic")
       set(_cyper_arm_candidates
-          "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard"
-          "-march=armv7-a -mfpu=neon -mfloat-abi=hard")
+          "-march=armv7-a -mfpu=neon-vfpv4"
+          "-march=armv7-a -mfpu=neon")
     else()
       message(FATAL_ERROR
               "TARGET_BOARD=${TARGET_BOARD} has no supported ARMv7 profile")
@@ -215,6 +220,10 @@ catkin_package(CATKIN_DEPENDS
 )
 
 add_executable(capture_image_imu capture_image_imu.cpp)
+if(TARGET_BOARD STREQUAL "rk3588" AND
+   _cyper_cpu MATCHES "^(aarch64|arm64|arm|armv[0-9])")
+  target_compile_definitions(Cyperlib PUBLIC CYPERSTEREO_RK3588=1)
+endif()
 cyperstereo_optimise_target(Cyperlib)
 cyperstereo_optimise_target(capture_image_imu)
 target_link_libraries(capture_image_imu

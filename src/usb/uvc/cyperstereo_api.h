@@ -27,6 +27,7 @@
 #include <opencv2/core/hal/intrin.hpp>
 #include "uvc.h"
 #include "bayer_format.h"
+#include "smartsens_metadata.h"
 #include "tic_toc.h"
 #include "thread_priority.h"
 
@@ -379,24 +380,12 @@ static constexpr int kMt9FrameWidth = 752;
 static constexpr int kMt9FrameHeight = 480;
 static constexpr int kMt9FrameFps = 60;
 
-static constexpr int kMetaImuBaseCol = 5;
-static constexpr int kImuWordsPerSample = 9;
-static constexpr int kImuMaxSamplesPerFrame = 7;
-
 static constexpr double kImuGapThresholdSec = 0.007;
-static constexpr double kImageGapThresholdSec = 0.040;
 
-// SmartSens SC136HGS row(line) time in the 30Hz continuous build:
-//   Current FPGA table writes HTS = 0x016a = 362 at 15 MHz EXTCLK.
-//   Relative to the characterized 364-row/24us timing:
-//   Tline = 24us * 362 / 364 ~= 23.868132us.
-//   exposure_time[s] = exposure_lines * kSmartSensLineTimeSec.
-static constexpr double kSmartSensLineTimeSec = 23.868131868e-6;
-
-// Dynamic IMU sample-count detection. This firmware packs a VARIABLE number of
-// IMU samples per frame (e.g. ~200Hz IMU vs ~54fps image => 3 or 4 per frame)
-// and does NOT zero unused metadata slots -- they retain a stale value. So the
-// genuine sample count is found by validating each slot against:
+// Dynamic IMU sample-count detection. Firmware 03/04 pack a variable number
+// of samples and can leave stale values in unused slots; firmware 05 reserves
+// 13 slots and explicitly zero-fills unused/startup slots. The genuine count
+// is found by the v05 zero marker first, then by validating each slot against:
 //   (a) timestamp continuity: within a window of the image timestamp, and a
 //       small forward step from the previous accepted sample; and
 //   (b) temperature plausibility: within the BMI088 range and only a small
@@ -424,7 +413,8 @@ struct CameraProfile {
 
 static constexpr CameraProfile kProfileSmartSens{
     "SmartSens(Cyper-ego)", 2, 3, kFx3FrameWidth, kFx3FrameHeight, kFx3FrameFps,
-    4, kFx3HalfFrameWidth, kFx3FrameHeight - 1, 7, 72};
+    4, kFx3HalfFrameWidth, kFx3FrameHeight - 1,
+    kSmartSensLegacyImuSamplesPerFrame, 72};
 
 static constexpr CameraProfile kProfileM150{
     "MT9V034(M150)", 0, 2, kMt9FrameWidth, kMt9FrameHeight, kMt9FrameFps,
@@ -501,8 +491,11 @@ inline const CameraProfile &SelectProfile(const std::string &serial_num,
 #define BMI088_GYRO_500_SEN 0.0002663161044650608
 #define BMI088_GYRO_250_SEN 0.0001331580522325304
 #define BMI088_GYRO_125_SEN 0.00006657902611626519
-double BMI088_ACCEL_SEN = BMI088_ACCEL_6G_SEN;
-double BMI088_GYRO_SEN = BMI088_GYRO_2000_SEN;
+// Header-only SDK constants need internal linkage on C++14 builds.  Keeping
+// writable definitions here creates duplicate symbols as soon as a Linux/ROS
+// application includes this header from more than one translation unit.
+static constexpr double BMI088_ACCEL_SEN = BMI088_ACCEL_6G_SEN;
+static constexpr double BMI088_GYRO_SEN = BMI088_GYRO_2000_SEN;
 
 
 struct IMUStreamData {
@@ -610,8 +603,8 @@ struct FrameInfo {
   double last_image_timestamp{0};
   // Running IMU die-temperature reference for stale-slot rejection. The BMI088
   // temperature changes very slowly, so a genuine sample stays close to this;
-  // a stale/held-over metadata slot (this firmware does not zero unused IMU
-  // slots) jumps away from it. Sentinel < -900 means "no reference yet".
+  // a stale/held-over legacy metadata slot jumps away from it. Firmware 05
+  // zero-filled slots are rejected explicitly. Sentinel < -900 means no ref.
   double last_imu_temperature{-1000.0};
   // Anomaly replay ring: last kDiagRingLen frames of raw metadata.
   static constexpr int kDiagRingLen = 10;
@@ -7403,6 +7396,33 @@ CYPERSTEREO_AVX2_TARGET inline void FastApplyHueGuard16Avx2(
 }
 #endif
 
+// Keep the persistent ISP working planes behind one block-scope TLS object.
+// MSVC has a per-function limit on separately initialized/destructed local
+// statics (C2603); one aggregate preserves the existing per-thread lifetime
+// and reuse semantics without disabling thread-safe static initialization.
+struct SuppressFalseColorScratch {
+  cv::Mat y8, y_bl, colsum;
+  cv::Mat yq8, sq_q, mean_i, mean_ii, a_q, b_q;
+  cv::Mat a_q16, b_q16;
+  cv::Mat hf_q8, tex_q;
+  cv::Mat luma_hf_ring, luma_hs_ring;
+  cv::Mat residual_keep_q8;
+  cv::Mat chroma_blend_q8;
+  cv::Mat hue_protect_q8;
+  cv::Mat hue_min_keep_q8;
+  cv::Mat bgr_h, ycc_h, ch_h[3];
+  cv::Mat cr_h, cb_h;
+  cv::Mat cr_med_h, cb_med_h;
+  cv::Mat base_cr_q, base_cb_q;
+  cv::Mat g5_tmp_full, g5_tmp_half;
+#if (defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)) || \
+    defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
+  cv::Mat chroma_gauss_ring_cr, chroma_gauss_ring_cb;
+  cv::Mat chroma_box_ring_cr, chroma_box_ring_cb;
+  cv::Mat chroma_down_cr, chroma_down_cb;
+#endif
+};
+
 inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
                                    double sensor_gain = 1.0,
                                    bool linear_input = false,
@@ -7427,30 +7447,42 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   // interpretation.  Callers requesting UYVY must explicitly take the
   // filtered full-range ISP planes before that display-oriented curve.
   CV_Assert(!output_uyvy || !apply_tone);
-  static thread_local cv::Mat y8, y_bl, colsum;              // u8 full res
-  static thread_local cv::Mat yq8, sq_q, mean_i, mean_ii, a_q, b_q;
-  static thread_local cv::Mat a_q16, b_q16;                  // u16 coeffs
-  static thread_local cv::Mat hf_q8, tex_q;                  // u8 quarter
-  static thread_local cv::Mat luma_hf_ring, luma_hs_ring;    // AVX2 3-row rings
-  static thread_local cv::Mat residual_keep_q8;              // u8 Q7 gate
-  static thread_local cv::Mat chroma_blend_q8;               // u8 HDR-like mix
-  static thread_local cv::Mat hue_protect_q8;                // u8 sparse guard
-  static thread_local cv::Mat hue_min_keep_q8;               // u8 magnitude floor
-  static thread_local cv::Mat bgr_h, ycc_h, ch_h[3];         // half res
-  static thread_local cv::Mat cr_h, cb_h;                    // u8 half
+  static thread_local SuppressFalseColorScratch scratch;
+  cv::Mat &y8 = scratch.y8, &y_bl = scratch.y_bl,
+          &colsum = scratch.colsum;                           // u8 full res
+  cv::Mat &yq8 = scratch.yq8, &sq_q = scratch.sq_q,
+          &mean_i = scratch.mean_i, &mean_ii = scratch.mean_ii,
+          &a_q = scratch.a_q, &b_q = scratch.b_q;
+  cv::Mat &a_q16 = scratch.a_q16, &b_q16 = scratch.b_q16;    // u16 coeffs
+  cv::Mat &hf_q8 = scratch.hf_q8, &tex_q = scratch.tex_q;    // u8 quarter
+  cv::Mat &luma_hf_ring = scratch.luma_hf_ring,
+          &luma_hs_ring = scratch.luma_hs_ring;               // AVX2 rings
+  cv::Mat &residual_keep_q8 = scratch.residual_keep_q8;       // u8 Q7 gate
+  cv::Mat &chroma_blend_q8 = scratch.chroma_blend_q8;         // u8 HDR mix
+  cv::Mat &hue_protect_q8 = scratch.hue_protect_q8;           // sparse guard
+  cv::Mat &hue_min_keep_q8 = scratch.hue_min_keep_q8;         // magnitude floor
+  cv::Mat &bgr_h = scratch.bgr_h, &ycc_h = scratch.ycc_h;     // half res
+  cv::Mat (&ch_h)[3] = scratch.ch_h;
+  cv::Mat &cr_h = scratch.cr_h, &cb_h = scratch.cb_h;         // u8 half
   // Keep median3 out-of-place. OpenCV must clone the whole source when its
   // input/output alias; these persistent ping-pong planes remove that hidden
   // copy while executing the exact same optimized median sorting network.
-  static thread_local cv::Mat cr_med_h, cb_med_h;            // u8 half
-  static thread_local cv::Mat base_cr_q, base_cb_q;          // u8 quarter
-  static thread_local cv::Mat g5_tmp_full, g5_tmp_half;      // u16 scratch
+  cv::Mat &cr_med_h = scratch.cr_med_h,
+          &cb_med_h = scratch.cb_med_h;                       // u8 half
+  cv::Mat &base_cr_q = scratch.base_cr_q,
+          &base_cb_q = scratch.base_cb_q;                     // u8 quarter
+  cv::Mat &g5_tmp_full = scratch.g5_tmp_full,
+          &g5_tmp_half = scratch.g5_tmp_half;                 // u16 scratch
 #if (defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)) || \
     defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
   // Persistent 8-row rings for exact Gauss5 -> area/2 -> box7 streaming.
   // At the production 640x512 half-grid these total 31,360 bytes/thread.
-  static thread_local cv::Mat chroma_gauss_ring_cr, chroma_gauss_ring_cb;
-  static thread_local cv::Mat chroma_box_ring_cr, chroma_box_ring_cb;
-  static thread_local cv::Mat chroma_down_cr, chroma_down_cb;
+  cv::Mat &chroma_gauss_ring_cr = scratch.chroma_gauss_ring_cr,
+          &chroma_gauss_ring_cb = scratch.chroma_gauss_ring_cb;
+  cv::Mat &chroma_box_ring_cr = scratch.chroma_box_ring_cr,
+          &chroma_box_ring_cb = scratch.chroma_box_ring_cb;
+  cv::Mat &chroma_down_cr = scratch.chroma_down_cr,
+          &chroma_down_cb = scratch.chroma_down_cb;
 #endif
 
   const int output_type = output_uyvy ? CV_8UC2 : CV_8UC3;
@@ -8561,7 +8593,7 @@ inline void ApplyISP(cv::Mat &raw, cv::Mat &color, WhiteBalance &wb,
   // "post" in the profile; "demosaic" reads ~0 on that path.
   // The hand-fused ARM kernel implements the legacy RG2BGR-equivalent CFA.
   // Use OpenCV EA for the opposite phase until that kernel has a pattern-aware
-  // implementation; correctness takes priority for software version 04.
+  // implementation; correctness takes priority for software versions 04/05.
   const bool fused_demosaic =
       UseFusedDemosaic() &&
       bayer == BayerConversion::kColorBayerRg2Bgr;
@@ -9173,7 +9205,7 @@ inline bool FastBalancedIspEnabled() {
          std::strcmp(mode, "fast-balanced") == 0;
 }
 
-cv::Mat FastGuidedfilter(cv::Mat &I, int r, float eps, int size) {
+inline cv::Mat FastGuidedfilter(cv::Mat &I, int r, float eps, int size) {
     r = r / size;
     int wsize = 2 * r + 1;
     I.convertTo(I, CV_32FC1, 1/255.0);
@@ -9213,7 +9245,8 @@ cv::Mat FastGuidedfilter(cv::Mat &I, int r, float eps, int size) {
 }
 
 
-bool FindCyperstereoDevices(std::shared_ptr<uvc::device>& cyperstereo_device) {
+inline bool FindCyperstereoDevices(
+    std::shared_ptr<uvc::device>& cyperstereo_device) {
   std::vector<std::shared_ptr<uvc::device>> cyperstereo_devices;
 
   auto context = uvc::create_context();
@@ -9268,7 +9301,7 @@ bool FindCyperstereoDevices(std::shared_ptr<uvc::device>& cyperstereo_device) {
   return true;
 }
 
-void WaitForStream(FrameInfo& frame_info) {
+inline void WaitForStream(FrameInfo& frame_info) {
   std::unique_lock<std::mutex> lock(frame_info.mtx);
   const auto frame_ready = [&frame_info]() { return frame_info.frame != nullptr; };
   // Never throw on timeout: the capture layer restarts the stream (and, if
@@ -9286,7 +9319,8 @@ void WaitForStream(FrameInfo& frame_info) {
   frame_info.frame = nullptr;
 }
 
-void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()> continuation) {
+inline void SetStreamData(FrameInfo& frame_info, const void *data,
+                          std::function<void()> continuation) {
   const auto t_cb_start = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lock(frame_info.mtx);
   frame_info.host_gap_ms =
@@ -9329,7 +9363,13 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
         const int imu_end_col =
             kMetaImuBaseCol + prof.imu_samples_per_frame * kImuWordsPerSample;
         const int gnss_end_col = prof.gnss_base_col + 23;
-        const int needed_cols = imu_end_col > gnss_end_col ? imu_end_col : gnss_end_col;
+        // The SmartSens marker itself selects either the 81-column legacy
+        // layout or the 135-column v5 layout, so validate against the largest
+        // supported layout before reading the marker. MT9 keeps its GNSS bound.
+        const int needed_cols =
+            prof.num_cameras >= 4
+                ? kSmartSensMaxMetadataCols
+                : (imu_end_col > gnss_end_col ? imu_end_col : gnss_end_col);
         if (prof.meta_row < lo_plane->rows && lo_plane->cols >= needed_cols) {
           const uchar *hi = hi_plane->ptr<uchar>(prof.meta_row);
           const uchar *lo = lo_plane->ptr<uchar>(prof.meta_row);
@@ -9342,14 +9382,16 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
 
           const int ver0 = meta_u(0);
           const int ver1 = meta_u(1);
+          const SmartSensMetadataLayout smartsens_layout =
+              GetSmartSensMetadataLayout(ver0, ver1);
           bool marker_ok =
               (ver0 == prof.hardware_version) && (ver1 == prof.software_version);
 
-          // SmartSens hardware 02 has two supported FPGA metadata/software
-          // layouts.  Version 03 uses the legacy Bayer conversion on all four
-          // planes; version 04 marks C1/C4 (images 1/3) as the opposite Bayer
-          // phase after sensor mirror+flip.  Their metadata layout is otherwise
-          // compatible, so accept and latch either marker.
+          // SmartSens hardware 02 supports software 03/04 with the legacy
+          // seven-slot metadata layout and software 05 with the 13-slot layout.
+          // Version 03 uses the legacy Bayer phase; versions 04/05 use the
+          // mirror+flip phase for C1/C4. Accept the marker, then latch both the
+          // live version and its matching slot count for all parsing below.
           if (prof.num_cameras >= 4 &&
               IsSupportedSmartSensFirmware(ver0, ver1)) {
             if (ver0 != frame_info.profile.hardware_version ||
@@ -9359,6 +9401,8 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
               std::cout << "[api] SmartSens firmware from metadata: "
                         << ver0 << "/" << ver1 << std::endl;
             }
+            frame_info.profile.imu_samples_per_frame =
+                smartsens_layout.imu_samples_per_frame;
             marker_ok = true;
           }
 
@@ -9464,33 +9508,45 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
 
           // Per-camera AE telemetry (SmartSens SC136HGS 4-cam only).  The FPGA
           // metadata row packs a full 16-bit value per column into the two low
-          // byte lanes, so meta_u(col) returns it directly:
-          //   col 69..72   = FPGA AEC target exposure lines C1,C2,C3,C4
-          //   col 73..76   = temperature raw C1,C2,C3,C4 ({0x4c10,0x4c11})
-          //   col 77..80   = FPGA AEC target gain code C1,C2,C3,C4
+          // byte lanes, so meta_u(col) returns it directly. Software 03 has no
+          // telemetry; software 04 uses marker/exp/temp/gain columns
+          // 68/69/73/77; software 05 moves those bases to 122/123/127/131.
           // Values are forwarded directly from the controller state; no
           // exposure/gain sensor-register readback is performed.
           // FPGA byte-lane wiring is DQ[7:0]=C1, DQ[15:8]=C2,
           // DQ[23:16]=C4, DQ[31:24]=C3.  DeinterleaveFourPlanes therefore maps
           // image1..4 to C1,C2,C4,C3 respectively.  All metadata arrays below
           // use that display-plane order so each print follows its own image.
-          if (prof.num_cameras >= 4) {
+          if (prof.num_cameras >= 4 && smartsens_layout.has_ae_telemetry) {
             // FX3 image-plane order is C1,C2,C4,C3.  Metadata columns remain
             // in physical-sensor order C1,C2,C3,C4, so map each plane here.
-            static const int kExpColByPlane[4]     = {69, 70, 72, 71};
-            static const int kTempColByPlane[4]    = {73, 74, 76, 75};
-            static const int kGainColByPlane[4]    = {77, 78, 80, 79};
+            static const int kSensorByPlane[4] = {0, 1, 3, 2};
             for (int p = 0; p < 4; ++p) {
-              const int lines = meta_u(kExpColByPlane[p]);
+              const int sensor = kSensorByPlane[p];
+              const int lines =
+                  meta_u(smartsens_layout.exposure_base_col + sensor);
               fs.exposure_lines[p] = static_cast<uint16_t>(lines);
-              fs.exposure_time[p]  = lines * kSmartSensLineTimeSec;
-              const int traw = meta_u(kTempColByPlane[p]);   // {0x4c10,0x4c11}
+              fs.exposure_time[p] = lines * smartsens_layout.line_time_sec;
+              const int traw =
+                  meta_u(smartsens_layout.temperature_base_col + sensor);
               fs.camera_temperature[p] =
                   ((traw >> 8) * 8 + (traw & 0x7)) / 4.0 - 273.15;
-              fs.camera_gain[p] = meta_u(kGainColByPlane[p]) / 64.0;
+              fs.camera_gain[p] =
+                  meta_u(smartsens_layout.gain_base_col + sensor) / 64.0;
               // Estimated capture midpoint from the target exposure.
               fs.image_midpoint_timestamp[p] =
                   fs.image_timestamp - fs.exposure_time[p] / 2.0;
+            }
+          } else if (prof.num_cameras >= 4) {
+            // Software 03 resumes image pixels immediately after its seven IMU
+            // slots. Do not reinterpret those pixels as telemetry, and clear
+            // any values retained if a FrameInfo is reused across firmware.
+            for (int p = 0; p < 4; ++p) {
+              fs.exposure_lines[p] = 0;
+              fs.exposure_time[p] = 0.0;
+              fs.camera_temperature[p] = 0.0;
+              fs.camera_gain[p] = 0.0;
+              fs.image_midpoint_timestamp[p] = fs.image_timestamp;
             }
           }
 
@@ -9528,16 +9584,20 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
           if (frame_info.last_image_timestamp > 0.0) {
             const double image_gap =
                 fs.image_timestamp - frame_info.last_image_timestamp;
+            const double image_gap_threshold =
+                prof.num_cameras >= 4
+                    ? smartsens_layout.image_gap_threshold_sec
+                    : kImageGapThresholdSec;
             // Flag BOTH directions: a backward step (negative gap) was
             // previously silent, hiding the "stale timestamps then snap
             // forward" failure mode (the forward snap alone looks identical
             // to a genuine counter jump).
-            if (std::fabs(image_gap) > kImageGapThresholdSec) {
+            if (std::fabs(image_gap) > image_gap_threshold) {
               anomaly = true;
               ++frame_info.image_drop_count;
               std::cout << "[drop] image gap=" << std::fixed
                         << std::setprecision(3) << image_gap * 1000.0
-                        << " ms (threshold " << kImageGapThresholdSec * 1000.0
+                        << " ms (threshold " << image_gap_threshold * 1000.0
                         << " ms)  prev_ts=" << frame_info.last_image_timestamp
                         << "  cur_ts=" << fs.image_timestamp
                         << "  host_gap=" << frame_info.host_gap_ms << " ms"
@@ -9610,6 +9670,20 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
           double prev_temp = frame_info.last_imu_temperature;
           for (int i = 0; i < imu_slots; ++i) {
             const int base = kMetaImuBaseCol + i * kImuWordsPerSample;
+            // Software 05 explicitly zero-fills an unused 13th slot and all
+            // slots on an unprefilled startup frame. Stop before timestamp /
+            // temperature heuristics can mistake an all-zero slot as valid.
+            if (prof.num_cameras >= 4 &&
+                smartsens_layout.zero_fills_unused_imu) {
+              bool all_zero = true;
+              for (int word = 0; word < kImuWordsPerSample; ++word) {
+                if (meta_u(base + word) != 0) {
+                  all_zero = false;
+                  break;
+                }
+              }
+              if (all_zero) break;
+            }
             const double imu_count_ms = meta_u(base + 0);
             const double imu_count_s = meta_u(base + 1);
             const double ts = wrap_fix(
@@ -9695,9 +9769,9 @@ void SetStreamData(FrameInfo& frame_info, const void *data, std::function<void()
           }
           ++frame_info.frame_seq;
 
-          // SmartSens 4-cam has no GNSS module, and its metadata cols 72..80 now
-          // carry the per-camera AE telemetry parsed above, which would collide
-          // with the GNSS byte layout.  Only parse GNSS on the MT9V families.
+          // SmartSens 4-cam has no GNSS module. Its versioned metadata region
+          // carries IMU plus per-camera AE telemetry and overlaps the legacy
+          // GNSS byte layout, so only parse GNSS on the MT9V families.
           if (prof.num_cameras >= 4) {
             fs.gnss.valid = false;
           } else {

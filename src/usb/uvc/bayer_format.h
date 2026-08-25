@@ -2,6 +2,7 @@
 #define CYPERSTEREO_BAYER_FORMAT_H_
 
 #include <cstdint>
+#include "smartsens_metadata.h"
 
 namespace cyperstereo {
 
@@ -13,21 +14,23 @@ enum class BayerConversion {
   kColorBayerBg2Bgr,
 };
 
-inline bool IsSupportedSmartSensFirmware(int hardware_version,
-                                         int software_version) {
-  return hardware_version == 2 &&
-         (software_version == 3 || software_version == 4);
-}
-
-// FPGA software 04 mirror+flips C1/C4 in the sensor, which reverses their
-// red/blue Bayer phase.  USB image order is C1,C2,C4,C3, so this applies to
-// display images 1 and 3 (zero-based indices 0 and 2).  Software 03 keeps the
-// legacy conversion on all four images.
+// FPGA software 04 introduced sensor mirror+flip on C1/C4, which reverses
+// their red/blue Bayer phase; software 05 keeps that image orientation while
+// extending the metadata row for 13 IMU slots. USB image order is C1,C2,C4,C3,
+// so the opposite phase applies to display images 1 and 3 (indices 0 and 2).
+// Software 03 keeps the legacy conversion on all four images.
 inline BayerConversion SelectBayerConversion(uint32_t hardware_version,
                                               uint32_t software_version,
                                               int image_index) {
   const bool image_1_or_3 = image_index == 0 || image_index == 2;
-  if (hardware_version == 2 && software_version == 4 && image_1_or_3)
+  const bool mirrored_smartsens =
+      hardware_version ==
+          static_cast<uint32_t>(kSmartSensHardwareVersion) &&
+      (software_version ==
+           static_cast<uint32_t>(kSmartSensSoftwareVersion4) ||
+       software_version ==
+           static_cast<uint32_t>(kSmartSensSoftwareVersion5));
+  if (mirrored_smartsens && image_1_or_3)
     return BayerConversion::kColorBayerBg2Bgr;
   return BayerConversion::kColorBayerRg2Bgr;
 }

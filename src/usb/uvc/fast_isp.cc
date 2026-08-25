@@ -704,7 +704,9 @@ void ApplyQualityReferenceISPParallel(
   if (n <= 0) return;
   CV_Assert(raws != nullptr && outputs != nullptr && names != nullptr &&
             sensor_gains != nullptr && bayers != nullptr);
-  n = std::min(n, 4);
+  // Windows headers may define min as a macro; parenthesize the standard
+  // function so this source builds under MSVC as well as GCC/Clang.
+  n = (std::min)(n, 4);
   std::array<HdrIspJob, 4> jobs{};
   for (int i = 0; i < n; ++i) {
     CV_Assert(raws[i] != nullptr && outputs[i] != nullptr &&

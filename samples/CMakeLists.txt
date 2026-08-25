@@ -52,6 +52,14 @@ include(CheckCXXCompilerFlag)
 
 set(TARGET_BOARD "auto" CACHE STRING
     "CPU tuning: auto|native|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic")
+set_property(CACHE TARGET_BOARD PROPERTY STRINGS
+    auto native rk3588 sunrise-x5 pi5 pi4 pi3
+    jetson-xavier jetson-orin jetson-thor generic)
+string(TOLOWER "${TARGET_BOARD}" TARGET_BOARD)
+if(NOT TARGET_BOARD MATCHES
+   "^(auto|native|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic)$")
+  message(FATAL_ERROR "Unknown TARGET_BOARD=${TARGET_BOARD}")
+endif()
 
 # Linux x86 deployment policy:
 #   native   Build and run on the same host (default, normally fastest).
@@ -139,18 +147,28 @@ elseif(_proc MATCHES "^(arm|armv[0-9])")
   # Keep this branch after aarch64/arm64: names such as armv8l describe a
   # 32-bit userspace and must not receive AArch64 -mcpu/-march options.
   if(TARGET_BOARD STREQUAL "pi3")
-    set(_cands "-mcpu=cortex-a53 -mfpu=neon-fp-armv8 -mfloat-abi=hard"
-               "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard")
+    set(_cands "-mcpu=cortex-a53 -mfpu=neon-fp-armv8"
+               "-march=armv7-a -mfpu=neon-vfpv4")
+  elseif(TARGET_BOARD MATCHES "^(rk3588|sunrise-x5|pi5|pi4)$")
+    # These boards normally run AArch64, but a 32-bit userspace still needs an
+    # ARMv7+NEON binary. Never use the x86 build host's -mcpu=native here.
+    set(_cands "-march=armv7-a -mfpu=neon-vfpv4"
+               "-march=armv7-a -mfpu=neon")
+  elseif(TARGET_BOARD MATCHES "^jetson-")
+    message(FATAL_ERROR
+        "TARGET_BOARD=${TARGET_BOARD} requires a 64-bit AArch64 toolchain")
   elseif(TARGET_BOARD STREQUAL "generic" OR
          (TARGET_BOARD STREQUAL "auto" AND CMAKE_CROSSCOMPILING))
     # armv8l is a 32-bit userspace. Use an ARMv7-A+NEON baseline for an
-    # unspecified cross target rather than probing the build host's CPU.
-    set(_cands "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard"
-               "-march=armv7-a -mfpu=neon -mfloat-abi=hard")
+    # unspecified cross target rather than probing the build host's CPU. The
+    # toolchain selects hard-float or softfp ABI; CPU tuning must not override
+    # an ABI that is fixed by its sysroot.
+    set(_cands "-march=armv7-a -mfpu=neon-vfpv4"
+               "-march=armv7-a -mfpu=neon")
   else() # on-device auto / native
-    set(_cands "-mcpu=native -mfpu=neon-vfpv4 -mfloat-abi=hard"
-               "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard"
-               "-march=armv7-a -mfpu=neon -mfloat-abi=hard")
+    set(_cands "-mcpu=native -mfpu=neon-vfpv4"
+               "-march=armv7-a -mfpu=neon-vfpv4"
+               "-march=armv7-a -mfpu=neon")
   endif()
   pick_first_supported_flag(ARCH_FLAGS ${_cands})
 elseif(_proc MATCHES "^(x86_64|amd64|x86|i[3-6]86)")
@@ -208,7 +226,8 @@ endif()
 # the four Cortex-A76 performance cores as CPU4-7. Expose the selected board
 # to the header-only ISP scheduler so its four camera workers can be pinned
 # one per A76. Keep this board-specific: other ARM SoCs use different layouts.
-if(TARGET_BOARD STREQUAL "rk3588")
+if(TARGET_BOARD STREQUAL "rk3588" AND
+   _proc MATCHES "^(aarch64|arm64|arm|armv[0-9])")
   add_definitions(-DCYPERSTEREO_RK3588=1)
 endif()
 
@@ -282,7 +301,9 @@ target_compile_definitions(Cyperlib PRIVATE
   ELPP_THREAD_SAFE
   ELPP_NO_DEFAULT_LOG_FILE)
 if (MSVC)
-  target_compile_definitions(Cyperlib PRIVATE _CRT_SECURE_NO_WARNINGS)
+  # cyperstereo_api.h is header-only and is compiled by Cyperlib consumers as
+  # well, so propagate the standard CRT opt-out to those translation units.
+  target_compile_definitions(Cyperlib PUBLIC _CRT_SECURE_NO_WARNINGS)
 endif()
 target_link_libraries(Cyperlib PUBLIC ${OpenCV_LIBRARIES})
 

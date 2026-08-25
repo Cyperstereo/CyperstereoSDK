@@ -62,6 +62,44 @@ cmake -DTARGET_BOARD=generic ..        # portable ARMv8-A + NEON, no CPU-specifi
 make
 ```
 
+## SmartSens firmware 2/3, 2/4 and 2/5
+
+Windows, Linux/V4L2, ROS, ROS 2 and ARM builds all use the same versioned
+metadata description in `src/usb/uvc/smartsens_metadata.h`:
+
+- 2/3: 7 IMU slots, no AE telemetry;
+- 2/4: 7 IMU slots, AE telemetry in columns 68..80;
+- 2/5: 13 IMU slots, AE telemetry in columns 122..134 and an 80 ms image-gap
+  threshold for the 16 Hz camera trigger.
+
+The public IMU arrays are now sized for 13 samples. This changes the C++ object
+layout, so Linux/ARM deployments must clean-rebuild the SDK and every consumer;
+do not combine an old `Cyperlib` or application object with the new headers.
+
+The version/Bayer/column mapping can be checked without OpenCV or a camera:
+
+```c
+cmake -S tests -B tests/build -DCMAKE_BUILD_TYPE=Release
+cmake --build tests/build --parallel
+ctest --test-dir tests/build --output-on-failure
+```
+
+For ARM cross-compilation, pass the deployment toolchain to both the portable
+test and the samples build. The toolchain selects hard-float versus softfp ABI;
+the SDK only selects the CPU/NEON instruction set:
+
+```c
+cmake -S tests -B tests/build-arm \
+  -DCMAKE_TOOLCHAIN_FILE=/path/to/arm-linux-toolchain.cmake
+cmake --build tests/build-arm --parallel
+
+cmake -S samples -B samples/build-arm \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=/path/to/arm-linux-toolchain.cmake \
+  -DTARGET_BOARD=rk3588
+cmake --build samples/build-arm --parallel
+```
+
 
 # 4.ROS Compile
 ```c
@@ -122,5 +160,4 @@ Useful overrides are:
 # Restore per-frame metadata logging (RK3588 defaults to one sample/second).
 ./capture_image_imu --verbose
 ```
-
 

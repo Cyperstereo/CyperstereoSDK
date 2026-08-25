@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <sys/ioctl.h>
@@ -93,6 +94,32 @@ static int xioctl(int fh, int request, void *arg) {
     r = ioctl(fh, request, arg);
   } while (r < 0 && errno == EINTR);
   return r;
+}
+
+// Some vendor ARM sysroots ship a C++11 libstdc++ without
+// std::this_thread::sleep_for.  This file is Linux-only, so use the POSIX
+// primitive directly and preserve the remaining delay if a signal interrupts
+// the sleep.
+static void sleep_for_milliseconds(unsigned int milliseconds) {
+  timespec request;
+  request.tv_sec = milliseconds / 1000U;
+  request.tv_nsec = static_cast<long>(milliseconds % 1000U) * 1000000L;
+  timespec remaining;
+  while (nanosleep(&request, &remaining) < 0 && errno == EINTR) {
+    request = remaining;
+  }
+}
+
+// V4L2 sets DEVICE_CAPS on modern multi-node drivers and puts the capabilities
+// of this particular /dev/videoX node in device_caps. Older/vendor kernels may
+// not expose that flag (or even that struct member in their headers), so fall
+// back to the legacy capabilities field without changing the selected ABI.
+static uint32_t effective_device_caps(const v4l2_capability &cap) {
+#ifdef V4L2_CAP_DEVICE_CAPS
+  if (cap.capabilities & V4L2_CAP_DEVICE_CAPS)
+    return cap.device_caps;
+#endif
+  return cap.capabilities;
 }
 
 // True for strings that look like a PCI BDF (e.g. "0000:00:14.0"). Some kernels
@@ -316,7 +343,7 @@ struct device {
     // (video0 -> video2), so rediscover by VID/PID instead of waiting on
     // the old name.
     for (int i = 0; i < 60; ++i) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      sleep_for_milliseconds(100);
       if (rediscover_dev_name())
         return true;
     }
@@ -354,7 +381,7 @@ struct device {
       v4l2_capability cap = {};
       const bool is_capture =
           ioctl(tfd, VIDIOC_QUERYCAP, &cap) == 0 &&
-          (cap.device_caps & V4L2_CAP_VIDEO_CAPTURE);
+          (effective_device_caps(cap) & V4L2_CAP_VIDEO_CAPTURE);
       close(tfd);
       if (!is_capture)
         continue;
@@ -390,7 +417,7 @@ struct device {
     }
 
     // Give uvcvideo a moment to release the old file-handle state.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    sleep_for_milliseconds(200);
     fd = open(dev_name.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC, 0);
     if (fd < 0 && errno == ENOENT) {
       // Node gone: the device disconnected and re-enumerated under a new
@@ -570,9 +597,10 @@ struct device {
         throw_error() << "VIDIOC_QUERYCAP error " << errno << ", "
                       << strerror(errno);
     }
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE))
+    const uint32_t caps = effective_device_caps(cap);
+    if (!(caps & V4L2_CAP_VIDEO_CAPTURE))
       throw_error() << dev_name + " is no video capture device";
-    if (!(cap.capabilities & V4L2_CAP_STREAMING))
+    if (!(caps & V4L2_CAP_STREAMING))
       throw_error() << dev_name + " does not support streaming I/O";
 
     // Select video input, video standard and tune here.
@@ -799,7 +827,7 @@ struct device {
     for (int i = 0; i < 10; ++i) {
       if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
         last_start_error = errno;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        sleep_for_milliseconds(100);
       } else {
         capture_start_time = diag_clock::now();
         is_capturing = true;
@@ -865,7 +893,7 @@ struct device {
       // sets asynchronously, so an unthrottled loop out-allocates the
       // release worker and OOMs the board (observed on Orange Pi 5 after
       // a mid-stream device re-enumeration behind a USB hub).
-      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      sleep_for_milliseconds(250);
       if (fd == -1) {
         const auto now = diag_clock::now();
         if (last_restart_time.time_since_epoch().count() != 0 &&
@@ -932,7 +960,7 @@ struct device {
           // this repeats immediately and would hot-spin at SCHED_FIFO
           // priority.  Cap the loop rate and escalate a solid streak.
           ++eagain_streak;
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          sleep_for_milliseconds(1);
           if (eagain_streak >= 300) {
             eagain_streak = 0;
             std::cout << "[v4l2] fd stuck readable-but-empty for ~300 ms "
@@ -955,7 +983,7 @@ struct device {
                        "immediate reopen/rediscover" << std::endl;
           no_data_count = 0;
           kernel_bufs_stuck = true;  // REQBUFS(0) on a dead fd cannot work
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          sleep_for_milliseconds(50);
           restart_stream();
           return;
         }
@@ -1292,8 +1320,7 @@ struct device {
       for (int attempt = 0;
            attempt < kBusyRetryCount && last_start_error == EBUSY;
            ++attempt) {
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kBusyRetryDelayMs));
+        sleep_for_milliseconds(kBusyRetryDelayMs);
         started = start_capture(true);
         if (started)
           break;
@@ -1356,8 +1383,10 @@ std::vector<std::shared_ptr<device>> query_devices(
   std::vector<std::shared_ptr<device>> devices;
 
   DIR *dir = opendir("/sys/class/video4linux");
-  if (!dir)
+  if (!dir) {
     std::cout << "Cannot access /sys/class/video4linux" << std::endl;
+    return devices;
+  }
   while (dirent *entry = readdir(dir)) {
     std::string name = entry->d_name;
     if (name == "." || name == "..")
