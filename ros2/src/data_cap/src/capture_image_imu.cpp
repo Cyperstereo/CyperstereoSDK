@@ -91,6 +91,7 @@ public:
         frame_info.Init(profile);
         frame_info.framestream.serial_num = serial_num;
         const int num_cameras = profile.num_cameras;
+        const bool is_smartsens = cyperstereo::IsSmartSensProfile(profile);
         cyperstereo::uvc::set_device_mode(
             *cyperstereo_device, profile.frame_width, profile.frame_height,
             static_cast<int>(cyperstereo::Format::YUYV), profile.fps,
@@ -132,7 +133,9 @@ public:
                 if (num_cameras >= 4) {
                     cv::swap(frame_info.framestream.left_front_image, left_front_image);
                     cv::swap(frame_info.framestream.right_front_image, right_front_image);
-                    for (int i = 0; i < 4; ++i)
+                }
+                if (is_smartsens) {
+                    for (int i = 0; i < num_cameras; ++i)
                         camera_gain[i] = frame_info.framestream.camera_gain[i];
                 }
                 imu_data = frame_info.framestream.imu;
@@ -141,7 +144,7 @@ public:
             cv_bridge::CvImage msg0, msg1, msg2, msg3;
             rclcpp::Time custom_time(image_timestamp*1e9); // seconds -> ns
 
-            if (num_cameras >= 4)
+            if (is_smartsens)
             {
                 // SmartSens: use the SDK's persistent fast-balanced worker
                 // pool instead of constructing three threads every frame.
@@ -151,31 +154,42 @@ public:
                 static WhiteBalance wb[4];
                 const BayerConversion image13_bayer =
                     SelectBayerConversion(hardware_version, software_version, 0);
-                ApplyFastBalancedISPParallel({
-                    {left_image, left_color, wb[0], "fast-cam1",
-                     camera_gain[0], image13_bayer},
-                    {right_image, right_color, wb[1], "fast-cam2",
-                     camera_gain[1]},
-                    {left_front_image, left_front_color, wb[2], "fast-cam3",
-                     camera_gain[2], image13_bayer},
-                    {right_front_image, right_front_color, wb[3], "fast-cam4",
-                     camera_gain[3]},
-                });
+                if (num_cameras >= 4) {
+                    ApplyFastBalancedISPParallel({
+                        {left_image, left_color, wb[0], "fast-cam1",
+                         camera_gain[0], image13_bayer},
+                        {right_image, right_color, wb[1], "fast-cam2",
+                         camera_gain[1]},
+                        {left_front_image, left_front_color, wb[2], "fast-cam3",
+                         camera_gain[2], image13_bayer},
+                        {right_front_image, right_front_color, wb[3], "fast-cam4",
+                         camera_gain[3]},
+                    });
+                } else {
+                    ApplyFastBalancedISPParallel({
+                        {left_image, left_color, wb[0], "fast-cam1",
+                         camera_gain[0], image13_bayer},
+                        {right_image, right_color, wb[1], "fast-cam2",
+                         camera_gain[1]},
+                    });
+                }
 
                 msg0.encoding = "bgr8";
                 msg0.image = left_color;
                 msg1.encoding = "bgr8";
                 msg1.image = right_color;
 
-                msg2.header.stamp = custom_time;
-                msg2.header.frame_id = "cam2";
-                msg2.encoding = "bgr8";
-                msg2.image = left_front_color;
+                if (num_cameras >= 4) {
+                    msg2.header.stamp = custom_time;
+                    msg2.header.frame_id = "cam2";
+                    msg2.encoding = "bgr8";
+                    msg2.image = left_front_color;
 
-                msg3.header.stamp = custom_time;
-                msg3.header.frame_id = "cam3";
-                msg3.encoding = "bgr8";
-                msg3.image = right_front_color;
+                    msg3.header.stamp = custom_time;
+                    msg3.header.frame_id = "cam3";
+                    msg3.encoding = "bgr8";
+                    msg3.image = right_front_color;
+                }
             }
             else
             {

@@ -2,7 +2,8 @@
 
 This test covers the platform-neutral firmware marker, Bayer phase and
 metadata-column layouts used by the Windows, Linux/V4L2, ROS and ROS 2 builds.
-It verifies firmware 2/3, 2/4 and 2/5, including the 13-slot IMU layout.
+It verifies firmware 2/3, 2/4, 2/5 and 2/6, including the 13-slot IMU layout
+and the HTS=452 exposure-time conversion used by firmware 2/6.
 
 Native Linux or on-device ARM build:
 

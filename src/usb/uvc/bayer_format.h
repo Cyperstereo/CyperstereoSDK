@@ -15,10 +15,10 @@ enum class BayerConversion {
 };
 
 // FPGA software 04 introduced sensor mirror+flip on C1/C4, which reverses
-// their red/blue Bayer phase; software 05 keeps that image orientation while
-// extending the metadata row for 13 IMU slots. USB image order is C1,C2,C4,C3,
-// so the opposite phase applies to display images 1 and 3 (indices 0 and 2).
-// Software 03 keeps the legacy conversion on all four images.
+// their red/blue Bayer phase; software 05/06 keep that image orientation.
+// USB image order is C1,C2,C4,C3, so the opposite phase applies to display
+// images 1 and 3 (indices 0 and 2). Software 03 keeps the legacy conversion on
+// all four images.
 inline BayerConversion SelectBayerConversion(uint32_t hardware_version,
                                               uint32_t software_version,
                                               int image_index) {
@@ -29,7 +29,9 @@ inline BayerConversion SelectBayerConversion(uint32_t hardware_version,
       (software_version ==
            static_cast<uint32_t>(kSmartSensSoftwareVersion4) ||
        software_version ==
-           static_cast<uint32_t>(kSmartSensSoftwareVersion5));
+           static_cast<uint32_t>(kSmartSensSoftwareVersion5) ||
+       software_version ==
+           static_cast<uint32_t>(kSmartSensSoftwareVersion6));
   if (mirrored_smartsens && image_1_or_3)
     return BayerConversion::kColorBayerBg2Bgr;
   return BayerConversion::kColorBayerRg2Bgr;

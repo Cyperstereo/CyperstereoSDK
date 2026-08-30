@@ -50,6 +50,7 @@
 #include <regex>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 #include <strsafe.h>
 
@@ -160,6 +161,176 @@ std::vector<std::string> tokenize(std::string string, char separator) {
     tokens.push_back(string.substr(i1, i2-i1));
     i1 = i2 + 1;
   }
+}
+
+// Media Foundation exposes a UVC interface path rather than the physical USB
+// device.  For a composite camera the interface instance ID contains a
+// location token (for example, "6&40cb302&0&0000"), while the USB serial is on
+// its parent device (for example, "USB\\VID_04B4&PID_00F9\\s200010").  Resolve
+// the opaque interface path with SetupAPI, then walk the PnP parent chain.
+struct scoped_device_info_set {
+  HDEVINFO handle = SetupDiCreateDeviceInfoList(nullptr, nullptr);
+
+  ~scoped_device_info_set() {
+    if (handle != INVALID_HANDLE_VALUE)
+      SetupDiDestroyDeviceInfoList(handle);
+  }
+};
+
+struct scoped_device_interface {
+  explicit scoped_device_interface(HDEVINFO device_info_set)
+      : device_info_set(device_info_set) {
+    data.cbSize = sizeof(data);
+  }
+
+  ~scoped_device_interface() {
+    if (opened)
+      SetupDiDeleteDeviceInterfaceData(device_info_set, &data);
+  }
+
+  HDEVINFO device_info_set;
+  SP_DEVICE_INTERFACE_DATA data{};
+  bool opened = false;
+};
+
+static bool get_device_instance_id(DEVINST dev_inst, std::wstring &device_id) {
+  ULONG chars = 0;
+  if (CM_Get_Device_ID_Size(&chars, dev_inst, 0) != CR_SUCCESS)
+    return false;
+
+  std::vector<WCHAR> buffer(static_cast<size_t>(chars) + 1, L'\0');
+  if (CM_Get_Device_IDW(dev_inst, buffer.data(),
+                        static_cast<ULONG>(buffer.size()), 0) != CR_SUCCESS)
+    return false;
+
+  device_id.assign(buffer.data());
+  return true;
+}
+
+static std::wstring ascii_upper(std::wstring value) {
+  for (auto &c : value) {
+    if (c >= L'a' && c <= L'z')
+      c = static_cast<WCHAR>(c - L'a' + L'A');
+  }
+  return value;
+}
+
+static bool parse_hex_digit(WCHAR c, int &value) {
+  if (c >= L'0' && c <= L'9') {
+    value = c - L'0';
+    return true;
+  }
+  if (c >= L'A' && c <= L'F') {
+    value = c - L'A' + 10;
+    return true;
+  }
+  return false;
+}
+
+static bool parse_hex4(const std::wstring &value, size_t offset, int &result) {
+  if (offset + 4 > value.size()) return false;
+  result = 0;
+  for (size_t i = 0; i < 4; ++i) {
+    int digit = 0;
+    if (!parse_hex_digit(value[offset + i], digit)) return false;
+    result = (result << 4) | digit;
+  }
+  return true;
+}
+
+static bool is_physical_usb_device_id(const std::wstring &device_id,
+                                      int expected_vid, int expected_pid) {
+  const auto upper = ascii_upper(device_id);
+  const auto first_slash = upper.find(L'\\');
+  const auto second_slash = first_slash == std::wstring::npos
+      ? std::wstring::npos
+      : upper.find(L'\\', first_slash + 1);
+  if (first_slash == std::wstring::npos ||
+      second_slash == std::wstring::npos ||
+      upper.compare(0, first_slash, L"USB") != 0)
+    return false;
+
+  const auto hardware_id =
+      upper.substr(first_slash + 1, second_slash - first_slash - 1);
+  if (hardware_id.size() < 17 ||
+      hardware_id.compare(0, 4, L"VID_") != 0 ||
+      hardware_id.compare(8, 5, L"&PID_") != 0 ||
+      hardware_id.find(L"&MI_") != std::wstring::npos)
+    return false;
+
+  int vid = 0;
+  int pid = 0;
+  return parse_hex4(hardware_id, 4, vid) &&
+         parse_hex4(hardware_id, 13, pid) &&
+         vid == expected_vid && pid == expected_pid;
+}
+
+static std::string read_usb_serial_number(const WCHAR *device_path,
+                                          int expected_vid,
+                                          int expected_pid) {
+  if (!device_path || !*device_path) return "";
+
+  try {
+    scoped_device_info_set device_info_set;
+    if (device_info_set.handle == INVALID_HANDLE_VALUE) return "";
+
+    scoped_device_interface device_interface(device_info_set.handle);
+    if (!SetupDiOpenDeviceInterfaceW(device_info_set.handle, device_path, 0,
+                                     &device_interface.data))
+      return "";
+    device_interface.opened = true;
+
+    DWORD required_size = 0;
+    SetLastError(ERROR_SUCCESS);
+    if (SetupDiGetDeviceInterfaceDetailW(
+            device_info_set.handle, &device_interface.data, nullptr, 0,
+            &required_size, nullptr) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER || required_size == 0)
+      return "";
+
+    std::vector<BYTE> storage(required_size);
+    auto detail =
+        reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(storage.data());
+    detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+    SP_DEVINFO_DATA device_info{};
+    device_info.cbSize = sizeof(device_info);
+    if (!SetupDiGetDeviceInterfaceDetailW(
+            device_info_set.handle, &device_interface.data, detail,
+            required_size, nullptr, &device_info))
+      return "";
+
+    DEVINST dev_inst = device_info.DevInst;
+    for (unsigned int depth = 0; depth < 8; ++depth) {
+      std::wstring device_id;
+      if (!get_device_instance_id(dev_inst, device_id)) return "";
+
+      if (is_physical_usb_device_id(device_id, expected_vid, expected_pid)) {
+        ULONG capabilities = 0;
+        ULONG registry_type = 0;
+        ULONG bytes = sizeof(capabilities);
+        const CONFIGRET result = CM_Get_DevNode_Registry_PropertyW(
+            dev_inst, CM_DRP_CAPABILITIES, &registry_type, &capabilities,
+            &bytes, 0);
+        if (result != CR_SUCCESS || registry_type != REG_DWORD ||
+            bytes != sizeof(capabilities) ||
+            (capabilities & CM_DEVCAP_UNIQUEID) == 0)
+          return "";
+
+        const auto slash = device_id.rfind(L'\\');
+        if (slash == std::wstring::npos || slash + 1 == device_id.size())
+          return "";
+        return win_to_utf(device_id.substr(slash + 1).c_str());
+      }
+
+      DEVINST parent = 0;
+      if (CM_Get_Parent(&parent, dev_inst, 0) != CR_SUCCESS) break;
+      dev_inst = parent;
+    }
+  } catch (const std::exception &) {
+    // A missing/invalid serial must not prevent the camera from enumerating.
+  }
+  return "";
 }
 
 /*
@@ -298,6 +469,8 @@ struct device {
   int vid, pid;
   std::string unique_id;
   std::string name;
+  std::string serial_number;
+  DWORD expected_frame_bytes = 0;
 
   com_ptr<reader_callback> reader_callback;
   com_ptr<IMFActivate> mf_activate;
@@ -308,8 +481,11 @@ struct device {
   com_ptr<IMFSourceReader> mf_source_reader;
   video_channel_callback callback = nullptr;
 
-  device(std::shared_ptr<context> parent, int vid, int pid, std::string unique_id, std::string name)
-      : parent(move(parent)), vid(vid), pid(pid), unique_id(move(unique_id)), name(name) {
+  device(std::shared_ptr<context> parent, int vid, int pid,
+         std::string unique_id, std::string name, std::string serial_number)
+      : parent(move(parent)), vid(vid), pid(pid),
+        unique_id(move(unique_id)), name(move(name)),
+        serial_number(move(serial_number)) {
   }
 
   ~device() {
@@ -392,13 +568,13 @@ struct device {
 HRESULT reader_callback::OnReadSample(HRESULT hrStatus, DWORD dwStreamIndex, DWORD dwStreamFlags, LONGLONG llTimestamp, IMFSample *sample) {
   if (auto owner_ptr = owner.lock()) {
     // ---- USB/transfer integrity check (candidate (1): detect dropped /
-    // corrupted frames at the transfer layer and log them).  The configured
-    // stream is 2560x1024 YUYV (2 bytes/pixel), so one complete frame is
-    // exactly kExpectedFrameBytes.  A USB dropout shows up as: a failed read
+    // corrupted frames at the transfer layer and log them). One complete
+    // uncompressed frame has the size calculated from the selected MF media
+    // type (1280x1024 for S2 or 2560x1024 for S0). A USB dropout shows up as:
+    // a failed read
     // status, an MF stream ERROR/STREAMTICK flag, a per-sample "discontinuity"
     // attribute, or a short buffer.  Any of these means this frame is (partly)
     // garbage -> the "snowy top stripes" the user sees.
-    static const DWORD kExpectedFrameBytes = 2560u * 1024u * 2u;
     static unsigned long long s_frame_count = 0;
     static unsigned long long s_corrupt_count = 0;
     const unsigned long long this_frame = s_frame_count;
@@ -434,10 +610,12 @@ HRESULT reader_callback::OnReadSample(HRESULT hrStatus, DWORD dwStreamIndex, DWO
         BYTE *byte_buffer;
         DWORD max_length, current_length;
         if (SUCCEEDED(buffer->Lock(&byte_buffer, &max_length, &current_length))) {
-          if (current_length != kExpectedFrameBytes) {
+          const DWORD expected_frame_bytes = owner_ptr->expected_frame_bytes;
+          if (expected_frame_bytes != 0 &&
+              current_length != expected_frame_bytes) {
             std::cout << "[FRAME-CORRUPT] frame#" << s_frame_count
                       << " size mismatch: got " << current_length
-                      << " B, expected " << kExpectedFrameBytes
+                      << " B, expected " << expected_frame_bytes
                       << " B (USB transfer dropout / partial frame)" << std::endl;
             frame_bad = true;
           }
@@ -499,7 +677,6 @@ std::vector<std::shared_ptr<device>> query_devices(std::shared_ptr<context> cont
       MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, &wchar_dev_name,
       &length);
     auto dev_name = win_to_utf(wchar_dev_name);
-    CoTaskMemFree(wchar_dev_name);
 
     pDevice->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &wchar_name, &length);
     auto name = win_to_utf(wchar_name);  // Device description name
@@ -508,7 +685,13 @@ std::vector<std::shared_ptr<device>> query_devices(std::shared_ptr<context> cont
     int vid, pid, mi;
     std::string unique_id;
 
-    if (!parse_usb_path(vid, pid, mi, unique_id, dev_name)) continue;
+    if (!parse_usb_path(vid, pid, mi, unique_id, dev_name)) {
+      CoTaskMemFree(wchar_dev_name);
+      continue;
+    }
+    const auto serial_number =
+        read_usb_serial_number(wchar_dev_name, vid, pid);
+    CoTaskMemFree(wchar_dev_name);
 
     std::shared_ptr<device> dev;
     for (auto & d : devices) {
@@ -517,12 +700,16 @@ std::vector<std::shared_ptr<device>> query_devices(std::shared_ptr<context> cont
     }
     if (!dev) {
       try {
-        dev = std::make_shared<device>(context, vid, pid, unique_id, name);
+        dev = std::make_shared<device>(context, vid, pid, unique_id, name,
+                                       serial_number);
         devices.push_back(dev);
       } catch (const std::exception &e) {
         std::cout << "Not a USB video device: " << std::endl;
       }
     }
+
+    if (dev->serial_number.empty() && !serial_number.empty())
+      dev->serial_number = serial_number;
 
     dev->reader_callback = new reader_callback(dev);
     dev->mf_activate = pDevice;
@@ -551,8 +738,7 @@ std::string get_video_name(const device &device) {
 }
 
 std::string get_serial_number(const device &device) {
-  // Not read on this backend yet.
-  return "";
+  return device.serial_number;
 }
 
 bool has_frame_size(const device &device, int width, int height) {
@@ -856,6 +1042,16 @@ void set_device_mode(device &device, int width, int height, int fourcc, int fps,
 
     check("IMFSourceReader::SetCurrentMediaType", device.mf_source_reader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, media_type));
 
+    UINT32 expected_frame_bytes = 0;
+    if (FAILED(MFCalculateImageSize(
+            subtype, uvc_width, uvc_height, &expected_frame_bytes)) ||
+        expected_frame_bytes == 0) {
+      // All SDK camera profiles currently request packed YUY2 (two bytes per
+      // transport pixel). Keep a deterministic fallback for drivers that omit
+      // enough subtype information for MFCalculateImageSize.
+      expected_frame_bytes = uvc_width * uvc_height * 2u;
+    }
+    device.expected_frame_bytes = expected_frame_bytes;
     device.callback = callback;
     return;
   }

@@ -14,5 +14,5 @@ add_executable(smartsens_metadata_test smartsens_metadata_test.cc)
 target_include_directories(smartsens_metadata_test PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../src/usb/uvc")
 
-add_test(NAME smartsens_metadata_2_3_2_4_2_5
+add_test(NAME smartsens_serial_s0_s2_and_metadata_2_3_2_4_2_5_2_6
          COMMAND smartsens_metadata_test)

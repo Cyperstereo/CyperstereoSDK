@@ -62,7 +62,7 @@ cmake -DTARGET_BOARD=generic ..        # portable ARMv8-A + NEON, no CPU-specifi
 make
 ```
 
-## SmartSens firmware 2/3, 2/4 and 2/5
+## SmartSens firmware 2/3, 2/4, 2/5 and 2/6
 
 Windows, Linux/V4L2, ROS, ROS 2 and ARM builds all use the same versioned
 metadata description in `src/usb/uvc/smartsens_metadata.h`:
@@ -70,7 +70,9 @@ metadata description in `src/usb/uvc/smartsens_metadata.h`:
 - 2/3: 7 IMU slots, no AE telemetry;
 - 2/4: 7 IMU slots, AE telemetry in columns 68..80;
 - 2/5: 13 IMU slots, AE telemetry in columns 122..134 and an 80 ms image-gap
-  threshold for the 16 Hz camera trigger.
+  threshold for the 16 Hz camera trigger;
+- 2/6: 7 IMU slots and the 2/4 AE columns, with HTS=452 exposure conversion
+  (`29.761316872 us/line`) for the 30 Hz camera trigger.
 
 The public IMU arrays are now sized for 13 samples. This changes the C++ object
 layout, so Linux/ARM deployments must clean-rebuild the SDK and every consumer;
@@ -160,4 +162,3 @@ Useful overrides are:
 # Restore per-frame metadata logging (RK3588 defaults to one sample/second).
 ./capture_image_imu --verbose
 ```
-

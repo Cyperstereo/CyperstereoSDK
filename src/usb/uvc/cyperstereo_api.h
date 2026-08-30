@@ -369,11 +369,13 @@ static inline void DeinterleaveTwoPlanes(
   }
 }
 
-static constexpr int kFx3FrameWidth = 2560;
+static constexpr int kSmartSensCamWidth = 1280;
+static constexpr int kFx3FrameWidthStereo = kSmartSensCamWidth;
+static constexpr int kFx3FrameWidth = kSmartSensCamWidth * 2;
 static constexpr int kFx3FrameHeight = 1024;
 static constexpr int kFx3FrameFps = 30;
 static constexpr int kFx3FramePixels = kFx3FrameWidth * kFx3FrameHeight;
-static constexpr int kFx3HalfFrameWidth = kFx3FrameWidth / 2;
+static constexpr int kFx3HalfFrameWidth = kSmartSensCamWidth;
 static constexpr int kFx3HalfFramePixels = kFx3HalfFrameWidth * kFx3FrameHeight;
 
 static constexpr int kMt9FrameWidth = 752;
@@ -382,7 +384,7 @@ static constexpr int kMt9FrameFps = 60;
 
 static constexpr double kImuGapThresholdSec = 0.007;
 
-// Dynamic IMU sample-count detection. Firmware 03/04 pack a variable number
+// Dynamic IMU sample-count detection. Firmware 03/04/06 pack a variable number
 // of samples and can leave stale values in unused slots; firmware 05 reserves
 // 13 slots and explicitly zero-fills unused/startup slots. The genuine count
 // is found by the v05 zero marker first, then by validating each slot against:
@@ -411,10 +413,22 @@ struct CameraProfile {
   int gnss_base_col;
 };
 
-static constexpr CameraProfile kProfileSmartSens{
-    "SmartSens(Cyper-ego)", 2, 3, kFx3FrameWidth, kFx3FrameHeight, kFx3FrameFps,
-    4, kFx3HalfFrameWidth, kFx3FrameHeight - 1,
+// SmartSens serial layout: S0xxxxxx=quad and S2xxxxxx=stereo.  Both use
+// 1280-pixel SC136HGS planes; the UVC transport is 2560 wide for four byte
+// lanes (C1/C2/C4/C3) and 1280 wide for the two byte lanes (C1/C2).
+static constexpr CameraProfile kProfileSmartSensQuad{
+    "SmartSens(SC136HGS-quad/S0)", 2, 3, kFx3FrameWidth, kFx3FrameHeight,
+    kFx3FrameFps, 4, kSmartSensCamWidth, kFx3FrameHeight - 1,
     kSmartSensLegacyImuSamplesPerFrame, 72};
+
+static constexpr CameraProfile kProfileSmartSensStereo{
+    "SmartSens(SC136HGS-stereo/S2)", 2, 3, kFx3FrameWidthStereo,
+    kFx3FrameHeight, kFx3FrameFps, 2, kSmartSensCamWidth,
+    kFx3FrameHeight - 1, kSmartSensLegacyImuSamplesPerFrame, 72};
+
+// Preserve the old name for code that treats an unspecified SmartSens unit as
+// the legacy four-camera SKU.
+static constexpr CameraProfile kProfileSmartSens = kProfileSmartSensQuad;
 
 static constexpr CameraProfile kProfileM150{
     "MT9V034(M150)", 0, 2, kMt9FrameWidth, kMt9FrameHeight, kMt9FrameFps,
@@ -424,6 +438,10 @@ static constexpr CameraProfile kProfileM60{
     "MT9V034(M60)", 1, 2, kMt9FrameWidth, kMt9FrameHeight, kMt9FrameFps,
     2, kMt9FrameWidth, kMt9FrameHeight - 1, 4, 48};
 
+inline bool IsSmartSensProfile(const CameraProfile &profile) {
+  return profile.hardware_version == kSmartSensHardwareVersion;
+}
+
 // Trusted Cyperstereo USB serial prefixes: S=SmartSens, C=M150, M=M60.
 inline bool IsValidCyperstereoSerial(const std::string &serial_num) {
   if (serial_num.empty()) return false;
@@ -432,11 +450,29 @@ inline bool IsValidCyperstereoSerial(const std::string &serial_num) {
   return c == 'S' || c == 'C' || c == 'M';
 }
 
+inline const CameraProfile &SelectSmartSensBySerial(
+    const std::string &serial_num, const uvc::device *device = nullptr) {
+  const int camera_count = SmartSensCameraCountFromSerial(serial_num);
+  if (camera_count == 2) return kProfileSmartSensStereo;
+  if (camera_count == 4) return kProfileSmartSensQuad;
+
+  // Unknown/legacy S serials keep the old quad default.  If a device is
+  // available, an unambiguous advertised size is a safer fallback.
+  if (device) {
+    const bool has_stereo =
+        uvc::has_frame_size(*device, kFx3FrameWidthStereo, kFx3FrameHeight);
+    const bool has_quad =
+        uvc::has_frame_size(*device, kFx3FrameWidth, kFx3FrameHeight);
+    if (has_stereo && !has_quad) return kProfileSmartSensStereo;
+  }
+  return kProfileSmartSensQuad;
+}
+
 inline const CameraProfile &SelectProfileBySerial(const std::string &serial_num) {
   if (IsValidCyperstereoSerial(serial_num)) {
     const char c = static_cast<char>(
         std::toupper(static_cast<unsigned char>(serial_num[0])));
-    if (c == 'S') return kProfileSmartSens;
+    if (c == 'S') return SelectSmartSensBySerial(serial_num);
     if (c == 'C') return kProfileM150;
     if (c == 'M') return kProfileM60;
   }
@@ -451,19 +487,32 @@ inline const CameraProfile &SelectProfileBySerial(const std::string &serial_num)
 // (752x480) vs SmartSens (2560x1024) from the device's UVC frame sizes.
 inline const CameraProfile &SelectProfile(const std::string &serial_num,
                                           const uvc::device &device) {
-  if (IsValidCyperstereoSerial(serial_num))
-    return SelectProfileBySerial(serial_num);
+  if (IsValidCyperstereoSerial(serial_num)) {
+    const char c = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(serial_num[0])));
+    if (c == 'S') return SelectSmartSensBySerial(serial_num, &device);
+    if (c == 'C') return kProfileM150;
+    if (c == 'M') return kProfileM60;
+  }
 
-  const bool has_smartsens =
+  const bool has_quad =
       uvc::has_frame_size(device, kFx3FrameWidth, kFx3FrameHeight);
+  const bool has_stereo =
+      uvc::has_frame_size(device, kFx3FrameWidthStereo, kFx3FrameHeight);
   const bool has_mt9 =
       uvc::has_frame_size(device, kMt9FrameWidth, kMt9FrameHeight);
 
-  if (has_smartsens && !has_mt9) {
+  if (has_stereo && !has_quad && !has_mt9) {
+    std::cout << "[api] no USB serial; UVC size " << kFx3FrameWidthStereo
+              << "x" << kFx3FrameHeight << " -> "
+              << kProfileSmartSensStereo.name << std::endl;
+    return kProfileSmartSensStereo;
+  }
+  if (has_quad && !has_mt9) {
     std::cout << "[api] no USB serial; UVC size " << kFx3FrameWidth << "x"
-              << kFx3FrameHeight << " -> " << kProfileSmartSens.name
+              << kFx3FrameHeight << " -> " << kProfileSmartSensQuad.name
               << std::endl;
-    return kProfileSmartSens;
+    return kProfileSmartSensQuad;
   }
   if (has_mt9) {
     std::cout << "[api] no USB serial; UVC size " << kMt9FrameWidth << "x"
@@ -471,10 +520,11 @@ inline const CameraProfile &SelectProfile(const std::string &serial_num,
               << " (M150/M60 refined from metadata)" << std::endl;
     return kProfileM60;
   }
-  if (has_smartsens) {
+  if (has_stereo && !has_quad) return kProfileSmartSensStereo;
+  if (has_quad) {
     std::cout << "[api] no USB serial; UVC advertises both families, preferring "
-              << kProfileSmartSens.name << std::endl;
-    return kProfileSmartSens;
+              << kProfileSmartSensQuad.name << std::endl;
+    return kProfileSmartSensQuad;
   }
 
   std::cout << "[api] no USB serial and no known UVC size; defaulting to "
@@ -542,7 +592,7 @@ struct FrameStreamData {
 
   // Per-display-plane AE telemetry, parsed from the SmartSens metadata row.
   // Index: 0=image1(left), 1=image2(right), 2=image3(left_front),
-  // 3=image4(right_front).  SmartSens 4-cam only; left 0 for the MT9V families.
+  // 3=image4(right_front). Unused SmartSens planes and all MT9V planes stay 0.
   // Each sensor runs its own AEC, so these generally differ between cameras.
   // These are the FPGA AEC targets sent to I2C, not sensor-register readback.
   uint16_t exposure_lines[4]{};          // target exposure, in rows
@@ -552,8 +602,8 @@ struct FrameStreamData {
 
   // Per-camera capture timestamp taken at the exposure MIDPOINT:
   //   image_midpoint_timestamp[i] = image_timestamp - exposure_time[i]/2.
-  // All four share the common exposure END (image_timestamp), but each has its
-  // own exposure length, so each midpoint differs.
+  // All active cameras share the common exposure END (image_timestamp), but
+  // each has its own exposure length, so each midpoint differs.
   double   image_midpoint_timestamp[4]{};
 };
 
@@ -8593,7 +8643,7 @@ inline void ApplyISP(cv::Mat &raw, cv::Mat &color, WhiteBalance &wb,
   // "post" in the profile; "demosaic" reads ~0 on that path.
   // The hand-fused ARM kernel implements the legacy RG2BGR-equivalent CFA.
   // Use OpenCV EA for the opposite phase until that kernel has a pattern-aware
-  // implementation; correctness takes priority for software versions 04/05.
+  // implementation; correctness takes priority for software versions 04/05/06.
   const bool fused_demosaic =
       UseFusedDemosaic() &&
       bayer == BayerConversion::kColorBayerRg2Bgr;
@@ -9349,7 +9399,19 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
               prof.cam_width, prof.frame_height);
           lo_plane = &fs.left_image;
           hi_plane = &fs.right_image;
+        } else if (IsSmartSensProfile(prof)) {
+          // S2 transport byte order is C1,C2 for every pixel. Keep C1 as the
+          // low metadata byte/left image and C2 as the high byte/right image.
+          DeinterleaveTwoPlanes(
+              img.ptr<unsigned char>(0, 0), static_cast<int>(img.step),
+              fs.left_image.ptr<unsigned char>(0, 0),
+              fs.right_image.ptr<unsigned char>(0, 0),
+              static_cast<int>(fs.left_image.step),
+              prof.cam_width, prof.frame_height);
+          lo_plane = &fs.left_image;
+          hi_plane = &fs.right_image;
         } else {
+          // MT9V034 uses the opposite logical left/right assignment.
           DeinterleaveTwoPlanes(
               img.ptr<unsigned char>(0, 0), static_cast<int>(img.step),
               fs.right_image.ptr<unsigned char>(0, 0),
@@ -9367,7 +9429,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
         // layout or the 135-column v5 layout, so validate against the largest
         // supported layout before reading the marker. MT9 keeps its GNSS bound.
         const int needed_cols =
-            prof.num_cameras >= 4
+            IsSmartSensProfile(prof)
                 ? kSmartSensMaxMetadataCols
                 : (imu_end_col > gnss_end_col ? imu_end_col : gnss_end_col);
         if (prof.meta_row < lo_plane->rows && lo_plane->cols >= needed_cols) {
@@ -9387,12 +9449,12 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           bool marker_ok =
               (ver0 == prof.hardware_version) && (ver1 == prof.software_version);
 
-          // SmartSens hardware 02 supports software 03/04 with the legacy
+          // SmartSens hardware 02 supports software 03/04/06 with the
           // seven-slot metadata layout and software 05 with the 13-slot layout.
-          // Version 03 uses the legacy Bayer phase; versions 04/05 use the
+          // Version 03 uses the legacy Bayer phase; versions 04/05/06 use the
           // mirror+flip phase for C1/C4. Accept the marker, then latch both the
           // live version and its matching slot count for all parsing below.
-          if (prof.num_cameras >= 4 &&
+          if (IsSmartSensProfile(prof) &&
               IsSupportedSmartSensFirmware(ver0, ver1)) {
             if (ver0 != frame_info.profile.hardware_version ||
                 ver1 != frame_info.profile.software_version) {
@@ -9411,7 +9473,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           // accept any of these markers and latch onto the live profile so
           // subsequent frames are not rejected (no-SN units often report
           // 0/1 which matches neither of the baked-in 0/2 or 1/2 expects).
-          if (!marker_ok && prof.num_cameras < 4 &&
+          if (!marker_ok && !IsSmartSensProfile(prof) &&
               (ver0 == kProfileM150.hardware_version ||
                ver0 == kProfileM60.hardware_version) &&
               (ver1 == 1 || ver1 == kProfileM60.software_version)) {
@@ -9506,10 +9568,10 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           fs.image_timestamp =
               image_count_hour * 12 * 3600 + image_count_s + image_count_ms / 10000.0;
 
-          // Per-camera AE telemetry (SmartSens SC136HGS 4-cam only).  The FPGA
+          // Per-camera AE telemetry (SmartSens SC136HGS family). The FPGA
           // metadata row packs a full 16-bit value per column into the two low
           // byte lanes, so meta_u(col) returns it directly. Software 03 has no
-          // telemetry; software 04 uses marker/exp/temp/gain columns
+          // telemetry; software 04/06 use marker/exp/temp/gain columns
           // 68/69/73/77; software 05 moves those bases to 122/123/127/131.
           // Values are forwarded directly from the controller state; no
           // exposure/gain sensor-register readback is performed.
@@ -9517,11 +9579,21 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           // DQ[23:16]=C4, DQ[31:24]=C3.  DeinterleaveFourPlanes therefore maps
           // image1..4 to C1,C2,C4,C3 respectively.  All metadata arrays below
           // use that display-plane order so each print follows its own image.
-          if (prof.num_cameras >= 4 && smartsens_layout.has_ae_telemetry) {
+          if (IsSmartSensProfile(prof) &&
+              smartsens_layout.has_ae_telemetry) {
             // FX3 image-plane order is C1,C2,C4,C3.  Metadata columns remain
-            // in physical-sensor order C1,C2,C3,C4, so map each plane here.
+            // in physical-sensor order C1,C2,C3,C4, so map each active plane.
+            // S2 uses only the first two entries, which are C1 and C2.
             static const int kSensorByPlane[4] = {0, 1, 3, 2};
             for (int p = 0; p < 4; ++p) {
+              fs.exposure_lines[p] = 0;
+              fs.exposure_time[p] = 0.0;
+              fs.camera_temperature[p] = 0.0;
+              fs.camera_gain[p] = 0.0;
+              fs.image_midpoint_timestamp[p] = fs.image_timestamp;
+            }
+            const int active_cameras = std::min(prof.num_cameras, 4);
+            for (int p = 0; p < active_cameras; ++p) {
               const int sensor = kSensorByPlane[p];
               const int lines =
                   meta_u(smartsens_layout.exposure_base_col + sensor);
@@ -9537,7 +9609,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
               fs.image_midpoint_timestamp[p] =
                   fs.image_timestamp - fs.exposure_time[p] / 2.0;
             }
-          } else if (prof.num_cameras >= 4) {
+          } else if (IsSmartSensProfile(prof)) {
             // Software 03 resumes image pixels immediately after its seven IMU
             // slots. Do not reinterpret those pixels as telemetry, and clear
             // any values retained if a FrameInfo is reused across firmware.
@@ -9585,7 +9657,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             const double image_gap =
                 fs.image_timestamp - frame_info.last_image_timestamp;
             const double image_gap_threshold =
-                prof.num_cameras >= 4
+                IsSmartSensProfile(prof)
                     ? smartsens_layout.image_gap_threshold_sec
                     : kImageGapThresholdSec;
             // Flag BOTH directions: a backward step (negative gap) was
@@ -9673,7 +9745,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             // Software 05 explicitly zero-fills an unused 13th slot and all
             // slots on an unprefilled startup frame. Stop before timestamp /
             // temperature heuristics can mistake an all-zero slot as valid.
-            if (prof.num_cameras >= 4 &&
+            if (IsSmartSensProfile(prof) &&
                 smartsens_layout.zero_fills_unused_imu) {
               bool all_zero = true;
               for (int word = 0; word < kImuWordsPerSample; ++word) {
@@ -9769,10 +9841,10 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           }
           ++frame_info.frame_seq;
 
-          // SmartSens 4-cam has no GNSS module. Its versioned metadata region
+          // SmartSens cameras have no GNSS module. Their versioned metadata region
           // carries IMU plus per-camera AE telemetry and overlaps the legacy
           // GNSS byte layout, so only parse GNSS on the MT9V families.
-          if (prof.num_cameras >= 4) {
+          if (IsSmartSensProfile(prof)) {
             fs.gnss.valid = false;
           } else {
             const int gnss_shift = prof.gnss_base_col * 2 - 96;

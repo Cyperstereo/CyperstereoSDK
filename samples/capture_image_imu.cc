@@ -194,7 +194,7 @@ static IspMode ConfigureCaptureIsp(bool use_fast_balanced,
 }
 
 static void LogCaptureDiagnostics(
-    int count, int capture_log_every, int num_cameras,
+    int count, int capture_log_every, int num_cameras, bool is_smartsens,
     double image_timestamp, const double exposure_time[4],
     const uint16_t exposure_lines[4], const double camera_gain[4],
     const double camera_temperature[4],
@@ -244,13 +244,13 @@ static void LogCaptureDiagnostics(
     }
 
     // FPGA AEC targets are controller state, not sensor-register readback.
-    if (num_cameras >= 4) {
+    if (is_smartsens) {
       static const char *const kCameraNames[4] = {
           "image1(L,C1)", "image2(R,C2)",
           "image3(LF,C4)", "image4(RF,C3)"};
       capture_log << std::fixed << std::setprecision(6)
                   << "[cam] frame_end_ts=" << image_timestamp << '\n';
-      for (int i = 0; i < 4; ++i) {
+      for (int i = 0; i < num_cameras; ++i) {
         capture_log << "  " << kCameraNames[i]
                     << "  aec_exp=" << std::setprecision(3)
                     << exposure_time[i] * 1000.0 << "ms ("
@@ -433,6 +433,7 @@ static int run(int argc, char *argv[]) {
   int count = 0;
 
   const int num_cameras = profile.num_cameras;
+  const bool is_smartsens = cyperstereo::IsSmartSensProfile(profile);
 
   cv::Mat left_image(profile.frame_height, profile.cam_width, CV_8U);
   cv::Mat right_image(profile.frame_height, profile.cam_width, CV_8U);
@@ -522,7 +523,9 @@ static int run(int argc, char *argv[]) {
       if (num_cameras >= 4) {
         cv::swap(frame_info.framestream.left_front_image, left_front_image);
         cv::swap(frame_info.framestream.right_front_image, right_front_image);
-        for (int i = 0; i < 4; ++i) {
+      }
+      if (is_smartsens) {
+        for (int i = 0; i < num_cameras; ++i) {
           exposure_time[i] = frame_info.framestream.exposure_time[i];
           exposure_lines[i] = frame_info.framestream.exposure_lines[i];
           camera_gain[i] = frame_info.framestream.camera_gain[i];
@@ -543,7 +546,7 @@ static int run(int argc, char *argv[]) {
       break;
     }
 
-    if (num_cameras >= 4)
+    if (is_smartsens)
     {
       TicToc proc;
       // Run the selected ISP pipeline. Fast-balanced is the default; the
@@ -551,20 +554,28 @@ static int run(int argc, char *argv[]) {
       // Each camera uses its own live AEC gain from the metadata row.
       const BayerConversion image13_bayer =
           SelectBayerConversion(hardware_version, software_version, 0);
-      isp.ApplyParallel({
-          {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
-          {right_image, right_color, "cam2", camera_gain[1]},
-          {left_front_image, left_front_color, "cam3", camera_gain[2],
-           image13_bayer},
-          {right_front_image, right_front_color, "cam4", camera_gain[3]},
-      });
+      if (num_cameras >= 4) {
+        isp.ApplyParallel({
+            {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
+            {right_image, right_color, "cam2", camera_gain[1]},
+            {left_front_image, left_front_color, "cam3", camera_gain[2],
+             image13_bayer},
+            {right_front_image, right_front_color, "cam4", camera_gain[3]},
+        });
+      } else {
+        // S2 exposes only the C1/C2 Bayer planes.
+        isp.ApplyParallel({
+            {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
+            {right_image, right_color, "cam2", camera_gain[1]},
+        });
+      }
       //std::cout << "proc(wb+cvt) " << proc.toc() << std::endl;
       
       if (show_preview && count % kShowEvery == 0) {
         const cv::Mat *display_images[4] = {
             &left_color, &right_color, &left_front_color, &right_front_color};
         if (use_uyvy422) {
-          for (int i = 0; i < 4; ++i) {
+          for (int i = 0; i < num_cameras; ++i) {
             Uyvy422Bt601FullRangeToBgrPreview(*display_images[i],
                                               preview_color[i]);
             if (FastBalancedGammaEnabled())
@@ -572,10 +583,8 @@ static int run(int argc, char *argv[]) {
             display_images[i] = &preview_color[i];
           }
         }
-        cv::imshow("image1", *display_images[0]);
-        cv::imshow("image2", *display_images[1]);
-        cv::imshow("image3", *display_images[2]);
-        cv::imshow("image4", *display_images[3]);
+        for (int i = 0; i < num_cameras; ++i)
+          cv::imshow(kWindowNames[i], *display_images[i]);
         preview_key = cv::waitKey(1);
       }
     }
@@ -598,9 +607,9 @@ static int run(int argc, char *argv[]) {
     }
 
     LogCaptureDiagnostics(
-        count, capture_log_every, num_cameras, image_timestamp, exposure_time,
-        exposure_lines, camera_gain, camera_temperature, imu_data, gnss_data,
-        frame_info, t_frame, capture_log);
+        count, capture_log_every, num_cameras, is_smartsens, image_timestamp,
+        exposure_time, exposure_lines, camera_gain, camera_temperature,
+        imu_data, gnss_data, frame_info, t_frame, capture_log);
     ++count;
   }
   stream.Stop();

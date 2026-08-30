@@ -53,6 +53,7 @@ int main(int argc, char *argv[]) {
   frame_info.Init(profile);
   frame_info.framestream.serial_num = serial_num;
   const int num_cameras = profile.num_cameras;
+  const bool is_smartsens = cyperstereo::IsSmartSensProfile(profile);
   cyperstereo::uvc::set_device_mode(
       *cyperstereo_device, profile.frame_width, profile.frame_height,
       static_cast<int>(cyperstereo::Format::YUYV), profile.fps,
@@ -90,14 +91,16 @@ int main(int argc, char *argv[]) {
       if (num_cameras >= 4) {
         cv::swap(frame_info.framestream.left_front_image, left_front_image);
         cv::swap(frame_info.framestream.right_front_image, right_front_image);
-        for (int i = 0; i < 4; ++i)
+      }
+      if (is_smartsens) {
+        for (int i = 0; i < num_cameras; ++i)
           camera_gain[i] = frame_info.framestream.camera_gain[i];
       }
       imu_data = frame_info.framestream.imu;
     }
 
     sensor_msgs::ImagePtr msg0, msg1, msg2, msg3;
-    if (num_cameras >= 4) {
+    if (is_smartsens) {
       // SmartSens: each plane is RAW Bayer with no on-chip AWB.  The SDK's
       // fast-balanced path owns three persistent workers and runs the fourth
       // camera on this thread, avoiding three thread creations every frame.
@@ -106,21 +109,31 @@ int main(int argc, char *argv[]) {
       static WhiteBalance wb[4];
       const BayerConversion image13_bayer =
           SelectBayerConversion(hardware_version, software_version, 0);
-      ApplyFastBalancedISPParallel({
-          {left_image, left_color, wb[0], "fast-cam1", camera_gain[0],
-           image13_bayer},
-          {right_image, right_color, wb[1], "fast-cam2", camera_gain[1]},
-          {left_front_image, left_front_color, wb[2], "fast-cam3",
-           camera_gain[2], image13_bayer},
-          {right_front_image, right_front_color, wb[3], "fast-cam4",
-           camera_gain[3]},
-      });
+      if (num_cameras >= 4) {
+        ApplyFastBalancedISPParallel({
+            {left_image, left_color, wb[0], "fast-cam1", camera_gain[0],
+             image13_bayer},
+            {right_image, right_color, wb[1], "fast-cam2", camera_gain[1]},
+            {left_front_image, left_front_color, wb[2], "fast-cam3",
+             camera_gain[2], image13_bayer},
+            {right_front_image, right_front_color, wb[3], "fast-cam4",
+             camera_gain[3]},
+        });
+      } else {
+        ApplyFastBalancedISPParallel({
+            {left_image, left_color, wb[0], "fast-cam1", camera_gain[0],
+             image13_bayer},
+            {right_image, right_color, wb[1], "fast-cam2", camera_gain[1]},
+        });
+      }
       msg0 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", left_color).toImageMsg();
       msg1 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", right_color).toImageMsg();
-      msg2 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", left_front_color).toImageMsg();
-      msg3 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", right_front_color).toImageMsg();
-      msg2->header.stamp = ros::Time(image_timestamp);
-      msg3->header.stamp = ros::Time(image_timestamp);
+      if (num_cameras >= 4) {
+        msg2 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", left_front_color).toImageMsg();
+        msg3 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", right_front_color).toImageMsg();
+        msg2->header.stamp = ros::Time(image_timestamp);
+        msg3->header.stamp = ros::Time(image_timestamp);
+      }
     } else {
       // MT9V034 is monochrome: publish the two raw planes as mono8.
       msg0 = cv_bridge::CvImage(std_msgs::Header(), "mono8", left_image).toImageMsg();

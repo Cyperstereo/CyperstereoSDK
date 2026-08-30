@@ -117,6 +117,7 @@ int main(int argc, char *argv[]) {
             << profile.frame_width << "x" << profile.frame_height << "@"
             << profile.fps << "  cameras: " << profile.num_cameras << std::endl;
   const int num_cameras = profile.num_cameras;
+  const bool is_smartsens = cyperstereo::IsSmartSensProfile(profile);
   cyperstereo::uvc::set_device_mode(
       *cyperstereo_device, profile.frame_width, profile.frame_height,
       static_cast<int>(cyperstereo::Format::YUYV), profile.fps,
@@ -154,7 +155,9 @@ int main(int argc, char *argv[]) {
       if (num_cameras >= 4) {
         cv::swap(frame_info.framestream.left_front_image, left_front_image);
         cv::swap(frame_info.framestream.right_front_image, right_front_image);
-        for (int i = 0; i < 4; ++i)
+      }
+      if (is_smartsens) {
+        for (int i = 0; i < num_cameras; ++i)
           camera_gain[i] = frame_info.framestream.camera_gain[i];
       }
       imu_data = frame_info.framestream.imu;
@@ -320,69 +323,89 @@ void DataFlow() {
         double image_timestamp = record.timestamp;
         const std::vector<cv::Mat> &imgs = record.images;
         const size_t n = imgs.size();
-        // 4-camera (SmartSens) path: RAW Bayer -> white balance + demosaic, save
-        // as colour. 2-camera (MT9V034) path: monochrome, saved as-is.
+        // SmartSens S0/S2: RAW Bayer -> white balance + demosaic, save as
+        // colour. MT9V034 remains monochrome and is saved as-is.
         const bool four_ok =
             n >= 4 && !imgs[0].empty() && !imgs[1].empty() &&
             !imgs[2].empty() && !imgs[3].empty();
         const bool two_ok =
             n >= 2 && !imgs[0].empty() && !imgs[1].empty();
-        if (four_ok) {
+        const bool is_smartsens =
+            record.hardware_version == kSmartSensHardwareVersion;
+        if (is_smartsens && two_ok) {
           if (count % 2 == 0) {
             cv::Mat left_image = imgs[0];
             cv::Mat right_image = imgs[1];
-            cv::Mat left_front_image = imgs[2];
-            cv::Mat right_front_image = imgs[3];
+            cv::Mat left_front_image = four_ok ? imgs[2] : cv::Mat{};
+            cv::Mat right_front_image = four_ok ? imgs[3] : cv::Mat{};
             
             // Run the selected ISP pipeline; fast-balanced is the default.
             const std::string image_name = std::to_string(static_cast<int>(image_timestamp * 10000)) + ".png";
             const BayerConversion image13_bayer = SelectBayerConversion(
                 record.hardware_version, record.software_version, 0);
             if (use_fast_balanced) {
-              ApplyFastBalancedISPParallel({
-                  {left_image, left_color, fast_wb[0], "fast-cam1",
-                   record.camera_gain[0], image13_bayer},
-                  {right_image, right_color, fast_wb[1], "fast-cam2",
-                   record.camera_gain[1]},
-                  {left_front_image, left_front_color, fast_wb[2], "fast-cam3",
-                   record.camera_gain[2], image13_bayer},
-                  {right_front_image, right_front_color, fast_wb[3], "fast-cam4",
-                   record.camera_gain[3]},
-              });
+              if (four_ok) {
+                ApplyFastBalancedISPParallel({
+                    {left_image, left_color, fast_wb[0], "fast-cam1",
+                     record.camera_gain[0], image13_bayer},
+                    {right_image, right_color, fast_wb[1], "fast-cam2",
+                     record.camera_gain[1]},
+                    {left_front_image, left_front_color, fast_wb[2], "fast-cam3",
+                     record.camera_gain[2], image13_bayer},
+                    {right_front_image, right_front_color, fast_wb[3], "fast-cam4",
+                     record.camera_gain[3]},
+                });
+              } else {
+                // S2: process and save only C1/C2.
+                ApplyFastBalancedISPParallel({
+                    {left_image, left_color, fast_wb[0], "fast-cam1",
+                     record.camera_gain[0], image13_bayer},
+                    {right_image, right_color, fast_wb[1], "fast-cam2",
+                     record.camera_gain[1]},
+                });
+              }
             } else {
               std::thread t2([&] {
                 ApplyHdrIsp(right_image, right_color, "cam2",
                             BayerConversion::kColorBayerRg2Bgr,
                             record.camera_gain[1]);
               });
-              std::thread t3([&] {
-                ApplyHdrIsp(left_front_image, left_front_color, "cam3",
-                            image13_bayer, record.camera_gain[2]);
-              });
-              std::thread t4([&] {
-                ApplyHdrIsp(right_front_image, right_front_color, "cam4",
-                            BayerConversion::kColorBayerRg2Bgr,
-                            record.camera_gain[3]);
-              });
+              std::thread t3;
+              std::thread t4;
+              if (four_ok) {
+                t3 = std::thread([&] {
+                  ApplyHdrIsp(left_front_image, left_front_color, "cam3",
+                              image13_bayer, record.camera_gain[2]);
+                });
+                t4 = std::thread([&] {
+                  ApplyHdrIsp(right_front_image, right_front_color, "cam4",
+                              BayerConversion::kColorBayerRg2Bgr,
+                              record.camera_gain[3]);
+                });
+              }
               ApplyHdrIsp(left_image, left_color, "cam1", image13_bayer,
                           record.camera_gain[0]);
               t2.join();
-              t3.join();
-              t4.join();
+              if (t3.joinable()) t3.join();
+              if (t4.joinable()) t4.join();
             }
             std::thread t2([&] {
               cv::imwrite("./right/" + image_name, right_color);
             });
-            std::thread t3([&] {
-              cv::imwrite("./left_front/" + image_name, left_front_color);
-            });
-            std::thread t4([&] {
-              cv::imwrite("./right_front/" + image_name, right_front_color);
-            });
+            std::thread t3;
+            std::thread t4;
+            if (four_ok) {
+              t3 = std::thread([&] {
+                cv::imwrite("./left_front/" + image_name, left_front_color);
+              });
+              t4 = std::thread([&] {
+                cv::imwrite("./right_front/" + image_name, right_front_color);
+              });
+            }
             cv::imwrite("./left/" + image_name, left_color);
             t2.join();
-            t3.join();
-            t4.join();
+            if (t3.joinable()) t3.join();
+            if (t4.joinable()) t4.join();
 
           }
           count++;
