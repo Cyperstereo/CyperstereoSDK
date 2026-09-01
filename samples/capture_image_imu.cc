@@ -416,10 +416,16 @@ static int run(int argc, char *argv[]) {
       cyperstereo::SelectProfile(serial_num, *cyperstereo_device);
   frame_info.Init(profile);
   frame_info.framestream.serial_num = serial_num;
+  const int num_cameras = profile.num_cameras;
+  const int process_cameras =
+      cyperstereo::SmartSensProcessedCameraCount(serial_num, num_cameras);
   std::cout << "camera: " << profile.name << "  serial: "
             << (serial_num.empty() ? "(none)" : serial_num) << "  "
           << profile.frame_width << "x" << profile.frame_height << "@"
-          << profile.fps << "  cameras: " << profile.num_cameras << std::endl;
+          << profile.fps << "  cameras: " << num_cameras;
+  if (process_cameras == 1 && num_cameras > 1)
+    std::cout << "  process: C1 only (S1 color SKU)";
+  std::cout << std::endl;
   cyperstereo::uvc::set_device_mode(
     *cyperstereo_device, profile.frame_width, profile.frame_height,
     static_cast<int>(cyperstereo::Format::YUYV), profile.fps,
@@ -432,7 +438,6 @@ static int run(int argc, char *argv[]) {
   TicToc t_frame;
   int count = 0;
 
-  const int num_cameras = profile.num_cameras;
   const bool is_smartsens = cyperstereo::IsSmartSensProfile(profile);
 
   cv::Mat left_image(profile.frame_height, profile.cam_width, CV_8U);
@@ -451,7 +456,7 @@ static int run(int argc, char *argv[]) {
   cv::Mat preview_color[4];
   const IspMode isp_mode = ConfigureCaptureIsp(
       use_fast_balanced, use_uyvy422, show_preview, capture_log_every,
-      left_color.step[0], num_cameras);
+      left_color.step[0], process_cameras);
   IspProcessor isp(isp_mode);
 
   //imshow windows init
@@ -459,7 +464,7 @@ static int run(int argc, char *argv[]) {
   static const char *const kWindowNames[4] = {
       "image1", "image2", "image3", "image4"};
   if (show_preview) {
-    for (int i = 0; i < num_cameras; ++i) {
+    for (int i = 0; i < process_cameras; ++i) {
       // WINDOW_AUTOSIZE keeps the preview at the Mat's native resolution.
       // Do not resize the window: scaling can hide fine noise and false color.
       cv::namedWindow(kWindowNames[i], cv::WINDOW_AUTOSIZE);
@@ -469,7 +474,7 @@ static int run(int argc, char *argv[]) {
   bool preview_visible_seen[4]{};
   bool preview_autosize_seen[4]{};
   const auto preview_window_closed = [&]() {
-    for (int i = 0; i < num_cameras; ++i) {
+    for (int i = 0; i < process_cameras; ++i) {
       // OpenCV 4.2's GTK backend does not implement WND_PROP_VISIBLE and
       // returns -1 even while a window is displayed. AUTOSIZE is supported:
       // it is 0/1 for an existing window and -1 after the user closes it. A
@@ -519,13 +524,14 @@ static int run(int argc, char *argv[]) {
       hardware_version = frame_info.framestream.hardware_version;
       software_version = frame_info.framestream.software_version;
       cv::swap(frame_info.framestream.left_image, left_image);
-      cv::swap(frame_info.framestream.right_image, right_image);
-      if (num_cameras >= 4) {
+      if (process_cameras >= 2)
+        cv::swap(frame_info.framestream.right_image, right_image);
+      if (process_cameras >= 4) {
         cv::swap(frame_info.framestream.left_front_image, left_front_image);
         cv::swap(frame_info.framestream.right_front_image, right_front_image);
       }
       if (is_smartsens) {
-        for (int i = 0; i < num_cameras; ++i) {
+        for (int i = 0; i < process_cameras; ++i) {
           exposure_time[i] = frame_info.framestream.exposure_time[i];
           exposure_lines[i] = frame_info.framestream.exposure_lines[i];
           camera_gain[i] = frame_info.framestream.camera_gain[i];
@@ -554,7 +560,12 @@ static int run(int argc, char *argv[]) {
       // Each camera uses its own live AEC gain from the metadata row.
       const BayerConversion image13_bayer =
           SelectBayerConversion(hardware_version, software_version, 0);
-      if (num_cameras >= 4) {
+      if (process_cameras <= 1) {
+        // S1: C1-only color SKU. Unused FX3 lanes are not ISP'd.
+        isp.ApplyParallel({
+            {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
+        });
+      } else if (process_cameras >= 4) {
         isp.ApplyParallel({
             {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
             {right_image, right_color, "cam2", camera_gain[1]},
@@ -575,7 +586,7 @@ static int run(int argc, char *argv[]) {
         const cv::Mat *display_images[4] = {
             &left_color, &right_color, &left_front_color, &right_front_color};
         if (use_uyvy422) {
-          for (int i = 0; i < num_cameras; ++i) {
+          for (int i = 0; i < process_cameras; ++i) {
             Uyvy422Bt601FullRangeToBgrPreview(*display_images[i],
                                               preview_color[i]);
             if (FastBalancedGammaEnabled())
@@ -583,7 +594,7 @@ static int run(int argc, char *argv[]) {
             display_images[i] = &preview_color[i];
           }
         }
-        for (int i = 0; i < num_cameras; ++i)
+        for (int i = 0; i < process_cameras; ++i)
           cv::imshow(kWindowNames[i], *display_images[i]);
         preview_key = cv::waitKey(1);
       }
@@ -607,7 +618,7 @@ static int run(int argc, char *argv[]) {
     }
 
     LogCaptureDiagnostics(
-        count, capture_log_every, num_cameras, is_smartsens, image_timestamp,
+        count, capture_log_every, process_cameras, is_smartsens, image_timestamp,
         exposure_time, exposure_lines, camera_gain, camera_temperature,
         imu_data, gnss_data, frame_info, t_frame, capture_log);
     ++count;

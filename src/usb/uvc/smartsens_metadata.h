@@ -10,16 +10,31 @@
 // and both 32-bit and 64-bit ARM builds.
 namespace cyperstereo {
 
-// Cyperstereo SmartSens serials encode the camera count in character 1:
-// S0xxxxxx=quad and S2xxxxxx=stereo. Return 0 for another family/SKU so the
-// caller can use UVC-size or legacy fallback logic.
+// Cyperstereo SmartSens serials encode the SKU in character 1:
+// S0xxxxxx=quad (C1/C2/C4/C3), S1xxxxxx=mono color (process C1 only),
+// S2xxxxxx=stereo (C1/C2). The FX3 transport may still carry unused lanes
+// for S1; consumers must skip those planes. Return 0 for another family/SKU
+// so the caller can use UVC-size or legacy fallback logic.
 inline int SmartSensCameraCountFromSerial(const std::string &serial_number) {
   if (serial_number.size() < 2 ||
       (serial_number[0] != 'S' && serial_number[0] != 's'))
     return 0;
   if (serial_number[1] == '0') return 4;
+  if (serial_number[1] == '1') return 1;
   if (serial_number[1] == '2') return 2;
   return 0;
+}
+
+inline bool IsSmartSensC1OnlySerial(const std::string &serial_number) {
+  return SmartSensCameraCountFromSerial(serial_number) == 1;
+}
+
+// How many image planes a consumer should ISP / preview / save.
+// S1 still arrives on the S0/S2 lane layout; only C1 (image1/left) is used.
+inline int SmartSensProcessedCameraCount(const std::string &serial_number,
+                                         int profile_num_cameras) {
+  if (IsSmartSensC1OnlySerial(serial_number)) return 1;
+  return profile_num_cameras;
 }
 
 static constexpr int kSmartSensHardwareVersion = 2;

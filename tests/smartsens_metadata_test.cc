@@ -30,6 +30,24 @@ int main() {
                     "uppercase S0 selects quad");
   failures += Check(SmartSensCameraCountFromSerial("s000061") == 4,
                     "lowercase s0 selects quad");
+  failures += Check(SmartSensCameraCountFromSerial("S100001") == 1,
+                    "uppercase S1 selects mono C1");
+  failures += Check(SmartSensCameraCountFromSerial("s100001") == 1,
+                    "lowercase s1 selects mono C1");
+  failures += Check(IsSmartSensC1OnlySerial("S100001"),
+                    "S1 is the C1-only color SKU");
+  failures += Check(!IsSmartSensC1OnlySerial("S000061"),
+                    "S0 is not C1-only");
+  failures += Check(!IsSmartSensC1OnlySerial("S200010"),
+                    "S2 is not C1-only");
+  failures += Check(SmartSensProcessedCameraCount("S100001", 4) == 1,
+                    "S1 processes C1 even on a four-lane profile");
+  failures += Check(SmartSensProcessedCameraCount("s100002", 4) == 1,
+                    "live S1 serial s100002 processes C1 only");
+  failures += Check(SmartSensProcessedCameraCount("S000061", 4) == 4,
+                    "S0 keeps the quad process count");
+  failures += Check(SmartSensProcessedCameraCount("S200010", 2) == 2,
+                    "S2 keeps the stereo process count");
   failures += Check(SmartSensCameraCountFromSerial("S3") == 0,
                     "unsupported SmartSens SKU uses fallback");
   failures += Check(SmartSensCameraCountFromSerial("C200010") == 0,
@@ -131,7 +149,7 @@ int main() {
       "2/6 Bayer phase");
 
   if (failures != 0) return 1;
-  std::cout << "SmartSens S0/S2 serial and 2/3, 2/4, 2/5, 2/6 metadata tests passed"
+  std::cout << "SmartSens S0/S1/S2 serial and 2/3, 2/4, 2/5, 2/6 metadata tests passed"
             << std::endl;
   return 0;
 }

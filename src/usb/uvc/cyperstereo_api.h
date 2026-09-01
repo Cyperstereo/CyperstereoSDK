@@ -413,9 +413,11 @@ struct CameraProfile {
   int gnss_base_col;
 };
 
-// SmartSens serial layout: S0xxxxxx=quad and S2xxxxxx=stereo.  Both use
-// 1280-pixel SC136HGS planes; the UVC transport is 2560 wide for four byte
-// lanes (C1/C2/C4/C3) and 1280 wide for the two byte lanes (C1/C2).
+// SmartSens serial layout: S0xxxxxx=quad, S1xxxxxx=mono color (C1 only),
+// and S2xxxxxx=stereo.  All use 1280-pixel SC136HGS planes; the UVC
+// transport is 2560 wide for four byte lanes (C1/C2/C4/C3) and 1280 wide
+// for the two byte lanes (C1/C2).  S1 keeps that lane layout so metadata
+// packed across C1/C2 stays readable; samples process only C1.
 static constexpr CameraProfile kProfileSmartSensQuad{
     "SmartSens(SC136HGS-quad/S0)", 2, 3, kFx3FrameWidth, kFx3FrameHeight,
     kFx3FrameFps, 4, kSmartSensCamWidth, kFx3FrameHeight - 1,
@@ -456,7 +458,8 @@ inline const CameraProfile &SelectSmartSensBySerial(
   if (camera_count == 2) return kProfileSmartSensStereo;
   if (camera_count == 4) return kProfileSmartSensQuad;
 
-  // Unknown/legacy S serials keep the old quad default.  If a device is
+  // S1 (count==1) and unknown/legacy S serials keep the FX3 lane layout so
+  // metadata packed across C1/C2 remains readable.  If a device is
   // available, an unambiguous advertised size is a safer fallback.
   if (device) {
     const bool has_stereo =

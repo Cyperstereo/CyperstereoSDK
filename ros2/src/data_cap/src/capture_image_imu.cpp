@@ -91,7 +91,18 @@ public:
         frame_info.Init(profile);
         frame_info.framestream.serial_num = serial_num;
         const int num_cameras = profile.num_cameras;
+        const int process_cameras =
+            cyperstereo::SmartSensProcessedCameraCount(serial_num, num_cameras);
         const bool is_smartsens = cyperstereo::IsSmartSensProfile(profile);
+        RCLCPP_INFO(this->get_logger(),
+                    "camera: %s  serial: %s  %dx%d@%d  cameras: %d%s",
+                    profile.name,
+                    serial_num.empty() ? "(none)" : serial_num.c_str(),
+                    profile.frame_width, profile.frame_height, profile.fps,
+                    num_cameras,
+                    (process_cameras == 1 && num_cameras > 1)
+                        ? "  process: C1 only (S1 color SKU)"
+                        : "");
         cyperstereo::uvc::set_device_mode(
             *cyperstereo_device, profile.frame_width, profile.frame_height,
             static_cast<int>(cyperstereo::Format::YUYV), profile.fps,
@@ -129,13 +140,14 @@ public:
                 hardware_version = frame_info.framestream.hardware_version;
                 software_version = frame_info.framestream.software_version;
                 cv::swap(frame_info.framestream.left_image, left_image);
-                cv::swap(frame_info.framestream.right_image, right_image);
-                if (num_cameras >= 4) {
+                if (process_cameras >= 2)
+                    cv::swap(frame_info.framestream.right_image, right_image);
+                if (process_cameras >= 4) {
                     cv::swap(frame_info.framestream.left_front_image, left_front_image);
                     cv::swap(frame_info.framestream.right_front_image, right_front_image);
                 }
                 if (is_smartsens) {
-                    for (int i = 0; i < num_cameras; ++i)
+                    for (int i = 0; i < process_cameras; ++i)
                         camera_gain[i] = frame_info.framestream.camera_gain[i];
                 }
                 imu_data = frame_info.framestream.imu;
@@ -154,7 +166,14 @@ public:
                 static WhiteBalance wb[4];
                 const BayerConversion image13_bayer =
                     SelectBayerConversion(hardware_version, software_version, 0);
-                if (num_cameras >= 4) {
+                if (process_cameras <= 1) {
+                    // S1: C1-only color SKU. Unused FX3 lanes are not ISP'd
+                    // or published.
+                    ApplyFastBalancedISPParallel({
+                        {left_image, left_color, wb[0], "fast-cam1",
+                         camera_gain[0], image13_bayer},
+                    });
+                } else if (process_cameras >= 4) {
                     ApplyFastBalancedISPParallel({
                         {left_image, left_color, wb[0], "fast-cam1",
                          camera_gain[0], image13_bayer},
@@ -176,10 +195,12 @@ public:
 
                 msg0.encoding = "bgr8";
                 msg0.image = left_color;
-                msg1.encoding = "bgr8";
-                msg1.image = right_color;
+                if (process_cameras >= 2) {
+                    msg1.encoding = "bgr8";
+                    msg1.image = right_color;
+                }
 
-                if (num_cameras >= 4) {
+                if (process_cameras >= 4) {
                     msg2.header.stamp = custom_time;
                     msg2.header.frame_id = "cam2";
                     msg2.encoding = "bgr8";
@@ -202,8 +223,10 @@ public:
 
             msg0.header.stamp = custom_time;
             msg0.header.frame_id = "cam0";
-            msg1.header.stamp = custom_time;
-            msg1.header.frame_id = "cam1";
+            if (process_cameras >= 2) {
+                msg1.header.stamp = custom_time;
+                msg1.header.frame_id = "cam1";
+            }
 
             std::cout << "image_timestamp " << image_timestamp << std::endl;
             
@@ -238,8 +261,9 @@ public:
             }
 
             cam0_image_pub->publish(*msg0.toImageMsg());
-            cam1_image_pub->publish(*msg1.toImageMsg());
-            if (num_cameras >= 4)
+            if (process_cameras >= 2)
+                cam1_image_pub->publish(*msg1.toImageMsg());
+            if (process_cameras >= 4)
             {
                 cam2_image_pub->publish(*msg2.toImageMsg());
                 cam3_image_pub->publish(*msg3.toImageMsg());

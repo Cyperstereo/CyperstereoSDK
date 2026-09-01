@@ -45,6 +45,7 @@ struct ImageRecord {
   uint32_t hardware_version;
   uint32_t software_version;
   std::array<double, 4> camera_gain{};
+  int process_cameras{0};
   std::vector<cv::Mat> images;
 };
 std::queue<ImageRecord> IMAGE;
@@ -71,6 +72,7 @@ void DataFlow();
 void InputIMAGE(const double timestamp, uint32_t hardware_version,
                 uint32_t software_version,
                 const std::array<double, 4> &camera_gain,
+                int process_cameras,
                 const std::vector<cv::Mat>& images);
 void InputIMU(const double timestamp, double gyro_x, double gyro_y, double gyro_z, double acc_x, double acc_y, double acc_z);
 void InputGNSS(const cyperstereo::GNSSStreamData &gnss);
@@ -112,11 +114,16 @@ int main(int argc, char *argv[]) {
       cyperstereo::SelectProfile(serial_num, *cyperstereo_device);
   frame_info.Init(profile);
   frame_info.framestream.serial_num = serial_num;
+  const int num_cameras = profile.num_cameras;
+  const int process_cameras =
+      cyperstereo::SmartSensProcessedCameraCount(serial_num, num_cameras);
   std::cout << "camera: " << profile.name << "  serial: "
             << (serial_num.empty() ? "(none)" : serial_num) << "  "
             << profile.frame_width << "x" << profile.frame_height << "@"
-            << profile.fps << "  cameras: " << profile.num_cameras << std::endl;
-  const int num_cameras = profile.num_cameras;
+            << profile.fps << "  cameras: " << num_cameras;
+  if (process_cameras == 1 && num_cameras > 1)
+    std::cout << "  process: C1 only (S1 color SKU)";
+  std::cout << std::endl;
   const bool is_smartsens = cyperstereo::IsSmartSensProfile(profile);
   cyperstereo::uvc::set_device_mode(
       *cyperstereo_device, profile.frame_width, profile.frame_height,
@@ -151,13 +158,14 @@ int main(int argc, char *argv[]) {
       hardware_version = frame_info.framestream.hardware_version;
       software_version = frame_info.framestream.software_version;
       cv::swap(frame_info.framestream.left_image, left_image);
-      cv::swap(frame_info.framestream.right_image, right_image);
-      if (num_cameras >= 4) {
+      if (process_cameras >= 2)
+        cv::swap(frame_info.framestream.right_image, right_image);
+      if (process_cameras >= 4) {
         cv::swap(frame_info.framestream.left_front_image, left_front_image);
         cv::swap(frame_info.framestream.right_front_image, right_front_image);
       }
       if (is_smartsens) {
-        for (int i = 0; i < num_cameras; ++i)
+        for (int i = 0; i < process_cameras; ++i)
           camera_gain[i] = frame_info.framestream.camera_gain[i];
       }
       imu_data = frame_info.framestream.imu;
@@ -166,13 +174,14 @@ int main(int argc, char *argv[]) {
 
     std::vector<cv::Mat> images;
     images.push_back(left_image);
-    images.push_back(right_image);
-    if (num_cameras >= 4) {
+    if (process_cameras >= 2)
+      images.push_back(right_image);
+    if (process_cameras >= 4) {
       images.push_back(left_front_image);
       images.push_back(right_front_image);
     }
     InputIMAGE(image_timestamp, hardware_version, software_version,
-               camera_gain, images);  // clones into the save queue
+               camera_gain, process_cameras, images);  // clones into the save queue
     for (int i = 0; i < imu_data.imu_count; ++i) {
       InputIMU(imu_data.imu_timestamp[i], imu_data.gyro_x[i], imu_data.gyro_y[i],
                imu_data.gyro_z[i], imu_data.acc_x[i], imu_data.acc_y[i],
@@ -222,10 +231,12 @@ void InputGNSS(const cyperstereo::GNSSStreamData &gnss) {
 void InputIMAGE(const double timestamp, uint32_t hardware_version,
                  uint32_t software_version,
                  const std::array<double, 4> &camera_gain,
+                 int process_cameras,
                  const std::vector<cv::Mat>& images) {
     m_buf.lock();
     ImageRecord record{
-        timestamp, hardware_version, software_version, camera_gain, {}};
+        timestamp, hardware_version, software_version, camera_gain,
+        process_cameras, {}};
     record.images.reserve(images.size());
     for (const auto &img : images) {
       record.images.push_back(img.clone());
@@ -323,19 +334,24 @@ void DataFlow() {
         double image_timestamp = record.timestamp;
         const std::vector<cv::Mat> &imgs = record.images;
         const size_t n = imgs.size();
-        // SmartSens S0/S2: RAW Bayer -> white balance + demosaic, save as
-        // colour. MT9V034 remains monochrome and is saved as-is.
+        // SmartSens S0/S1/S2: RAW Bayer -> white balance + demosaic, save as
+        // colour. S1 processes and writes only C1. MT9V034 remains monochrome
+        // and is saved as-is.
+        const int process_n = record.process_cameras > 0
+                                  ? record.process_cameras
+                                  : static_cast<int>(n);
         const bool four_ok =
-            n >= 4 && !imgs[0].empty() && !imgs[1].empty() &&
-            !imgs[2].empty() && !imgs[3].empty();
+            process_n >= 4 && n >= 4 && !imgs[0].empty() &&
+            !imgs[1].empty() && !imgs[2].empty() && !imgs[3].empty();
         const bool two_ok =
-            n >= 2 && !imgs[0].empty() && !imgs[1].empty();
+            process_n >= 2 && n >= 2 && !imgs[0].empty() && !imgs[1].empty();
+        const bool one_ok = process_n >= 1 && n >= 1 && !imgs[0].empty();
         const bool is_smartsens =
             record.hardware_version == kSmartSensHardwareVersion;
-        if (is_smartsens && two_ok) {
+        if (is_smartsens && one_ok) {
           if (count % 2 == 0) {
             cv::Mat left_image = imgs[0];
-            cv::Mat right_image = imgs[1];
+            cv::Mat right_image = two_ok ? imgs[1] : cv::Mat{};
             cv::Mat left_front_image = four_ok ? imgs[2] : cv::Mat{};
             cv::Mat right_front_image = four_ok ? imgs[3] : cv::Mat{};
             
@@ -355,7 +371,7 @@ void DataFlow() {
                     {right_front_image, right_front_color, fast_wb[3], "fast-cam4",
                      record.camera_gain[3]},
                 });
-              } else {
+              } else if (two_ok) {
                 // S2: process and save only C1/C2.
                 ApplyFastBalancedISPParallel({
                     {left_image, left_color, fast_wb[0], "fast-cam1",
@@ -363,15 +379,24 @@ void DataFlow() {
                     {right_image, right_color, fast_wb[1], "fast-cam2",
                      record.camera_gain[1]},
                 });
+              } else {
+                // S1: process and save only C1.
+                ApplyFastBalancedISPParallel({
+                    {left_image, left_color, fast_wb[0], "fast-cam1",
+                     record.camera_gain[0], image13_bayer},
+                });
               }
             } else {
-              std::thread t2([&] {
-                ApplyHdrIsp(right_image, right_color, "cam2",
-                            BayerConversion::kColorBayerRg2Bgr,
-                            record.camera_gain[1]);
-              });
+              std::thread t2;
               std::thread t3;
               std::thread t4;
+              if (two_ok) {
+                t2 = std::thread([&] {
+                  ApplyHdrIsp(right_image, right_color, "cam2",
+                              BayerConversion::kColorBayerRg2Bgr,
+                              record.camera_gain[1]);
+                });
+              }
               if (four_ok) {
                 t3 = std::thread([&] {
                   ApplyHdrIsp(left_front_image, left_front_color, "cam3",
@@ -385,15 +410,18 @@ void DataFlow() {
               }
               ApplyHdrIsp(left_image, left_color, "cam1", image13_bayer,
                           record.camera_gain[0]);
-              t2.join();
+              if (t2.joinable()) t2.join();
               if (t3.joinable()) t3.join();
               if (t4.joinable()) t4.join();
             }
-            std::thread t2([&] {
-              cv::imwrite("./right/" + image_name, right_color);
-            });
+            std::thread t2;
             std::thread t3;
             std::thread t4;
+            if (two_ok) {
+              t2 = std::thread([&] {
+                cv::imwrite("./right/" + image_name, right_color);
+              });
+            }
             if (four_ok) {
               t3 = std::thread([&] {
                 cv::imwrite("./left_front/" + image_name, left_front_color);
@@ -403,7 +431,7 @@ void DataFlow() {
               });
             }
             cv::imwrite("./left/" + image_name, left_color);
-            t2.join();
+            if (t2.joinable()) t2.join();
             if (t3.joinable()) t3.join();
             if (t4.joinable()) t4.join();
 
