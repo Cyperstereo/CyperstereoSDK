@@ -263,9 +263,10 @@ class FastIspFrameParallelGuard {
   FastIspStagePool *pool_ = nullptr;
 };
 
-// OpenCV 4.11 (PR opencv#26109) removed the arithmetic/bitwise/shift
-// operators on universal intrinsics in favour of v_add/v_sub/v_mul/v_and/
-// v_shl/v_shr (they clash with the RISC-V RVV built-in vector types). Our
+// OpenCV 4.11 (PR opencv#26109) removed the arithmetic/bitwise/shift/
+// comparison operators on universal intrinsics in favour of
+// v_add/v_sub/v_mul/v_and/v_or/v_xor/v_not/v_gt/v_lt/v_shl/v_shr
+// (they clash with the RISC-V RVV built-in vector types). Our
 // CV_SIMD128 fallback loops are written with operators -- which keeps them
 // bit-exact and still builds against the 4.5.x that ships with most
 // distros. Restore the operators for newer OpenCV, scoped to this SDK's
@@ -275,16 +276,24 @@ class FastIspFrameParallelGuard {
 #define CYPERSTEREO_VOP_BIN(OP, FUN, TYPE)             \
   static inline cv::TYPE operator OP(const cv::TYPE &a, \
                                      const cv::TYPE &b) { return cv::FUN(a, b); }
-#define CYPERSTEREO_VOP_ALL(TYPE)     \
-  CYPERSTEREO_VOP_BIN(+, v_add, TYPE) \
-  CYPERSTEREO_VOP_BIN(-, v_sub, TYPE) \
-  CYPERSTEREO_VOP_BIN(*, v_mul, TYPE) \
-  CYPERSTEREO_VOP_BIN(&, v_and, TYPE)
+#define CYPERSTEREO_VOP_UNARY(OP, FUN, TYPE) \
+  static inline cv::TYPE operator OP(const cv::TYPE &a) { return cv::FUN(a); }
+#define CYPERSTEREO_VOP_ALL(TYPE)      \
+  CYPERSTEREO_VOP_BIN(+, v_add, TYPE)  \
+  CYPERSTEREO_VOP_BIN(-, v_sub, TYPE)  \
+  CYPERSTEREO_VOP_BIN(*, v_mul, TYPE)  \
+  CYPERSTEREO_VOP_BIN(&, v_and, TYPE)  \
+  CYPERSTEREO_VOP_BIN(|, v_or, TYPE)   \
+  CYPERSTEREO_VOP_BIN(^, v_xor, TYPE)  \
+  CYPERSTEREO_VOP_BIN(>, v_gt, TYPE)   \
+  CYPERSTEREO_VOP_BIN(<, v_lt, TYPE)   \
+  CYPERSTEREO_VOP_UNARY(~, v_not, TYPE)
 CYPERSTEREO_VOP_ALL(v_uint16x8)
 CYPERSTEREO_VOP_ALL(v_uint32x4)
 CYPERSTEREO_VOP_ALL(v_int16x8)
 CYPERSTEREO_VOP_ALL(v_int32x4)
 #undef CYPERSTEREO_VOP_ALL
+#undef CYPERSTEREO_VOP_UNARY
 #undef CYPERSTEREO_VOP_BIN
 #define CYPERSTEREO_VOP_SHIFT(TYPE)                                       \
   static inline cv::TYPE operator<<(const cv::TYPE &a, int n) {           \

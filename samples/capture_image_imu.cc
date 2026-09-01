@@ -460,7 +460,7 @@ static int run(int argc, char *argv[]) {
   IspProcessor isp(isp_mode);
 
   //imshow windows init
-  constexpr int kShowEvery = 5;
+  constexpr int kShowEvery = 1;
   static const char *const kWindowNames[4] = {
       "image1", "image2", "image3", "image4"};
   if (show_preview) {
