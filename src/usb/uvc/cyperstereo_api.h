@@ -932,11 +932,15 @@ inline const FastBalancedToneLuts &GetFastBalancedToneLuts() {
   static const FastBalancedToneLuts luts = [] {
     FastBalancedToneLuts v;
     constexpr double kLinearFullScale8 = 255.0 - kIspBlackLevel;  // 239
-    constexpr double kGamma = 1.20;
-    constexpr double kMaxGain = 1.35;
-    // HDR values 32..128 are in its 10-bit working range, hence 8..32 here.
-    constexpr double kNoiseFloor8 = 8.0;
-    constexpr double kRampEnd8 = 32.0;
+    // Moderate shadow/midtone lift; keep the noise-floor ramp and highlight
+    // limiter. Including 255/239 normalization, gain stays below 2x so the
+    // AArch64 signed-Q15 gain-above-identity table remains representable.
+    constexpr double kGamma = 2.00;
+    constexpr double kMaxGain = 1.85;
+    // Keep the deepest 0..4 DN linear; reveal detail earlier over 4..24 DN.
+    // HDR uses the same thresholds scaled by four (16..96).
+    constexpr double kNoiseFloor8 = 4.0;
+    constexpr double kRampEnd8 = 24.0;
     for (int y = 0; y < 256; ++y) {
       double n = y / kLinearFullScale8;
       if (n > 1.0) n = 1.0;
@@ -950,7 +954,7 @@ inline const FastBalancedToneLuts &GetFastBalancedToneLuts() {
       v.gain_q12[y] = static_cast<uint16_t>(
           y > 0 ? (out_y * 4096 + y / 2) / y : 0);
       v.clip_q12[y] = static_cast<uint16_t>(
-          y > 0 ? (255 * 4096) / y : 65535);
+          y > 0 ? (std::min)(65535, (255 * 4096) / y) : 65535);
       v.gain_q12_i32[y] = v.gain_q12[y];
       v.clip_q12_i32[y] = v.clip_q12[y];
     }

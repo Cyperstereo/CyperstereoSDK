@@ -10,7 +10,7 @@
 //                                       tools/ccm_calibrate.py).
 //   WB   = per-camera robust gray-world (median of g/b, g/r ratios), the
 //          estimator used by the old WhiteBalance class.
-//   Tone = mild shared-luminance gamma (1.20, max 1.35x lift) by default;
+//   Tone = shared-luminance gamma (2.00, max 1.85x lift) by default;
 //          explicit tone env knobs select the ported sRGB/power + S-curve.
 //
 // Sensor analogue gain is passed to gain-adaptive BayerNR and LumaNR. Exposure
@@ -105,16 +105,15 @@ double EnvContrast() {
   return a;
 }
 
-// Mild default curve for rgbgamma.  The module applies it to luminance and
-// uses that gain for B/G/R equally, so it reveals a little shadow detail
-// without changing hue or materially lifting chroma noise.
-constexpr double kDefaultRgbGamma = 1.20;
-constexpr double kDefaultRgbGammaMaxGain = 1.35;
-// Do not lift the sensor's darkest samples.  The transition ends at 32 DN in
-// the original 8-bit post-BLC domain, so shadow detail rises smoothly above
-// the noise floor rather than turning it into visible colour speckle.
-constexpr double kDefaultRgbGammaNoiseFloor = 32.0;
-constexpr double kDefaultRgbGammaRampEnd = 128.0;
+// Moderate default curve for rgbgamma, matching the fast-balanced path.
+// One gain for B/G/R preserves hue. Noise-floor gating remains necessary:
+// lifting real shadow detail also makes residual noise more visible.
+constexpr double kDefaultRgbGamma = 2.00;
+constexpr double kDefaultRgbGammaMaxGain = 1.85;
+// Preserve the deepest 0..4 DN and reveal shadows over 4..24 DN in the
+// original 8-bit post-BLC domain. Values below are in the 10-bit work domain.
+constexpr double kDefaultRgbGammaNoiseFloor = 16.0;
+constexpr double kDefaultRgbGammaRampEnd = 96.0;
 
 // True when the user explicitly asked for the old ApplyISPParallel tone
 // pipeline via any of its env knobs; otherwise the conservative default
@@ -258,7 +257,7 @@ void InitPrms(IspPrms &prms, int width, int height, CfaTypes cfa) {
   // rgbgamma: 10-bit linear in -> 8-bit encoded out. HDR-ISP interpolates
   // `nums` knots evenly over the input span [0, 1<<in_bits).
   //
-  // Default: a mild gamma-1.20 luminance curve whose gain is capped at 1.35x.
+  // Default: gamma-2.00 luminance curve whose gain is capped at 1.85x.
   // When a CYPERSTEREO_GAMMA/_BLACKPOINT/_CONTRAST knob is set we instead bake
   // the ported ApplyISPParallel sRGB+blackpoint+S curve into 21 knots,
   // rescaled so post-BLC full scale (956) maps to 1.0 (white stays white).
