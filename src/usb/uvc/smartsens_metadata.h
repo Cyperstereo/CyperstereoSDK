@@ -42,6 +42,8 @@ static constexpr int kSmartSensSoftwareVersion3 = 3;
 static constexpr int kSmartSensSoftwareVersion4 = 4;
 static constexpr int kSmartSensSoftwareVersion5 = 5;
 static constexpr int kSmartSensSoftwareVersion6 = 6;
+static constexpr int kSmartSensSoftwareVersion7 = 7;
+static constexpr int kSmartSensSoftwareVersion8 = 8;
 
 static constexpr int kMetaImuBaseCol = 5;
 static constexpr int kImuWordsPerSample = 9;
@@ -66,6 +68,9 @@ static constexpr double kSmartSensV6LineTimeSec = 452.0 / 15187500.0;
 // Software 05 carries twelve mandatory plus one optional IMU sample and moves
 // that telemetry to columns 122..134. Software 06 returns to the software-04
 // seven-slot/columns-68..80 layout, but uses the longer HTS=452 line time.
+// Software 07 adds USB online upgrade and GNSS at columns 81..105.
+// Software 08 adds USB online upgrade to 05: same 13 IMU slots, AE columns,
+// 16 Hz timing and zero-filled unused slots; it does not contain GNSS.
 struct SmartSensMetadataLayout {
   int imu_samples_per_frame;
   int ae_marker_col;
@@ -85,23 +90,27 @@ inline bool IsSupportedSmartSensFirmware(int hardware_version,
          (software_version == kSmartSensSoftwareVersion3 ||
           software_version == kSmartSensSoftwareVersion4 ||
           software_version == kSmartSensSoftwareVersion5 ||
-          software_version == kSmartSensSoftwareVersion6);
+          software_version == kSmartSensSoftwareVersion6 ||
+          software_version == kSmartSensSoftwareVersion7 ||
+          software_version == kSmartSensSoftwareVersion8);
 }
 
 inline SmartSensMetadataLayout GetSmartSensMetadataLayout(
     int hardware_version, int software_version) {
   if (hardware_version == kSmartSensHardwareVersion &&
-      software_version == kSmartSensSoftwareVersion6) {
+      (software_version == kSmartSensSoftwareVersion6 ||
+       software_version == kSmartSensSoftwareVersion7)) {
     return SmartSensMetadataLayout{
         kSmartSensLegacyImuSamplesPerFrame,
-        68, 69, 73, 77, 81,
+        68, 69, 73, 77, software_version == kSmartSensSoftwareVersion7 ? 106 : 81,
         kImageGapThresholdSec,
         kSmartSensV6LineTimeSec,
         true,
         false};
   }
   if (hardware_version == kSmartSensHardwareVersion &&
-      software_version == kSmartSensSoftwareVersion5) {
+      (software_version == kSmartSensSoftwareVersion5 ||
+       software_version == kSmartSensSoftwareVersion8)) {
     return SmartSensMetadataLayout{
         kSmartSensV5ImuSamplesPerFrame,
         122, 123, 127, 131, 135,

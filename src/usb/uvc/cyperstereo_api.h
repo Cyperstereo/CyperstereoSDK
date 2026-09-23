@@ -9857,13 +9857,16 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           }
           ++frame_info.frame_seq;
 
-          // SmartSens cameras have no GNSS module. Their versioned metadata region
-          // carries IMU plus per-camera AE telemetry and overlaps the legacy
-          // GNSS byte layout, so only parse GNSS on the MT9V families.
-          if (IsSmartSensProfile(prof)) {
+          // SmartSens v7 appends GNSS after IMU/AE. Older versions keep
+          // their original layouts and must never interpret pixels as GNSS.
+          const bool gnss_v7 = IsSmartSensProfile(prof) &&
+              ver1 == kSmartSensSoftwareVersion7;
+          const int gnss_status = gnss_v7 ? meta_u(81) : 0;
+          if (IsSmartSensProfile(prof) &&
+              (!gnss_v7 || (gnss_status & 0xff01) != 0x4701)) {
             fs.gnss.valid = false;
           } else {
-            const int gnss_shift = prof.gnss_base_col * 2 - 96;
+            const int gnss_shift = (gnss_v7 ? 82 : prof.gnss_base_col) * 2 - 96;
             auto g8 = [&](int ref_byte) -> int {
               const int b = ref_byte + gnss_shift;
               return (b & 1) ? hi[b >> 1] : lo[b >> 1];
@@ -9873,7 +9876,8 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             double gnss_count_s = ((g8(99) << 8) | g8(98));
             // Same 43200s-rollover correction as the IMU samples above.
             double gnss_timestamp = wrap_fix(
-                image_count_hour * 12 * 3600 + gnss_count_s + gnss_count_ms / 10000.0);
+                (gnss_v7 ? meta_u(105) : image_count_hour) * 12 * 3600 +
+                gnss_count_s + gnss_count_ms / 10000.0);
 
             uint16_t gnss_utc_hour = (g8(101) >> 3);
             uint16_t gps_utc_minute = (g8(100) >> 2);
@@ -9907,10 +9911,13 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             double gps_alt_integer = (g8(113) << 6 | g8(112) >> 2);
             double gps_alt_fraction = ((g8(115) << 8) | g8(114));
             double altitude = gps_alt_integer + gps_alt_fraction / 10000.0;
+            if (gnss_v7 && (g8(112) & 1)) altitude = -altitude;
             uint16_t gps_fix_quality = (g8(117) >> 5);
             uint16_t gps_satellites = (g8(116) >> 1);
             double gps_geoid_integer = ((g8(119) << 6) | (g8(118) >> 2));
-            double gps_geoid_fraction = ((g8(121) << 4) | (g8(120) >> 4));
+            double gps_geoid_fraction = gnss_v7
+                ? ((g8(121) << 8) | g8(120))
+                : ((g8(121) << 4) | (g8(120) >> 4));
             uint16_t gps_geoid_negative = (g8(118) & 0x01);
             double gps_geoid_height = gps_geoid_integer + gps_geoid_fraction / 10000.0;
             if (gps_geoid_negative == 1) gps_geoid_height = -gps_geoid_height;
@@ -9933,7 +9940,8 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             double gps_angle_fraction = ((g8(141) << 2) | g8(140) >> 6);
             double gps_angle = gps_angle_integer + gps_angle_fraction / 1000.0;
 
-            if (!gnss_time_unchanged && gps_fix_quality >= 1 && hdop < 50 &&
+            if (!gnss_time_unchanged && gps_fix_quality >= 1 &&
+                (!gnss_v7 || (gnss_status & 6) == 6) && hdop < 50 &&
                 vdop < 50 && pdop < 50) {
               fs.gnss.valid = true;
               fs.gnss.gnss_timestamp = gnss_timestamp;
