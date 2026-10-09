@@ -140,6 +140,13 @@ inline SmartSensMetadataLayout GetSmartSensMetadataLayout(
 
 static constexpr int kSmartSensMaxMetadataCols = 135;
 
+// AE marker column (ae_marker_col) = {0xAE, lo}. lo[3:0] = cam4/3/2/1 present.
+// lo[7:4] = per physical sensor C4/C3/C2/C1: the FPGA already applied the
+// fast-ISP BayerNR to that sensor's RAW in this frame (bit-exact with the host
+// filter), so the host must not filter it again. Older bitstreams send 0.
+static constexpr int kSmartSensAeMarkerHigh = 0xAE;
+static constexpr int kSmartSensFpgaBayerNrShift = 4;
+
 }  // namespace cyperstereo
 
 #endif  // CYPERSTEREO_SMARTSENS_METADATA_H_

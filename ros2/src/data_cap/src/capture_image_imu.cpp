@@ -132,6 +132,7 @@ public:
             uint32_t hardware_version = 0;
             uint32_t software_version = 0;
             std::array<double, 4> camera_gain{{1.0, 1.0, 1.0, 1.0}};
+            std::array<bool, 4> fpga_bayer_nr{};
             cyperstereo::IMUStreamData imu_data{};
 
             {
@@ -147,8 +148,10 @@ public:
                     cv::swap(frame_info.framestream.right_front_image, right_front_image);
                 }
                 if (is_smartsens) {
-                    for (int i = 0; i < process_cameras; ++i)
+                    for (int i = 0; i < process_cameras; ++i) {
                         camera_gain[i] = frame_info.framestream.camera_gain[i];
+                        fpga_bayer_nr[i] = frame_info.framestream.fpga_bayer_nr[i];
+                    }
                 }
                 imu_data = frame_info.framestream.imu;
             }
@@ -171,25 +174,28 @@ public:
                     // or published.
                     ApplyFastBalancedISPParallel({
                         {left_image, left_color, wb[0], "fast-cam1",
-                         camera_gain[0], image13_bayer},
+                         camera_gain[0], image13_bayer, fpga_bayer_nr[0]},
                     });
                 } else if (process_cameras >= 4) {
                     ApplyFastBalancedISPParallel({
                         {left_image, left_color, wb[0], "fast-cam1",
-                         camera_gain[0], image13_bayer},
+                         camera_gain[0], image13_bayer, fpga_bayer_nr[0]},
                         {right_image, right_color, wb[1], "fast-cam2",
-                         camera_gain[1]},
+                         camera_gain[1], BayerConversion::kColorBayerRg2Bgr,
+                         fpga_bayer_nr[1]},
                         {left_front_image, left_front_color, wb[2], "fast-cam3",
-                         camera_gain[2], image13_bayer},
+                         camera_gain[2], image13_bayer, fpga_bayer_nr[2]},
                         {right_front_image, right_front_color, wb[3], "fast-cam4",
-                         camera_gain[3]},
+                         camera_gain[3], BayerConversion::kColorBayerRg2Bgr,
+                         fpga_bayer_nr[3]},
                     });
                 } else {
                     ApplyFastBalancedISPParallel({
                         {left_image, left_color, wb[0], "fast-cam1",
-                         camera_gain[0], image13_bayer},
+                         camera_gain[0], image13_bayer, fpga_bayer_nr[0]},
                         {right_image, right_color, wb[1], "fast-cam2",
-                         camera_gain[1]},
+                         camera_gain[1], BayerConversion::kColorBayerRg2Bgr,
+                         fpga_bayer_nr[1]},
                     });
                 }
 

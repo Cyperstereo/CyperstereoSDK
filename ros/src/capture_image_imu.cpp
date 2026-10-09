@@ -11,7 +11,10 @@
 #include <string>
 #include <stdio.h>
 #include <sensor_msgs/Imu.h>
+#include <sensor_msgs/Image.h>
+#include <sensor_msgs/image_encodings.h>
 #include <std_msgs/Header.h>
+#include <boost/make_shared.hpp>
 #include <array>
 #include <map>
 #include <mutex>
@@ -22,6 +25,38 @@ using namespace std;
 const double g = 9.7887;
 
 CYPERSTEREO_USE_NAMESPACE
+
+// BGR8 messages the ISP renders into directly.  A message is reused only once
+// roscpp and every intra-process subscriber have released it (use_count()==1,
+// i.e. only the pool holds it), so the ~3.9 MB pixel buffer is neither copied
+// by cv_bridge nor reallocated and zero-filled every frame.
+class Bgr8MessagePool {
+ public:
+  sensor_msgs::ImagePtr Acquire(int height, int width) {
+    for (const auto &msg : pool_)
+      if (msg.use_count() == 1 && static_cast<int>(msg->height) == height &&
+          static_cast<int>(msg->width) == width)
+        return msg;
+    sensor_msgs::ImagePtr msg = boost::make_shared<sensor_msgs::Image>();
+    msg->height = height;
+    msg->width = width;
+    msg->encoding = sensor_msgs::image_encodings::BGR8;
+    msg->is_bigendian = 0;
+    msg->step = static_cast<uint32_t>(width) * 3;
+    msg->data.resize(static_cast<size_t>(msg->step) * height);
+    if (pool_.size() < kMaxPooled) pool_.push_back(msg);
+    return msg;
+  }
+
+ private:
+  static constexpr size_t kMaxPooled = 4;
+  std::vector<sensor_msgs::ImagePtr> pool_;
+};
+
+static cv::Mat WrapBgr8(const sensor_msgs::ImagePtr &msg) {
+  return cv::Mat(static_cast<int>(msg->height), static_cast<int>(msg->width),
+                 CV_8UC3, msg->data.data(), msg->step);
+}
 
 int main(int argc, char *argv[]) {
   ros::init(argc, argv, "capture_image_imu");
@@ -79,7 +114,7 @@ int main(int argc, char *argv[]) {
   cv::Mat right_image(profile.frame_height, profile.cam_width, CV_8U);
   cv::Mat left_front_image(profile.frame_height, profile.cam_width, CV_8U);
   cv::Mat right_front_image(profile.frame_height, profile.cam_width, CV_8U);
-  cv::Mat left_color, right_color, left_front_color, right_front_color;
+  Bgr8MessagePool color_pool[4];
 
   while (ros::ok()) {
     cyperstereo::WaitForStream(frame_info);
@@ -88,6 +123,7 @@ int main(int argc, char *argv[]) {
     uint32_t hardware_version = 0;
     uint32_t software_version = 0;
     std::array<double, 4> camera_gain{{1.0, 1.0, 1.0, 1.0}};
+    std::array<bool, 4> fpga_bayer_nr{};
     cyperstereo::IMUStreamData imu_data{};
 
     {
@@ -103,8 +139,10 @@ int main(int argc, char *argv[]) {
         cv::swap(frame_info.framestream.right_front_image, right_front_image);
       }
       if (is_smartsens) {
-        for (int i = 0; i < process_cameras; ++i)
+        for (int i = 0; i < process_cameras; ++i) {
           camera_gain[i] = frame_info.framestream.camera_gain[i];
+          fpga_bayer_nr[i] = frame_info.framestream.fpga_bayer_nr[i];
+        }
       }
       imu_data = frame_info.framestream.imu;
     }
@@ -119,35 +157,49 @@ int main(int argc, char *argv[]) {
       static WhiteBalance wb[4];
       const BayerConversion image13_bayer =
           SelectBayerConversion(hardware_version, software_version, 0);
+      sensor_msgs::ImagePtr *const color_msg[4] = {&msg0, &msg1, &msg2, &msg3};
+      cv::Mat color[4];
+      for (int i = 0; i < process_cameras && i < 4; ++i) {
+        *color_msg[i] =
+            color_pool[i].Acquire(profile.frame_height, profile.cam_width);
+        color[i] = WrapBgr8(*color_msg[i]);
+      }
+      cv::Mat &left_color = color[0], &right_color = color[1],
+              &left_front_color = color[2], &right_front_color = color[3];
       if (process_cameras <= 1) {
         // S1: C1-only color SKU. Unused FX3 lanes are not ISP'd or published.
         ApplyFastBalancedISPParallel({
             {left_image, left_color, wb[0], "fast-cam1", camera_gain[0],
-             image13_bayer},
+             image13_bayer, fpga_bayer_nr[0]},
         });
       } else if (process_cameras >= 4) {
         ApplyFastBalancedISPParallel({
             {left_image, left_color, wb[0], "fast-cam1", camera_gain[0],
-             image13_bayer},
-            {right_image, right_color, wb[1], "fast-cam2", camera_gain[1]},
+             image13_bayer, fpga_bayer_nr[0]},
+            {right_image, right_color, wb[1], "fast-cam2", camera_gain[1],
+             BayerConversion::kColorBayerRg2Bgr, fpga_bayer_nr[1]},
             {left_front_image, left_front_color, wb[2], "fast-cam3",
-             camera_gain[2], image13_bayer},
+             camera_gain[2], image13_bayer, fpga_bayer_nr[2]},
             {right_front_image, right_front_color, wb[3], "fast-cam4",
-             camera_gain[3]},
+             camera_gain[3], BayerConversion::kColorBayerRg2Bgr,
+             fpga_bayer_nr[3]},
         });
       } else {
         ApplyFastBalancedISPParallel({
             {left_image, left_color, wb[0], "fast-cam1", camera_gain[0],
-             image13_bayer},
-            {right_image, right_color, wb[1], "fast-cam2", camera_gain[1]},
+             image13_bayer, fpga_bayer_nr[0]},
+            {right_image, right_color, wb[1], "fast-cam2", camera_gain[1],
+             BayerConversion::kColorBayerRg2Bgr, fpga_bayer_nr[1]},
         });
       }
-      msg0 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", left_color).toImageMsg();
-      if (process_cameras >= 2)
-        msg1 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", right_color).toImageMsg();
+      for (int i = 0; i < process_cameras && i < 4; ++i) {
+        // The ISP keeps the wrapped buffer when size/type match; if it ever
+        // had to reallocate, publish a copy of what it produced instead.
+        if (color[i].data != (*color_msg[i])->data.data())
+          *color_msg[i] = cv_bridge::CvImage(std_msgs::Header(), "bgr8",
+                                             color[i]).toImageMsg();
+      }
       if (process_cameras >= 4) {
-        msg2 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", left_front_color).toImageMsg();
-        msg3 = cv_bridge::CvImage(std_msgs::Header(), "bgr8", right_front_color).toImageMsg();
         msg2->header.stamp = ros::Time(image_timestamp);
         msg3->header.stamp = ros::Time(image_timestamp);
       }

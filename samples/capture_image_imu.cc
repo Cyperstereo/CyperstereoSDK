@@ -197,7 +197,7 @@ static void LogCaptureDiagnostics(
     int count, int capture_log_every, int num_cameras, bool is_smartsens,
     double image_timestamp, const double exposure_time[4],
     const uint16_t exposure_lines[4], const double camera_gain[4],
-    const double camera_temperature[4],
+    const double digital_gain[4], const double camera_temperature[4],
     const cyperstereo::IMUStreamData &imu_data,
     const cyperstereo::GNSSStreamData &gnss_data,
     const cyperstereo::FrameInfo &frame_info, TicToc &frame_timer,
@@ -257,6 +257,7 @@ static void LogCaptureDiagnostics(
                     << exposure_lines[i] << " lines)"
                     << "  aec_gain=" << std::setprecision(2)
                     << camera_gain[i] << "x"
+                    << "  digital_gain=" << digital_gain[i] << "x"
                     << "  sensor_temp=" << camera_temperature[i] << "C\n";
       }
     }
@@ -376,10 +377,11 @@ static int run(int argc, char *argv[]) {
     else if (arg == "--output-bgr" || arg == "--output-bgr888")
       output_request = CaptureColorOutput::kBgr888;
   }
-  // Fast-balanced capture uses the processed full-range UYVY422 contract on
-  // every platform by default.  Keep --output-bgr as an explicit compatibility
-  // override; the quality-reference/HDR path remains BGR-only below.
-  constexpr bool kAutoUsesUyvy422 = true;
+  // Fast-balanced capture outputs BGR888 by default: only that path applies
+  // the display tone and digital exposure inside the ISP. --output-yuv422
+  // selects the full-range UYVY422 contract; the quality-reference/HDR path
+  // is BGR-only below.
+  constexpr bool kAutoUsesUyvy422 = false;
   // The quality-reference/HDR pipeline intentionally retains its existing
   // BGR888 contract. Never pass a CV_8UC2 destination to that API.
   const bool requested_uyvy422 =
@@ -512,6 +514,7 @@ static int run(int argc, char *argv[]) {
     double exposure_time[4]{};
     uint16_t exposure_lines[4]{};
     double camera_gain[4]{};
+    bool fpga_bayer_nr[4]{};
     double camera_temperature[4]{};
     uint32_t hardware_version = 0;
     uint32_t software_version = 0;
@@ -535,6 +538,7 @@ static int run(int argc, char *argv[]) {
           exposure_time[i] = frame_info.framestream.exposure_time[i];
           exposure_lines[i] = frame_info.framestream.exposure_lines[i];
           camera_gain[i] = frame_info.framestream.camera_gain[i];
+          fpga_bayer_nr[i] = frame_info.framestream.fpga_bayer_nr[i];
           camera_temperature[i] =
               frame_info.framestream.camera_temperature[i];
         }
@@ -563,21 +567,27 @@ static int run(int argc, char *argv[]) {
       if (process_cameras <= 1) {
         // S1: C1-only color SKU. Unused FX3 lanes are not ISP'd.
         isp.ApplyParallel({
-            {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
+            {left_image, left_color, "cam1", camera_gain[0], image13_bayer,
+             fpga_bayer_nr[0]},
         });
       } else if (process_cameras >= 4) {
         isp.ApplyParallel({
-            {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
-            {right_image, right_color, "cam2", camera_gain[1]},
+            {left_image, left_color, "cam1", camera_gain[0], image13_bayer,
+             fpga_bayer_nr[0]},
+            {right_image, right_color, "cam2", camera_gain[1],
+             BayerConversion::kColorBayerRg2Bgr, fpga_bayer_nr[1]},
             {left_front_image, left_front_color, "cam3", camera_gain[2],
-             image13_bayer},
-            {right_front_image, right_front_color, "cam4", camera_gain[3]},
+             image13_bayer, fpga_bayer_nr[2]},
+            {right_front_image, right_front_color, "cam4", camera_gain[3],
+             BayerConversion::kColorBayerRg2Bgr, fpga_bayer_nr[3]},
         });
       } else {
         // S2 exposes only the C1/C2 Bayer planes.
         isp.ApplyParallel({
-            {left_image, left_color, "cam1", camera_gain[0], image13_bayer},
-            {right_image, right_color, "cam2", camera_gain[1]},
+            {left_image, left_color, "cam1", camera_gain[0], image13_bayer,
+             fpga_bayer_nr[0]},
+            {right_image, right_color, "cam2", camera_gain[1],
+             BayerConversion::kColorBayerRg2Bgr, fpga_bayer_nr[1]},
         });
       }
       //std::cout << "proc(wb+cvt) " << proc.toc() << std::endl;
@@ -617,10 +627,13 @@ static int run(int argc, char *argv[]) {
       }
     }
 
+    double digital_gain[4];
+    for (int i = 0; i < 4; ++i) digital_gain[i] = isp.DigitalGain(i);
     LogCaptureDiagnostics(
         count, capture_log_every, process_cameras, is_smartsens, image_timestamp,
-        exposure_time, exposure_lines, camera_gain, camera_temperature,
-        imu_data, gnss_data, frame_info, t_frame, capture_log);
+        exposure_time, exposure_lines, camera_gain, digital_gain,
+        camera_temperature, imu_data, gnss_data, frame_info, t_frame,
+        capture_log);
     ++count;
   }
   stream.Stop();

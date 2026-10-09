@@ -47,6 +47,7 @@ struct ImageRecord {
   std::array<double, 4> camera_gain{};
   int process_cameras{0};
   std::vector<cv::Mat> images;
+  std::array<bool, 4> fpga_bayer_nr{};
 };
 std::queue<ImageRecord> IMAGE;
 struct GnssRecord {
@@ -72,6 +73,7 @@ void DataFlow();
 void InputIMAGE(const double timestamp, uint32_t hardware_version,
                 uint32_t software_version,
                 const std::array<double, 4> &camera_gain,
+                const std::array<bool, 4> &fpga_bayer_nr,
                 int process_cameras,
                 const std::vector<cv::Mat>& images);
 void InputIMU(const double timestamp, double gyro_x, double gyro_y, double gyro_z, double acc_x, double acc_y, double acc_z);
@@ -149,6 +151,7 @@ int main(int argc, char *argv[]) {
     uint32_t hardware_version = 0;
     uint32_t software_version = 0;
     std::array<double, 4> camera_gain{};
+    std::array<bool, 4> fpga_bayer_nr{};
     cyperstereo::IMUStreamData imu_data{};
     cyperstereo::GNSSStreamData gnss_data{};
 
@@ -165,8 +168,10 @@ int main(int argc, char *argv[]) {
         cv::swap(frame_info.framestream.right_front_image, right_front_image);
       }
       if (is_smartsens) {
-        for (int i = 0; i < process_cameras; ++i)
+        for (int i = 0; i < process_cameras; ++i) {
           camera_gain[i] = frame_info.framestream.camera_gain[i];
+          fpga_bayer_nr[i] = frame_info.framestream.fpga_bayer_nr[i];
+        }
       }
       imu_data = frame_info.framestream.imu;
       gnss_data = frame_info.framestream.gnss;
@@ -181,7 +186,8 @@ int main(int argc, char *argv[]) {
       images.push_back(right_front_image);
     }
     InputIMAGE(image_timestamp, hardware_version, software_version,
-               camera_gain, process_cameras, images);  // clones into the save queue
+               camera_gain, fpga_bayer_nr, process_cameras,
+               images);  // clones into the save queue
     for (int i = 0; i < imu_data.imu_count; ++i) {
       InputIMU(imu_data.imu_timestamp[i], imu_data.gyro_x[i], imu_data.gyro_y[i],
                imu_data.gyro_z[i], imu_data.acc_x[i], imu_data.acc_y[i],
@@ -231,12 +237,13 @@ void InputGNSS(const cyperstereo::GNSSStreamData &gnss) {
 void InputIMAGE(const double timestamp, uint32_t hardware_version,
                  uint32_t software_version,
                  const std::array<double, 4> &camera_gain,
+                 const std::array<bool, 4> &fpga_bayer_nr,
                  int process_cameras,
                  const std::vector<cv::Mat>& images) {
     m_buf.lock();
     ImageRecord record{
         timestamp, hardware_version, software_version, camera_gain,
-        process_cameras, {}};
+        process_cameras, {}, fpga_bayer_nr};
     record.images.reserve(images.size());
     for (const auto &img : images) {
       record.images.push_back(img.clone());
@@ -363,27 +370,34 @@ void DataFlow() {
               if (four_ok) {
                 ApplyFastBalancedISPParallel({
                     {left_image, left_color, fast_wb[0], "fast-cam1",
-                     record.camera_gain[0], image13_bayer},
+                     record.camera_gain[0], image13_bayer,
+                     record.fpga_bayer_nr[0]},
                     {right_image, right_color, fast_wb[1], "fast-cam2",
-                     record.camera_gain[1]},
+                     record.camera_gain[1], BayerConversion::kColorBayerRg2Bgr,
+                     record.fpga_bayer_nr[1]},
                     {left_front_image, left_front_color, fast_wb[2], "fast-cam3",
-                     record.camera_gain[2], image13_bayer},
+                     record.camera_gain[2], image13_bayer,
+                     record.fpga_bayer_nr[2]},
                     {right_front_image, right_front_color, fast_wb[3], "fast-cam4",
-                     record.camera_gain[3]},
+                     record.camera_gain[3], BayerConversion::kColorBayerRg2Bgr,
+                     record.fpga_bayer_nr[3]},
                 });
               } else if (two_ok) {
                 // S2: process and save only C1/C2.
                 ApplyFastBalancedISPParallel({
                     {left_image, left_color, fast_wb[0], "fast-cam1",
-                     record.camera_gain[0], image13_bayer},
+                     record.camera_gain[0], image13_bayer,
+                     record.fpga_bayer_nr[0]},
                     {right_image, right_color, fast_wb[1], "fast-cam2",
-                     record.camera_gain[1]},
+                     record.camera_gain[1], BayerConversion::kColorBayerRg2Bgr,
+                     record.fpga_bayer_nr[1]},
                 });
               } else {
                 // S1: process and save only C1.
                 ApplyFastBalancedISPParallel({
                     {left_image, left_color, fast_wb[0], "fast-cam1",
-                     record.camera_gain[0], image13_bayer},
+                     record.camera_gain[0], image13_bayer,
+                     record.fpga_bayer_nr[0]},
                 });
               }
             } else {

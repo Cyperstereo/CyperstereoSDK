@@ -123,6 +123,59 @@ CYPER_CHROMA_AVX2_TARGET static inline uint8_t Gauss5VScalar(const uint16_t *con
   return (uint8_t)((value + 128) >> 8);
 }
 
+// [1 2 1] variants for the lighter chroma NR (ChromaGauss3AreaBox7Avx2);
+// same equations and rounding as the NEON kernel.
+CYPER_CHROMA_AVX2_TARGET static inline void Gauss3HRow(const uint8_t *source, uint16_t *destination,
+                              int width) {
+  const auto at = [&](int x) {
+    return (int)source[Reflect101(x, width)];
+  };
+  destination[0] = (uint16_t)(at(-1) + 2 * at(0) + at(1));
+  int x = 1;
+  for (; x + 17 <= width; x += 16) {
+    const __m256i m1 = _mm256_cvtepu8_epi16(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + x - 1)));
+    const __m256i c0 = _mm256_cvtepu8_epi16(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + x)));
+    const __m256i p1 = _mm256_cvtepu8_epi16(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + x + 1)));
+    _mm256_storeu_si256(
+        reinterpret_cast<__m256i *>(destination + x),
+        _mm256_add_epi16(_mm256_add_epi16(m1, p1), _mm256_slli_epi16(c0, 1)));
+  }
+  for (; x < width; ++x)
+    destination[x] = (uint16_t)(at(x - 1) + 2 * at(x) + at(x + 1));
+}
+
+CYPER_CHROMA_AVX2_TARGET static inline void Gauss3VPair16(
+    const uint16_t *r0, const uint16_t *r1, const uint16_t *r2,
+    const uint16_t *r3, int x, __m128i &top, __m128i &bottom) {
+  const __m256i a0 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(r0 + x));
+  const __m256i a1 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(r1 + x));
+  const __m256i a2 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(r2 + x));
+  const __m256i a3 = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i *>(r3 + x));
+  const __m256i round = _mm256_set1_epi16(8);
+  top = Pack16U16ToU8(_mm256_srli_epi16(
+      _mm256_add_epi16(_mm256_add_epi16(_mm256_add_epi16(a0, a2),
+                                        _mm256_slli_epi16(a1, 1)),
+                       round),
+      4));
+  bottom = Pack16U16ToU8(_mm256_srli_epi16(
+      _mm256_add_epi16(_mm256_add_epi16(_mm256_add_epi16(a1, a3),
+                                        _mm256_slli_epi16(a2, 1)),
+                       round),
+      4));
+}
+
+CYPER_CHROMA_AVX2_TARGET static inline uint8_t Gauss3VScalar(const uint16_t *const rows[3], int x) {
+  const unsigned value = rows[0][x] + 2u * rows[1][x] + rows[2][x];
+  return (uint8_t)((value + 8) >> 4);
+}
+
 CYPER_CHROMA_AVX2_TARGET static inline void Down2x2Store8(__m128i top, __m128i bottom,
                                  uint8_t *destination) {
   const __m128i pair_ones = _mm_set1_epi16(0x0101);
@@ -225,7 +278,9 @@ CYPER_CHROMA_AVX2_TARGET static inline void EmitBox7Row(int output_y, int qheigh
   }
 }
 
-CYPER_CHROMA_AVX2_TARGET inline int ChromaGaussAreaBox7Avx2(
+// kGauss3 swaps the 5x5 Gaussian for [1 2 1] x [1 2 1] (lighter NR).
+template <bool kGauss3>
+CYPER_CHROMA_AVX2_TARGET inline int ChromaGaussAreaBox7Avx2T(
     const uint8_t *source_cr, uint64_t source_cr_step,
     const uint8_t *source_cb, uint64_t source_cb_step,
     uint8_t *gauss_cr, uint64_t gauss_cr_step,
@@ -257,19 +312,27 @@ CYPER_CHROMA_AVX2_TARGET inline int ChromaGaussAreaBox7Avx2(
   for (int quarter_y = 0; quarter_y < qheight; ++quarter_y) {
     const int y0 = 2 * quarter_y;
     const int y1 = y0 + 1;
-    const int through = y1 + 2 < height ? y1 + 2 : height - 1;
+    const int reach = kGauss3 ? 1 : 2;
+    const int through = y1 + reach < height ? y1 + reach : height - 1;
     for (; next_horizontal <= through; ++next_horizontal) {
-      Gauss5HRow(source_cr + (uint64_t)next_horizontal * source_cr_step,
-                 ghcr(next_horizontal), width);
-      Gauss5HRow(source_cb + (uint64_t)next_horizontal * source_cb_step,
-                 ghcb(next_horizontal), width);
+      if (kGauss3) {
+        Gauss3HRow(source_cr + (uint64_t)next_horizontal * source_cr_step,
+                   ghcr(next_horizontal), width);
+        Gauss3HRow(source_cb + (uint64_t)next_horizontal * source_cb_step,
+                   ghcb(next_horizontal), width);
+      } else {
+        Gauss5HRow(source_cr + (uint64_t)next_horizontal * source_cr_step,
+                   ghcr(next_horizontal), width);
+        Gauss5HRow(source_cb + (uint64_t)next_horizontal * source_cb_step,
+                   ghcb(next_horizontal), width);
+      }
     }
-    const uint16_t *cr_rows[6];
-    const uint16_t *cb_rows[6];
-    for (int k = -2; k <= 3; ++k) {
+    const uint16_t *cr_rows[6] = {};
+    const uint16_t *cb_rows[6] = {};
+    for (int k = -reach; k <= reach + 1; ++k) {
       const int row = Reflect101(y0 + k, height);
-      cr_rows[k + 2] = ghcr(row);
-      cb_rows[k + 2] = ghcb(row);
+      cr_rows[k + reach] = ghcr(row);
+      cb_rows[k + reach] = ghcb(row);
     }
     uint8_t *gcr0 = gauss_cr + (uint64_t)y0 * gauss_cr_step;
     uint8_t *gcr1 = gauss_cr + (uint64_t)y1 * gauss_cr_step;
@@ -279,14 +342,25 @@ CYPER_CHROMA_AVX2_TARGET inline int ChromaGaussAreaBox7Avx2(
     for (; x + 32 <= width; x += 32, xq += 16) {
       __m128i cr00, cr10, cr01, cr11;
       __m128i cb00, cb10, cb01, cb11;
-      Gauss5VPair16(cr_rows[0], cr_rows[1], cr_rows[2], cr_rows[3],
-                    cr_rows[4], cr_rows[5], x, cr00, cr10);
-      Gauss5VPair16(cr_rows[0], cr_rows[1], cr_rows[2], cr_rows[3],
-                    cr_rows[4], cr_rows[5], x + 16, cr01, cr11);
-      Gauss5VPair16(cb_rows[0], cb_rows[1], cb_rows[2], cb_rows[3],
-                    cb_rows[4], cb_rows[5], x, cb00, cb10);
-      Gauss5VPair16(cb_rows[0], cb_rows[1], cb_rows[2], cb_rows[3],
-                    cb_rows[4], cb_rows[5], x + 16, cb01, cb11);
+      if (kGauss3) {
+        Gauss3VPair16(cr_rows[0], cr_rows[1], cr_rows[2], cr_rows[3], x,
+                      cr00, cr10);
+        Gauss3VPair16(cr_rows[0], cr_rows[1], cr_rows[2], cr_rows[3],
+                      x + 16, cr01, cr11);
+        Gauss3VPair16(cb_rows[0], cb_rows[1], cb_rows[2], cb_rows[3], x,
+                      cb00, cb10);
+        Gauss3VPair16(cb_rows[0], cb_rows[1], cb_rows[2], cb_rows[3],
+                      x + 16, cb01, cb11);
+      } else {
+        Gauss5VPair16(cr_rows[0], cr_rows[1], cr_rows[2], cr_rows[3],
+                      cr_rows[4], cr_rows[5], x, cr00, cr10);
+        Gauss5VPair16(cr_rows[0], cr_rows[1], cr_rows[2], cr_rows[3],
+                      cr_rows[4], cr_rows[5], x + 16, cr01, cr11);
+        Gauss5VPair16(cb_rows[0], cb_rows[1], cb_rows[2], cb_rows[3],
+                      cb_rows[4], cb_rows[5], x, cb00, cb10);
+        Gauss5VPair16(cb_rows[0], cb_rows[1], cb_rows[2], cb_rows[3],
+                      cb_rows[4], cb_rows[5], x + 16, cb01, cb11);
+      }
       _mm_storeu_si128(reinterpret_cast<__m128i *>(gcr0 + x), cr00);
       _mm_storeu_si128(reinterpret_cast<__m128i *>(gcr0 + x + 16), cr01);
       _mm_storeu_si128(reinterpret_cast<__m128i *>(gcr1 + x), cr10);
@@ -308,15 +382,19 @@ CYPER_CHROMA_AVX2_TARGET inline int ChromaGaussAreaBox7Avx2(
                                       cb_rows[3], cb_rows[4]};
     const uint16_t *cb_bottom_rows[5] = {cb_rows[1], cb_rows[2], cb_rows[3],
                                          cb_rows[4], cb_rows[5]};
+    const auto vertical = [&](const uint16_t *const rows[5], int column) {
+      return kGauss3 ? Gauss3VScalar(rows, column)
+                     : Gauss5VScalar(rows, column);
+    };
     for (; x + 1 < width; x += 2, ++xq) {
-      const uint8_t cr00s = Gauss5VScalar(cr_top_rows, x);
-      const uint8_t cr01s = Gauss5VScalar(cr_top_rows, x + 1);
-      const uint8_t cr10s = Gauss5VScalar(cr_bottom_rows, x);
-      const uint8_t cr11s = Gauss5VScalar(cr_bottom_rows, x + 1);
-      const uint8_t cb00s = Gauss5VScalar(cb_top_rows, x);
-      const uint8_t cb01s = Gauss5VScalar(cb_top_rows, x + 1);
-      const uint8_t cb10s = Gauss5VScalar(cb_bottom_rows, x);
-      const uint8_t cb11s = Gauss5VScalar(cb_bottom_rows, x + 1);
+      const uint8_t cr00s = vertical(cr_top_rows, x);
+      const uint8_t cr01s = vertical(cr_top_rows, x + 1);
+      const uint8_t cr10s = vertical(cr_bottom_rows, x);
+      const uint8_t cr11s = vertical(cr_bottom_rows, x + 1);
+      const uint8_t cb00s = vertical(cb_top_rows, x);
+      const uint8_t cb01s = vertical(cb_top_rows, x + 1);
+      const uint8_t cb10s = vertical(cb_bottom_rows, x);
+      const uint8_t cb11s = vertical(cb_bottom_rows, x + 1);
       gcr0[x] = cr00s; gcr0[x + 1] = cr01s;
       gcr1[x] = cr10s; gcr1[x + 1] = cr11s;
       gcb0[x] = cb00s; gcb0[x + 1] = cb01s;
@@ -343,6 +421,34 @@ CYPER_CHROMA_AVX2_TARGET inline int ChromaGaussAreaBox7Avx2(
                 base_cr + (uint64_t)output_y * base_cr_step,
                 base_cb + (uint64_t)output_y * base_cb_step);
   return 0;
+}
+
+CYPER_CHROMA_AVX2_TARGET inline int ChromaGaussAreaBox7Avx2(
+    const uint8_t *source_cr, uint64_t source_cr_step,
+    const uint8_t *source_cb, uint64_t source_cb_step,
+    uint8_t *gauss_cr, uint64_t gauss_cr_step,
+    uint8_t *gauss_cb, uint64_t gauss_cb_step,
+    uint8_t *base_cr, uint64_t base_cr_step,
+    uint8_t *base_cb, uint64_t base_cb_step,
+    int width, int height, Scratch scratch) {
+  return ChromaGaussAreaBox7Avx2T<false>(
+      source_cr, source_cr_step, source_cb, source_cb_step, gauss_cr,
+      gauss_cr_step, gauss_cb, gauss_cb_step, base_cr, base_cr_step, base_cb,
+      base_cb_step, width, height, scratch);
+}
+
+CYPER_CHROMA_AVX2_TARGET inline int ChromaGauss3AreaBox7Avx2(
+    const uint8_t *source_cr, uint64_t source_cr_step,
+    const uint8_t *source_cb, uint64_t source_cb_step,
+    uint8_t *gauss_cr, uint64_t gauss_cr_step,
+    uint8_t *gauss_cb, uint64_t gauss_cb_step,
+    uint8_t *base_cr, uint64_t base_cr_step,
+    uint8_t *base_cb, uint64_t base_cb_step,
+    int width, int height, Scratch scratch) {
+  return ChromaGaussAreaBox7Avx2T<true>(
+      source_cr, source_cr_step, source_cb, source_cb_step, gauss_cr,
+      gauss_cr_step, gauss_cb, gauss_cb_step, base_cr, base_cr_step, base_cb,
+      base_cb_step, width, height, scratch);
 }
 
 }  // namespace cyper_chroma_x86_proto

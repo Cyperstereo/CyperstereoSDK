@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -611,6 +612,9 @@ struct FrameStreamData {
   double   exposure_time[4]{};           // seconds = exposure_lines * Tline
   double   camera_temperature[4]{};      // Celsius, from sensor reg {0x4c10,0x4c11}
   double   camera_gain[4]{};             // target real gain (x), code / 64
+  // True when the FPGA already ran the fast-ISP BayerNR on this plane's RAW.
+  // Pass it as raw_bayer_nr_done to the fast ISP so the filter is not doubled.
+  bool     fpga_bayer_nr[4]{};
 
   // Per-camera capture timestamp taken at the exposure MIDPOINT:
   //   image_midpoint_timestamp[i] = image_timestamp - exposure_time[i]/2.
@@ -907,66 +911,260 @@ inline double ToneEncode(double linear_val) {
   return 255.0 * ((1.0 - a) * t + a * s);
 }
 
-// Conservative tone used by the HDR quality path, expressed as a shared
-// luminance gain for the fast-balanced path.  Keeping one gain for B/G/R is
-// essential: applying the same nonlinear LUT to each channel independently
-// lifts the smaller green component of a dark red pixel much more than red
-// and rotates the hue toward orange.
+// Fast-path display tone. Default: the gamma-2.0 / 1.85x-cap curve.
+// CYPERSTEREO_FAST_TONE=filmic selects the filmic S-curve (deep toe, soft
+// shoulder) tuned against an iPhone 16 capture of the same ColorChecker
+// scene. CYPERSTEREO_FAST_TONE=legacy keeps the gamma curve and also disables
+// the digital exposure and highlight handling below (bit-exact old output).
+inline bool FastToneLegacy() {
+  static const bool legacy = [] {
+    const char *e = std::getenv("CYPERSTEREO_FAST_TONE");
+    return e != nullptr && std::strcmp(e, "legacy") == 0;
+  }();
+  return legacy;
+}
+
+inline bool FastToneFilmic() {
+  static const bool filmic = [] {
+    const char *e = std::getenv("CYPERSTEREO_FAST_TONE");
+    return e != nullptr && std::strcmp(e, "filmic") == 0;
+  }();
+  return filmic;
+}
+
+// Highlight handling, on unless CYPERSTEREO_FAST_HIGHLIGHT=off or the legacy
+// tone is selected (both restore the previous output bit-exactly):
+//  - R/B are clipped at green's ceiling in the WB LUT, so a saturated
+//    photosite stays neutral instead of turning magenta;
+//  - chroma fades to neutral as the local luma approaches the WB LUT's
+//    full-scale white, where the colour of what is left is wrong.
+inline bool FastHighlightEnabled() {
+  static const bool enabled = [] {
+    const char *e = std::getenv("CYPERSTEREO_FAST_HIGHLIGHT");
+    return !FastToneLegacy() &&
+           !(e != nullptr &&
+             (std::strcmp(e, "off") == 0 || std::strcmp(e, "0") == 0));
+  }();
+  return enabled;
+}
+
+// Strong chroma NR on flat saturated surfaces and none on sharp colour detail
+// (both keyed on the same local-vs-base test); CYPERSTEREO_FAST_FLAT_CHROMA=off
+// restores the previous output bit-exactly.
+inline bool FastFlatChromaEnabled() {
+  static const bool enabled = [] {
+    const char *e = std::getenv("CYPERSTEREO_FAST_FLAT_CHROMA");
+    return !(e != nullptr &&
+             (std::strcmp(e, "off") == 0 || std::strcmp(e, "0") == 0));
+  }();
+  return enabled;
+}
+
+// Tone used by the fast-balanced path, expressed as a shared luminance gain.
+// Keeping one gain for B/G/R is essential: applying the same nonlinear LUT
+// to each channel independently lifts the smaller green component of a dark
+// red pixel much more than red and rotates the hue toward orange.
 struct FastBalancedToneLuts {
+  // Gains are capped at 32767 (< 8x) so the AArch64 table below is exact.
+  // A pixel maps to (c * min(gain_q12[luma], clip_q12[max]) + 2048) >> 12.
   std::array<uint16_t, 256> gain_q12{};
   std::array<uint16_t, 256> clip_q12{};
   // AVX2 gathers operate on 32-bit elements. Keeping widened mirrors avoids
   // scalar lane gathers in the fused output kernel.
   std::array<int32_t, 256> gain_q12_i32{};
   std::array<int32_t, 256> clip_q12_i32{};
+  // Grey-axis curve T(y) = (y * min(gain, clip) + 2048) >> 12 as 32 linear
+  // segments for the approximate YCrCb-domain tone (CYPERSTEREO_FAST_TONE_YCC):
+  // T(8i + f) ~= (8 * base[i] + delta[i] * f) / 8. Usable only when that is
+  // within 1 DN of the table (true for the default curve, not for filmic).
+  // The shared chroma gain uses the same kind of segments, in Q7:
+  // gain_q12[y] (32 x 8) and the clip 255/max for max = 128 + 8i + f.
+  std::array<uint8_t, 32> y_tone_base{};
+  std::array<uint8_t, 32> y_tone_delta{};
+  std::array<uint8_t, 32> y_gain_base{};
+  std::array<int8_t, 32> y_gain_delta{};
+  std::array<uint8_t, 16> clip_base{};
+  std::array<uint8_t, 16> clip_delta{};
+  bool y_tone_segments_ok = false;
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
-  // AArch64 NEON has no vector gather. Collapse the two scalar LUT reads and
-  // min into one lookup indexed by [max_color:luma]. Each entry stores the
-  // signed Q15 multiplier for the gain above identity. gain==0 is encoded as
-  // -32768, so value + SQRDMULH(value, -32768) is exactly zero.
-  std::array<int16_t, 65536> gain_delta_q15{};
+  // AArch64 NEON has no vector gather. Collapse the two lookups and the min
+  // into one table indexed by [max_color:luma].
+  std::array<int16_t, 65536> gain_min_q12{};
 #endif
 };
+
+// Digital exposure for the BGR display path, folded into the WB LUT so the
+// whole ISP (NR averaging included) runs on the brightened signal. Applying
+// the same gain in the tone LUT instead exposes the 8-bit chroma
+// quantization of dark regions as colour blotches. Auto mode meters the WB
+// estimator's RAW samples: E = key / log-average luma, limited so at most
+// `clip` of samples reach full scale, clamped to [1, max], smoothed in log
+// space. The FPGA AE is exposure-priority (exposure, then analog gain), so
+// the auto upper limit opens only as the reported analog gain approaches
+// the FPGA's maximum: 1x below 90% of it, the full `max` at 100%, linear in
+// between so a gain hovering at the boundary cannot toggle the frame
+// brightness. The highlight limit is what usually binds indoors, so it, not
+// the key, sets how bright the frame gets. A bright monitor or lamp filling
+// a few percent of a dark room would hold E near 1x under a hard-clip
+// budget, so above `knee` the WB LUT rolls the exposed signal off to reach
+// 255 exactly at sensor full scale: nothing the gain lifts clips, and the
+// budget can be large (it bounds how hard the highlights are compressed).
+//   CYPERSTEREO_FAST_EXPOSURE            auto (default) | off | fixed 1..8
+//   CYPERSTEREO_FAST_EXPOSURE_KEY        log-average target in RAW DN, default 20
+//   CYPERSTEREO_FAST_EXPOSURE_MAX        auto upper limit, default 3
+//   CYPERSTEREO_FAST_EXPOSURE_KNEE       roll-off start in output DN, default
+//                                        128; 0 restores the hard clip
+//   CYPERSTEREO_FAST_EXPOSURE_CLIP       percent pushed past the linear
+//                                        range, default 10 (0.5 if KNEE=0)
+//   CYPERSTEREO_FAST_EXPOSURE_ANALOG_MAX FPGA GAIN_MAX_CODE / 64, default 12;
+//                                        0 disables the analog-gain gate
+struct FastExposureConfig {
+  bool enabled;
+  bool automatic;
+  double fixed;
+  double key;
+  double max;
+  double clip_percent;
+  double analog_max;
+  double knee;
+};
+
+inline const FastExposureConfig &GetFastExposureConfig() {
+  static const FastExposureConfig cfg = [] {
+    FastExposureConfig c{!FastToneLegacy(), true, 1.0, 20.0, 3.0, 10.0, 12.0,
+                         128.0};
+    if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE_KNEE")) {
+      const double v = std::atof(e);
+      if (v == 0.0 || (v >= 64.0 && v <= 224.0)) c.knee = v;
+      if (c.knee == 0.0) c.clip_percent = 0.5;
+    }
+    if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE")) {
+      if (std::strcmp(e, "off") == 0 || std::strcmp(e, "0") == 0) {
+        c.enabled = false;
+      } else if (std::strcmp(e, "auto") == 0) {
+        c.enabled = true;
+      } else {
+        const double v = std::atof(e);
+        if (v >= 1.0 && v <= 8.0) {
+          c.enabled = true;
+          c.automatic = false;
+          c.fixed = v;
+        }
+      }
+    }
+    if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE_KEY")) {
+      const double v = std::atof(e);
+      if (v >= 1.0 && v <= 120.0) c.key = v;
+    }
+    if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE_MAX")) {
+      const double v = std::atof(e);
+      if (v >= 1.0 && v <= 8.0) c.max = v;
+    }
+    if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE_CLIP")) {
+      const double v = std::atof(e);
+      if (v >= 0.1 && v <= 50.0) c.clip_percent = v;
+    }
+    if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE_ANALOG_MAX")) {
+      const double v = std::atof(e);
+      if (v == 0.0 || (v >= 1.0 && v <= 16.0)) c.analog_max = v;
+    }
+    return c;
+  }();
+  return cfg;
+}
+
+inline int FastLegacyToneOut(int y) {
+  constexpr double kLinearFullScale8 = 255.0 - kIspBlackLevel;  // 239
+  constexpr double kGamma = 2.00;
+  constexpr double kMaxGain = 1.85;
+  constexpr double kNoiseFloor8 = 4.0;
+  constexpr double kRampEnd8 = 24.0;
+  double n = y / kLinearFullScale8;
+  if (n > 1.0) n = 1.0;
+  double tone = n > 0.0 ? std::pow(n, 1.0 / kGamma) : 0.0;
+  if (n > 0.0) tone = (std::min)(tone, n * kMaxGain);
+  double ramp = (y - kNoiseFloor8) / (kRampEnd8 - kNoiseFloor8);
+  ramp = (std::max)(0.0, (std::min)(ramp, 1.0));
+  tone = n + ramp * (tone - n);
+  return (std::max)(0, (std::min)(255, static_cast<int>(tone * 255.0 + 0.5)));
+}
+
+// Narkowicz's ACES fit, white-normalized at kFilmicScale, then the sRGB
+// encode. kFilmicScale sets the shoulder strength; kBlackPoint8 is the
+// linear level mapped to black. Peak gain is ~3.6x (near y=8), mid grey
+// (18%, y=43) maps to 132.
+inline int FastFilmicToneOut(int y) {
+  constexpr double kLinearFullScale8 = 255.0 - kIspBlackLevel;  // 239
+  constexpr double kFilmicScale = 0.75;
+  constexpr double kBlackPoint8 = 4.0;
+  const auto filmic = [](double t) {
+    return t * (2.51 * t + 0.03) / (t * (2.43 * t + 0.59) + 0.14);
+  };
+  double n = (y - kBlackPoint8) / (kLinearFullScale8 - kBlackPoint8);
+  n = (std::max)(0.0, (std::min)(n, 1.0));
+  double d = filmic(kFilmicScale * n) / filmic(kFilmicScale);
+  d = (std::max)(0.0, (std::min)(d, 1.0));
+  const double v =
+      d <= 0.0031308 ? 12.92 * d : 1.055 * std::pow(d, 1.0 / 2.4) - 0.055;
+  return (std::max)(0, (std::min)(255, static_cast<int>(v * 255.0 + 0.5)));
+}
 
 inline const FastBalancedToneLuts &GetFastBalancedToneLuts() {
   static const FastBalancedToneLuts luts = [] {
     FastBalancedToneLuts v;
-    constexpr double kLinearFullScale8 = 255.0 - kIspBlackLevel;  // 239
-    // Moderate shadow/midtone lift; keep the noise-floor ramp and highlight
-    // limiter. Including 255/239 normalization, gain stays below 2x so the
-    // AArch64 signed-Q15 gain-above-identity table remains representable.
-    constexpr double kGamma = 2.00;
-    constexpr double kMaxGain = 1.85;
-    // Keep the deepest 0..4 DN linear; reveal detail earlier over 4..24 DN.
-    // HDR uses the same thresholds scaled by four (16..96).
-    constexpr double kNoiseFloor8 = 4.0;
-    constexpr double kRampEnd8 = 24.0;
+    const bool filmic = FastToneFilmic();
     for (int y = 0; y < 256; ++y) {
-      double n = y / kLinearFullScale8;
-      if (n > 1.0) n = 1.0;
-      double tone = n > 0.0 ? std::pow(n, 1.0 / kGamma) : 0.0;
-      if (n > 0.0) tone = (std::min)(tone, n * kMaxGain);
-      double ramp = (y - kNoiseFloor8) / (kRampEnd8 - kNoiseFloor8);
-      ramp = (std::max)(0.0, (std::min)(ramp, 1.0));
-      tone = n + ramp * (tone - n);
-      const int out_y = (std::max)(0, (std::min)(
-          255, static_cast<int>(tone * 255.0 + 0.5)));
+      const int out_y = filmic ? FastFilmicToneOut(y) : FastLegacyToneOut(y);
       v.gain_q12[y] = static_cast<uint16_t>(
-          y > 0 ? (out_y * 4096 + y / 2) / y : 0);
+          y > 0 ? (std::min)(32767, (out_y * 4096 + y / 2) / y) : 0);
       v.clip_q12[y] = static_cast<uint16_t>(
           y > 0 ? (std::min)(65535, (255 * 4096) / y) : 65535);
       v.gain_q12_i32[y] = v.gain_q12[y];
       v.clip_q12_i32[y] = v.clip_q12[y];
     }
+    {
+      int curve[257];
+      for (int y = 0; y < 256; ++y)
+        curve[y] = (y * (std::min)(v.gain_q12[y], v.clip_q12[y]) + 2048) >> 12;
+      curve[256] = (std::min)(255, 2 * curve[255] - curve[254]);
+      bool ok = true;
+      for (int i = 0; i < 32; ++i) {
+        const int delta = curve[8 * i + 8] - curve[8 * i];
+        ok = ok && delta >= 0 && delta <= 255;
+        v.y_tone_base[i] = static_cast<uint8_t>(curve[8 * i]);
+        v.y_tone_delta[i] = static_cast<uint8_t>(delta);
+      }
+      for (int y = 0; ok && y < 256; ++y) {
+        const int t = (8 * v.y_tone_base[y >> 3] +
+                       v.y_tone_delta[y >> 3] * (y & 7) + 4) >> 3;
+        ok = std::abs(t - curve[y]) <= 1;
+      }
+      const auto gain_q7 = [&](int y) {
+        return (std::min)(255, (v.gain_q12[(std::max)(1, (std::min)(y, 255))] +
+                                16) >> 5);
+      };
+      for (int i = 0; i < 32; ++i) {
+        const int delta = gain_q7(8 * i + 8) - gain_q7(8 * i);
+        ok = ok && delta >= -128 && delta <= 127;
+        v.y_gain_base[i] = static_cast<uint8_t>(gain_q7(8 * i));
+        v.y_gain_delta[i] = static_cast<int8_t>(delta);
+      }
+      const auto clip_q7 = [](int m) {
+        m = (std::min)(m, 255);
+        return (std::min)(255, (255 * 128 + m / 2) / m);
+      };
+      for (int i = 0; i < 16; ++i) {
+        v.clip_base[i] = static_cast<uint8_t>(clip_q7(128 + 8 * i));
+        v.clip_delta[i] = static_cast<uint8_t>(clip_q7(128 + 8 * i) -
+                                               clip_q7(136 + 8 * i));
+      }
+      v.y_tone_segments_ok = ok;
+    }
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
     for (int max_color = 0; max_color < 256; ++max_color) {
       for (int luma = 0; luma < 256; ++luma) {
-        const int gain = (std::min)(
-            static_cast<int>(v.gain_q12[luma]),
-            static_cast<int>(v.clip_q12[max_color]));
-        v.gain_delta_q15[(max_color << 8) | luma] =
-            gain == 0 ? static_cast<int16_t>(-32768)
-                      : static_cast<int16_t>((gain - 4096) << 3);
+        v.gain_min_q12[(max_color << 8) | luma] = static_cast<int16_t>(
+            (std::min)(v.gain_q12[luma], v.clip_q12[max_color]));
       }
     }
 #endif
@@ -1041,64 +1239,67 @@ inline void ApplyFastBalancedTone16(
 #endif
 
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
-// Constant-lane extraction lets AArch64 lower each lookup to UMOV + LDRH +
-// INS, without materialising the index/result vectors on the stack.
-inline int16x8_t FastToneGatherDelta8Neon(
-    const int16_t *table, const uint16x8_t index) {
-  int16x8_t result = vdupq_n_s16(table[vgetq_lane_u16(index, 0)]);
-  result = vsetq_lane_s16(table[vgetq_lane_u16(index, 1)], result, 1);
-  result = vsetq_lane_s16(table[vgetq_lane_u16(index, 2)], result, 2);
-  result = vsetq_lane_s16(table[vgetq_lane_u16(index, 3)], result, 3);
-  result = vsetq_lane_s16(table[vgetq_lane_u16(index, 4)], result, 4);
-  result = vsetq_lane_s16(table[vgetq_lane_u16(index, 5)], result, 5);
-  result = vsetq_lane_s16(table[vgetq_lane_u16(index, 6)], result, 6);
-  result = vsetq_lane_s16(table[vgetq_lane_u16(index, 7)], result, 7);
-  return result;
+// Four 16-bit [max:luma] indices travel in one general register. Splitting
+// and repacking them on the integer pipes keeps the lookup off the two
+// ASIMD pipes, which per-lane UMOV/INS would otherwise saturate
+// (A78AE: 3.96 -> 2.37 cycles/pixel for the whole tone step).
+inline uint64_t FastToneGather4(const int16_t *table, uint64_t index) {
+  const uint64_t d0 = static_cast<uint16_t>(table[index & 0xffff]);
+  const uint64_t d1 = static_cast<uint16_t>(table[(index >> 16) & 0xffff]);
+  const uint64_t d2 = static_cast<uint16_t>(table[(index >> 32) & 0xffff]);
+  const uint64_t d3 = static_cast<uint16_t>(table[index >> 48]);
+  return d0 | (d1 << 16) | (d2 << 32) | (d3 << 48);
 }
 
-// Exact AArch64 form of ApplyFastBalancedTonePixel. For every valid gain:
-//   round(value * gain / 4096)
-// = value + SQRDMULH(value, (gain - 4096) * 8).
+inline int16x8_t FastToneGather8Neon(
+    const int16_t *table, const uint16x8_t index) {
+  const uint64x2_t packed = vreinterpretq_u64_u16(index);
+  const uint64_t lo = FastToneGather4(table, vgetq_lane_u64(packed, 0));
+  const uint64_t hi = FastToneGather4(table, vgetq_lane_u64(packed, 1));
+  return vreinterpretq_s16_u64(
+      vcombine_u64(vcreate_u64(lo), vcreate_u64(hi)));
+}
+
+// SQRDMULH(value << 3, gain) for the low/high eight lanes, narrowed.
+inline uint8x16_t FastToneScale16Neon(const uint8x16_t value,
+                                      const int16x8_t gain_lo,
+                                      const int16x8_t gain_hi) {
+  const int16x8_t lo =
+      vreinterpretq_s16_u16(vshll_n_u8(vget_low_u8(value), 3));
+  const int16x8_t hi = vreinterpretq_s16_u16(vshll_high_n_u8(value, 3));
+  const int16x8_t out_lo = vqrdmulhq_s16(lo, gain_lo);
+  const int16x8_t out_hi = vqrdmulhq_s16(hi, gain_hi);
+  return vqmovn_high_u16(vqmovn_u16(vreinterpretq_u16_s16(out_lo)),
+                         vreinterpretq_u16_s16(out_hi));
+}
+
+// Exact AArch64 form of ApplyFastBalancedTonePixel. For value <= 255 and
+// gain <= 32767:
+//   SQRDMULH(8 * value, gain) = (16 * value * gain + 2^15) >> 16
+//                             = (value * gain + 2048) >> 12
+// and 2 * 2040 * 32767 < 2^31, so the doubling never saturates.
+// Luma is formed with 8-bit widening MACs: 29+150+77 = 256 keeps the sum
+// within 16 bits and RSHRN #8 is exactly (sum + 128) >> 8. Zipping luma
+// (low byte) with max (high byte) yields the [max:luma] index directly.
 inline void ApplyFastBalancedTone16Neon(
     uint8x16_t &blue, uint8x16_t &green, uint8x16_t &red,
     const FastBalancedToneLuts &luts) {
-  const uint16x8_t b_lo = vmovl_u8(vget_low_u8(blue));
-  const uint16x8_t b_hi = vmovl_u8(vget_high_u8(blue));
-  const uint16x8_t g_lo = vmovl_u8(vget_low_u8(green));
-  const uint16x8_t g_hi = vmovl_u8(vget_high_u8(green));
-  const uint16x8_t r_lo = vmovl_u8(vget_low_u8(red));
-  const uint16x8_t r_hi = vmovl_u8(vget_high_u8(red));
-
-  uint16x8_t y_lo = vmulq_n_u16(b_lo, 29);
-  uint16x8_t y_hi = vmulq_n_u16(b_hi, 29);
-  y_lo = vmlaq_n_u16(y_lo, g_lo, 150);
-  y_hi = vmlaq_n_u16(y_hi, g_hi, 150);
-  y_lo = vmlaq_n_u16(y_lo, r_lo, 77);
-  y_hi = vmlaq_n_u16(y_hi, r_hi, 77);
-  y_lo = vshrq_n_u16(vaddq_u16(y_lo, vdupq_n_u16(128)), 8);
-  y_hi = vshrq_n_u16(vaddq_u16(y_hi, vdupq_n_u16(128)), 8);
-  const uint16x8_t max_lo = vmaxq_u16(b_lo, vmaxq_u16(g_lo, r_lo));
-  const uint16x8_t max_hi = vmaxq_u16(b_hi, vmaxq_u16(g_hi, r_hi));
-  const uint16x8_t index_lo =
-      vorrq_u16(y_lo, vshlq_n_u16(max_lo, 8));
-  const uint16x8_t index_hi =
-      vorrq_u16(y_hi, vshlq_n_u16(max_hi, 8));
-  const int16_t *table = luts.gain_delta_q15.data();
-  const int16x8_t delta_lo = FastToneGatherDelta8Neon(table, index_lo);
-  const int16x8_t delta_hi = FastToneGatherDelta8Neon(table, index_hi);
-
-  const auto tone8 = [](const uint16x8_t value,
-                        const int16x8_t gain_delta) {
-    const int16x8_t value_s = vreinterpretq_s16_u16(value);
-    return vreinterpretq_u16_s16(
-        vaddq_s16(value_s, vqrdmulhq_s16(value_s, gain_delta)));
-  };
-  blue = vcombine_u8(vqmovn_u16(tone8(b_lo, delta_lo)),
-                     vqmovn_u16(tone8(b_hi, delta_hi)));
-  green = vcombine_u8(vqmovn_u16(tone8(g_lo, delta_lo)),
-                      vqmovn_u16(tone8(g_hi, delta_hi)));
-  red = vcombine_u8(vqmovn_u16(tone8(r_lo, delta_lo)),
-                    vqmovn_u16(tone8(r_hi, delta_hi)));
+  uint16x8_t y_lo = vmull_u8(vget_low_u8(blue), vdup_n_u8(29));
+  uint16x8_t y_hi = vmull_high_u8(blue, vdupq_n_u8(29));
+  y_lo = vmlal_u8(y_lo, vget_low_u8(green), vdup_n_u8(150));
+  y_hi = vmlal_high_u8(y_hi, green, vdupq_n_u8(150));
+  y_lo = vmlal_u8(y_lo, vget_low_u8(red), vdup_n_u8(77));
+  y_hi = vmlal_high_u8(y_hi, red, vdupq_n_u8(77));
+  const uint8x16_t luma = vrshrn_high_n_u16(vrshrn_n_u16(y_lo, 8), y_hi, 8);
+  const uint8x16_t max_color = vmaxq_u8(blue, vmaxq_u8(green, red));
+  const uint16x8_t index_lo = vreinterpretq_u16_u8(vzip1q_u8(luma, max_color));
+  const uint16x8_t index_hi = vreinterpretq_u16_u8(vzip2q_u8(luma, max_color));
+  const int16_t *table = luts.gain_min_q12.data();
+  const int16x8_t gain_lo = FastToneGather8Neon(table, index_lo);
+  const int16x8_t gain_hi = FastToneGather8Neon(table, index_hi);
+  blue = FastToneScale16Neon(blue, gain_lo, gain_hi);
+  green = FastToneScale16Neon(green, gain_lo, gain_hi);
+  red = FastToneScale16Neon(red, gain_lo, gain_hi);
 }
 #endif
 
@@ -1119,6 +1320,46 @@ inline bool FastEnvTruthy(const char *name) {
       (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
        std::strcmp(value, "TRUE") == 0 || std::strcmp(value, "on") == 0 ||
        std::strcmp(value, "ON") == 0);
+}
+
+// On unless the variable is 0/false/off, or the legacy tone (bit-exact old
+// output) is selected.
+inline bool FastEnvDefaultOn(const char *name) {
+  const char *value = std::getenv(name);
+  const bool off =
+      value &&
+      (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+       std::strcmp(value, "FALSE") == 0 || std::strcmp(value, "off") == 0 ||
+       std::strcmp(value, "OFF") == 0);
+  return !off && !FastToneLegacy();
+}
+
+// Lighter filter options, default on; =0 restores the previous output:
+//  CYPERSTEREO_FAST_LUMA_LITE   texture band-pass energy from the top two
+//                               rows of each 4x4 cell instead of all four;
+//  CYPERSTEREO_FAST_CHROMA_LITE half-res chroma NR with [1 2 1] x [1 2 1]
+//                               instead of the 5x5 Gaussian.
+inline bool FastLumaLiteEnabled() {
+  static const bool enabled = FastEnvDefaultOn("CYPERSTEREO_FAST_LUMA_LITE");
+  return enabled;
+}
+
+inline bool FastChromaLiteEnabled() {
+  static const bool enabled = FastEnvDefaultOn("CYPERSTEREO_FAST_CHROMA_LITE");
+  return enabled;
+}
+
+// Approximate, faster tone for the NEON and AVX2 output kernels (default on,
+// CYPERSTEREO_FAST_TONE_YCC=0 restores ApplyFastBalancedTonePixel exactly).
+// YCrCb->BGR is linear, so a shared B/G/R gain equals toning luma and scaling
+// chroma by the same gain. Luma goes through the segmented grey-axis curve
+// per pixel; chroma, already shared by each 2x2 block, is scaled once per
+// block by min(T(Y)/Y, 255/max) at the block's mean luma and estimated max
+// channel. Only block edges and colours near clipping differ from the
+// per-pixel tone. Both kernels evaluate identical integer equations.
+inline bool FastToneYccEnabled() {
+  static const bool enabled = FastEnvDefaultOn("CYPERSTEREO_FAST_TONE_YCC");
+  return enabled;
 }
 
 // Optional four-camera RK3588 big.LITTLE scheduler.  Each camera keeps its
@@ -1560,7 +1801,8 @@ inline bool FastBalancedFusedWbCopyEnabled() {
 }
 
 inline bool FastBalancedStreamedWbFrontEnabled() {
-#if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
+#if (defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)) || \
+    defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
   static const bool enabled = [] {
     return !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_STREAMED_WB_FRONT");
   }();
@@ -1574,14 +1816,23 @@ inline const char *FastBalancedDemosaicName() { return "ea"; }
 
 class WhiteBalance {
  public:
+  // Enables the display-path digital exposure for the following frames.
+  // The UYVY and quality paths keep the unscaled linear signal.
+  // `analog_gain` is the sensor's current analog gain from the metadata row.
+  void SetDisplayExposure(bool enabled, double analog_gain = 0.0) {
+    display_exposure_ = enabled;
+    analog_gain_ = analog_gain;
+  }
+  // Exposure applied by the current LUTs, quantized to Q7 (128 = 1x).
+  double DisplayExposure() const { return lut_exposure_q7_ / 128.0; }
+
   void Apply(
       cv::Mat &raw,
       BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr) {
     // Estimating on every 2nd frame halves the estimator cost; the gains
     // are EMA-smoothed (kSmooth=0.05, ~0.7s time constant) so the update
     // rate change is imperceptible.
-    if ((frame_idx_++ & 1) == 0 || b_gain_ <= 0.0)
-      EstimateGains(raw, bayer);
+    UpdateFrameStats(raw, bayer);
 
     double bg = b_gain_ > 0.0 ? b_gain_ : 1.0;
     double rg = r_gain_ > 0.0 ? r_gain_ : 1.0;
@@ -1621,8 +1872,7 @@ class WhiteBalance {
       BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr) {
     CV_Assert(raw.type() == CV_8UC1);
     CV_Assert(raw.data != dst.data);
-    if ((frame_idx_++ & 1) == 0 || b_gain_ <= 0.0)
-      EstimateGains(raw, bayer);
+    UpdateFrameStats(raw, bayer);
 
     const double bg = b_gain_ > 0.0 ? b_gain_ : 1.0;
     const double rg = r_gain_ > 0.0 ? r_gain_ : 1.0;
@@ -1647,10 +1897,6 @@ class WhiteBalance {
     for (int y = 0; y < raw.rows; ++y) {
       const uchar *src = raw.ptr<uchar>(y);
       uchar *out = dst.ptr<uchar>(y);
-      const uchar *even_col =
-          (y & 1) ? lut_g_ : (rggb ? lut_r_ : lut_b_);
-      const uchar *odd_col =
-          (y & 1) ? (rggb ? lut_b_ : lut_r_) : lut_g_;
       int x = 0;
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
       if (use_neon_lut) {
@@ -1666,7 +1912,19 @@ class WhiteBalance {
         }
       }
 #endif
+      LutRowTo(src, out, x, width, y, rggb);
+    }
+  }
+
+  // Bayer row `y` through its two channel LUTs, columns [x, width).
+  void LutRowTo(const uchar *src, uchar *out, int x, int width, int y,
+                bool rggb) const {
+    const uchar *even_col =
+        (y & 1) ? lut_g_ : (rggb ? lut_r_ : lut_b_);
+    const uchar *odd_col =
+        (y & 1) ? (rggb ? lut_b_ : lut_r_) : lut_g_;
 #if defined(__AVX2__) || defined(_M_AVX2)
+    {
       const int32_t *even_col_i32 =
           (y & 1) ? lut_g_i32_ : (rggb ? lut_r_i32_ : lut_b_i32_);
       const int32_t *odd_col_i32 =
@@ -1675,22 +1933,23 @@ class WhiteBalance {
       const __m256i black32 =
           _mm256_set1_epi32(static_cast<int>(kBlackLevel));
       const bool even_is_green = (y & 1) != 0;
+      const bool green_identity = lut_exposure_q7_ == 128;
       const auto apply_luts16 = [&](const __m256i samples16) {
         const __m256i even_indices =
             _mm256_and_si256(samples16, mask_u16);
         const __m256i odd_indices = _mm256_srli_epi32(samples16, 16);
-        // Half of a Bayer row is green and its LUT is exactly
-        // max(sample-black, 0). Evaluate that half arithmetically, leaving
-        // only the gain-bearing R/B half as a gather (two rather than four
-        // gathers per 32 pixels).
-        const __m256i even_values = even_is_green
+        // Half of a Bayer row is green and, without digital exposure, its
+        // LUT is exactly max(sample-black, 0). Evaluate that half
+        // arithmetically, leaving only the gain-bearing R/B half as a
+        // gather (two rather than four gathers per 32 pixels).
+        const __m256i even_values = even_is_green && green_identity
             ? _mm256_sub_epi32(_mm256_max_epi32(even_indices, black32),
                                black32)
             : _mm256_i32gather_epi32(even_col_i32, even_indices, 4);
-        const __m256i odd_values = even_is_green
-            ? _mm256_i32gather_epi32(odd_col_i32, odd_indices, 4)
-            : _mm256_sub_epi32(_mm256_max_epi32(odd_indices, black32),
-                               black32);
+        const __m256i odd_values = !even_is_green && green_identity
+            ? _mm256_sub_epi32(_mm256_max_epi32(odd_indices, black32),
+                               black32)
+            : _mm256_i32gather_epi32(odd_col_i32, odd_indices, 4);
         return _mm256_packus_epi32(
             _mm256_unpacklo_epi32(even_values, odd_values),
             _mm256_unpackhi_epi32(even_values, odd_values));
@@ -1706,13 +1965,13 @@ class WhiteBalance {
             _mm256_packus_epi16(values_lo, values_hi), 0xd8);
         _mm256_storeu_si256(reinterpret_cast<__m256i *>(out + x), packed);
       }
-#endif
-      for (; x + 1 < width; x += 2) {
-        out[x] = even_col[src[x]];
-        out[x + 1] = odd_col[src[x + 1]];
-      }
-      if (x < width) out[x] = even_col[src[x]];
     }
+#endif
+    for (; x + 1 < width; x += 2) {
+      out[x] = even_col[src[x]];
+      out[x + 1] = odd_col[src[x + 1]];
+    }
+    if (x < width) out[x] = even_col[src[x]];
   }
 
   // Gain-adaptive Bayer same-colour NR fused with the BLC/AWB LUT write.
@@ -1818,22 +2077,23 @@ class WhiteBalance {
       };
       // Each dword contains one consecutive [even, odd] u16 Bayer pair.
       // Split the pair before lookup so each index visits only its own CFA
-      // LUT: green is exactly max(sample-black, 0), so evaluate that half in
-      // lanes and gather only the gain-bearing R/B half. This reduces the
-      // mapping to two gathers per 32 pixels. The pack order restores
-      // e0,o0,... exactly.
+      // LUT: without digital exposure green is exactly max(sample-black, 0),
+      // so evaluate that half in lanes and gather only the gain-bearing R/B
+      // half. This reduces the mapping to two gathers per 32 pixels. The
+      // pack order restores e0,o0,... exactly.
+      const bool green_identity = lut_exposure_q7_ == 128;
       const auto apply_luts16 = [&](const __m256i filtered16) {
         const __m256i even_indices =
             _mm256_and_si256(filtered16, mask_u16);
         const __m256i odd_indices = _mm256_srli_epi32(filtered16, 16);
-        const __m256i even_values = even_is_green
+        const __m256i even_values = even_is_green && green_identity
             ? _mm256_sub_epi32(
                   _mm256_max_epi32(even_indices, black32), black32)
             : _mm256_i32gather_epi32(even_col_i32, even_indices, 4);
-        const __m256i odd_values = even_is_green
-            ? _mm256_i32gather_epi32(odd_col_i32, odd_indices, 4)
-            : _mm256_sub_epi32(
-                  _mm256_max_epi32(odd_indices, black32), black32);
+        const __m256i odd_values = !even_is_green && green_identity
+            ? _mm256_sub_epi32(
+                  _mm256_max_epi32(odd_indices, black32), black32)
+            : _mm256_i32gather_epi32(odd_col_i32, odd_indices, 4);
         return _mm256_packus_epi32(
             _mm256_unpacklo_epi32(even_values, odd_values),
             _mm256_unpackhi_epi32(even_values, odd_values));
@@ -1963,6 +2223,13 @@ class WhiteBalance {
       double sensor_gain, bool use_bayer_nr,
       BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr);
 #endif
+#if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
+  // WB rows live only in an eight-row ring and feed the fused AVX2 EA/front
+  // immediately; bit-exact with ApplyTo() + FusedDemosaicFrontAvx2().
+  void ApplyStreamedDemosaicFrontAvx2(
+      const cv::Mat &raw, cv::Mat &y8, cv::Mat &cr_h, cv::Mat &cb_h,
+      BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr);
+#endif
 
  private:
   // Robust gray-world: MEAN-based gray-world forces the frame AVERAGE to
@@ -2026,16 +2293,81 @@ class WhiteBalance {
     }
   }
 
+  // RAW luma histogram over the white-balance sample grid.
+  void MeterExposure(const cv::Mat &raw, BayerConversion bayer) {
+    const bool rggb = bayer == BayerConversion::kColorBayerBg2Bgr;
+    int n_total = 0;
+    uint32_t hist[kMeterBins] = {};
+    for (int y = 0; y + 1 < raw.rows; y += kEstStep) {
+      const uchar *r0 = raw.ptr<uchar>(y);
+      const uchar *r1 = raw.ptr<uchar>(y + 1);
+      for (int x = 0; x + 1 < raw.cols; x += kEstStep) {
+        const int b = rggb ? r1[x + 1] : r0[x];
+        const int r = rggb ? r0[x] : r1[x + 1];
+        const int meter = ((b + r0[x + 1] + r1[x] + r + 2) >> 2) -
+                          static_cast<int>(kBlackLevel);
+        ++hist[(std::max)(0, (std::min)(meter, kMeterBins - 1))];
+        ++n_total;
+      }
+    }
+    UpdateExposure(hist, n_total);
+  }
+
+  void UpdateExposure(const uint32_t *hist, int n_total) {
+    const FastExposureConfig &cfg = GetFastExposureConfig();
+    if (!cfg.automatic) {
+      exposure_ = cfg.fixed;
+      return;
+    }
+    if (n_total <= 0) return;
+    double log_sum = 0.0;
+    for (int i = 2; i < kMeterBins; ++i)
+      if (hist[i]) log_sum += hist[i] * std::log(static_cast<double>(i));
+    double target = std::log(cfg.key) - log_sum / n_total;
+    const uint32_t allowed =
+        static_cast<uint32_t>(n_total * cfg.clip_percent / 100.0);
+    // Samples already at full scale in RAW (a window, a lamp) are clipped at
+    // any exposure; counting them would spend the whole budget and pin E at
+    // 1x, so only samples the gain would newly push to full scale count.
+    uint32_t above = 0;
+    for (int i = kMeterBins - 2; i > 0; --i) {
+      above += hist[i];
+      if (above > allowed) {
+        target = (std::min)(target, std::log((kMeterBins - 1.0) / i));
+        break;
+      }
+    }
+    double limit = cfg.max;
+    if (cfg.analog_max > 0.0) {
+      const double t = (analog_gain_ / cfg.analog_max - 0.9) / 0.1;
+      limit = 1.0 + (cfg.max - 1.0) * (std::max)(0.0, (std::min)(t, 1.0));
+    }
+    target = (std::max)(0.0, (std::min)(target, std::log(limit)));
+    exposure_log_ = exposure_init_
+        ? exposure_log_ + kExposureSmooth * (target - exposure_log_)
+        : target;
+    exposure_init_ = true;
+    exposure_ = std::exp(exposure_log_);
+  }
+
   struct BayerNrParams {
     int threshold_base;
     int threshold_signal_q8;
     int strength_q8;
   };
 
-  void PrepareLutsForFrame(const cv::Mat &raw, BayerConversion bayer) {
-    // Keep the original state transition exactly once per camera frame.
+  // White balance is estimated on every 2nd frame (see Apply); the digital
+  // exposure is metered on every frame so it follows the AE without lag.
+  void UpdateFrameStats(const cv::Mat &raw, BayerConversion bayer) {
     if ((frame_idx_++ & 1) == 0 || b_gain_ <= 0.0)
       EstimateGains(raw, bayer);
+    if (display_exposure_ && GetFastExposureConfig().enabled)
+      MeterExposure(raw, bayer);
+  }
+
+  void PrepareLutsForFrame(const cv::Mat &raw, BayerConversion bayer) {
+    // Keep the original state transition exactly once per camera frame.
+    UpdateFrameStats(raw, bayer);
     const double bg = b_gain_ > 0.0 ? b_gain_ : 1.0;
     const double rg = r_gain_ > 0.0 ? r_gain_ : 1.0;
     BuildLuts(bg, rg);
@@ -2057,19 +2389,61 @@ class WhiteBalance {
     return out;
   }
 
+  // Green LUT entry for signal s = max(raw - black, 0). The SIMD fronts
+  // evaluate green arithmetically instead of through the table, so it is an
+  // integer formula (identity at e_q7 == 128).
+  static int ExposeGreen(int s, int e_q7) {
+    return (std::min)(255, (s * e_q7 + 64) >> 7);
+  }
+
   void BuildLuts(double bg, double rg) {
-    if (built_ && bg == lut_bg_ && rg == lut_rg_) return;
+    const int e_q7 = display_exposure_
+        ? (std::max)(128, (std::min)(1024, static_cast<int>(
+              std::lround(exposure_ * 128.0))))
+        : 128;
+    if (built_ && bg == lut_bg_ && rg == lut_rg_ && e_q7 == lut_exposure_q7_)
+      return;
     built_ = true;
     lut_bg_ = bg;
     lut_rg_ = rg;
-    // The WB LUT stays LINEAR (pedestal subtraction + WB gain only): the
-    // canonical pipeline needs linear data for demosaic and the CCM, so
-    // the encode/tone curve now runs post-CCM in ApplyCcmTone(). (The NEON
-    // TBL path reads these same tables.)
+    lut_exposure_q7_ = e_q7;
+    const double e = e_q7 / 128.0;
+    // Green reaches only (255 - black) * E at sensor full scale while R/B
+    // with WB gains above 1 would still reach 255.
+    const int white = FastHighlightEnabled()
+        ? ExposeGreen(255 - static_cast<int>(kBlackLevel), e_q7)
+        : 255;
+    // Highlight roll-off: identity up to the knee, then the rational curve
+    //   y = k + (255 - k) * s t / (1 + (s - 1) t),  t = (x - k) / (xm - k)
+    // with s = (xm - k) / (255 - k), which leaves the knee with slope 1 and
+    // maps green's sensor full scale xm to 255. R/B past xm are clipped
+    // there, as `white` does without the roll-off.
+    const double knee = GetFastExposureConfig().knee;
+    const double xm = (255.0 - kBlackLevel) * e;
+    const bool roll_off = knee > 0.0 && xm > 255.0;
+    const double roll_s = roll_off ? (xm - knee) / (255.0 - knee) : 1.0;
+    const auto roll = [&](double x, int linear) {
+      if (!roll_off || x <= knee) return linear;
+      const double t = (std::min)(1.0, (x - knee) / (xm - knee));
+      return static_cast<int>(
+          knee + (255.0 - knee) * t * roll_s / (1.0 + (roll_s - 1.0) * t) +
+          0.5);
+    };
+    green_table_ = roll_off;
+    // The WB LUT stays LINEAR (pedestal subtraction + WB gain + digital
+    // exposure only): the canonical pipeline needs linear data for demosaic
+    // and the CCM, so the encode/tone curve now runs post-CCM in
+    // ApplyCcmTone(). (The NEON TBL path reads these same tables.)
     for (int i = 0; i < 256; ++i) {
-      lut_b_[i] = cv::saturate_cast<uchar>((i - kBlackLevel) * bg);
-      lut_g_[i] = cv::saturate_cast<uchar>((i - kBlackLevel) * 1.0);
-      lut_r_[i] = cv::saturate_cast<uchar>((i - kBlackLevel) * rg);
+      const double signal = i - kBlackLevel;
+      lut_b_[i] = static_cast<uchar>(roll(signal * bg * e, (std::min)(
+          white, static_cast<int>(
+                     cv::saturate_cast<uchar>(signal * bg * e)))));
+      lut_g_[i] = static_cast<uchar>(roll(signal * e, ExposeGreen(
+          (std::max)(0, i - static_cast<int>(kBlackLevel)), e_q7)));
+      lut_r_[i] = static_cast<uchar>(roll(signal * rg * e, (std::min)(
+          white, static_cast<int>(
+                     cv::saturate_cast<uchar>(signal * rg * e)))));
       lut_b_i32_[i] = lut_b_[i];
       lut_g_i32_[i] = lut_g_[i];
       lut_r_i32_[i] = lut_r_[i];
@@ -2097,7 +2471,10 @@ class WhiteBalance {
       t2 = vld1q_u8_x4(lut + 128);
       t3 = vld1q_u8_x4(lut + 192);
     }
-    inline uint8x16_t Apply(uint8x16_t idx) const {
+    // Four instantiations of the row kernel exceed GCC's inline budget; an
+    // out-of-line call here reloads all 16 table registers per vector.
+    __attribute__((always_inline)) inline uint8x16_t Apply(
+        uint8x16_t idx) const {
       uint8x16_t r = vqtbl4q_u8(t0, idx);
       r = vqtbx4q_u8(r, t1, vsubq_u8(idx, vdupq_n_u8(64)));
       r = vqtbx4q_u8(r, t2, vsubq_u8(idx, vdupq_n_u8(128)));
@@ -2113,6 +2490,14 @@ class WhiteBalance {
     BayerNrParams nr;
     NeonLut256 neon_b;
     NeonLut256 neon_r;
+    // ExposeGreen() in lanes. Signals at or above green_clamp already map
+    // to 255, and clamping them keeps s * green_q7 within u16.
+    uint16_t green_q7;
+    uint8_t green_clamp;
+    // The highlight roll-off is not a multiply: green goes through its
+    // table too (loaded only then).
+    bool green_table;
+    NeonLut256 neon_g;
   };
 
   void InitNeonWbRowPlan(bool rggb, bool use_bayer_nr,
@@ -2122,9 +2507,14 @@ class WhiteBalance {
     plan.use_bayer_nr = use_bayer_nr;
     plan.use_neon_lut = UseNeonWbLut();
     plan.nr = nr;
+    plan.green_q7 = static_cast<uint16_t>(lut_exposure_q7_);
+    plan.green_clamp = static_cast<uint8_t>((std::min)(
+        255, (32576 + lut_exposure_q7_ - 1) / lut_exposure_q7_));
+    plan.green_table = green_table_;
     if (plan.use_neon_lut) {
       plan.neon_b.Load(lut_b_);
       plan.neon_r.Load(lut_r_);
+      if (plan.green_table) plan.neon_g.Load(lut_g_);
     }
   }
 
@@ -2132,10 +2522,117 @@ class WhiteBalance {
   // ring.  The template flag is resolved at compile time: both forms execute
   // the same BayerNR and LUT operations, but planar output stores the two CFA
   // phases directly instead of zipping them only for EA to LD2 them again.
-  template <bool kPlanar>
-  void ApplyPreparedRowNeonImpl(const cv::Mat &raw, int y,
-                                uchar *dst_even, uchar *dst_odd,
-                                const NeonWbRowPlan &plan) const {
+  static bool UseNeonWbAsm() {
+    static const bool enabled =
+        !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_WB_ASM");
+    return enabled;
+  }
+
+  // Unfiltered planar rows with the 256-entry LUT resident in v16-v31.
+  // Through the row lambdas GCC reloads all sixteen table registers for
+  // every 32 pixels; here a table is loaded once per row. kGreen 0 maps
+  // green in the same pass; kGreen 2 runs a second pass with the green
+  // table. Same TBL/TBX sequence as NeonLut256::Apply: byte-identical.
+#define CYPERSTEREO_WB_LUT_TABLES                                        \
+  "ld1 {v16.16b, v17.16b, v18.16b, v19.16b}, [%[lut]], #64\n\t"          \
+  "ld1 {v20.16b, v21.16b, v22.16b, v23.16b}, [%[lut]], #64\n\t"          \
+  "ld1 {v24.16b, v25.16b, v26.16b, v27.16b}, [%[lut]], #64\n\t"          \
+  "ld1 {v28.16b, v29.16b, v30.16b, v31.16b}, [%[lut]]\n\t"               \
+  "movi v4.16b, #64\n\t"
+#define CYPERSTEREO_WB_LUT_APPLY(V)                                      \
+  "tbl v2.16b, {v16.16b, v17.16b, v18.16b, v19.16b}, " V ".16b\n\t"      \
+  "sub v3.16b, " V ".16b, v4.16b\n\t"                                    \
+  "tbx v2.16b, {v20.16b, v21.16b, v22.16b, v23.16b}, v3.16b\n\t"         \
+  "sub v3.16b, v3.16b, v4.16b\n\t"                                       \
+  "tbx v2.16b, {v24.16b, v25.16b, v26.16b, v27.16b}, v3.16b\n\t"         \
+  "sub v3.16b, v3.16b, v4.16b\n\t"                                       \
+  "tbx v2.16b, {v28.16b, v29.16b, v30.16b, v31.16b}, v3.16b\n\t"
+#define CYPERSTEREO_WB_CLOBBERS                                          \
+  "v0", "v1", "v2", "v3", "v4", "v5", "v16", "v17", "v18", "v19", "v20",  \
+      "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29",      \
+      "v30", "v31", "cc", "memory"
+// Colour through the table, green = sat(raw - black), one pass.
+#define CYPERSTEREO_WB_PASS_IDENTITY(C, G, GQ)                           \
+  __asm__ volatile(                                                      \
+      CYPERSTEREO_WB_LUT_TABLES                                          \
+      "dup v5.16b, %w[black]\n\t"                                        \
+      "1:\n\t"                                                           \
+      "ld2 {v0.16b, v1.16b}, [%[src]], #32\n\t"                          \
+      CYPERSTEREO_WB_LUT_APPLY(C)                                        \
+      "uqsub " G ".16b, " G ".16b, v5.16b\n\t"                           \
+      "str q2, [%[dst_a]], #16\n\t"                                      \
+      "str " GQ ", [%[dst_b]], #16\n\t"                                  \
+      "subs %[n], %[n], #1\n\t"                                          \
+      "b.ne 1b\n\t"                                                      \
+      : [src] "+r"(s), [n] "+r"(n), [dst_a] "+r"(da), [dst_b] "+r"(db),  \
+        [lut] "+r"(lut)                                                  \
+      : [black] "r"(black)                                               \
+      : CYPERSTEREO_WB_CLOBBERS)
+// One CFA phase through the resident table.
+#define CYPERSTEREO_WB_PASS_TABLE(V)                                     \
+  __asm__ volatile(                                                      \
+      CYPERSTEREO_WB_LUT_TABLES                                          \
+      "1:\n\t"                                                           \
+      "ld2 {v0.16b, v1.16b}, [%[src]], #32\n\t"                          \
+      CYPERSTEREO_WB_LUT_APPLY(V)                                        \
+      "str q2, [%[dst_a]], #16\n\t"                                      \
+      "subs %[n], %[n], #1\n\t"                                          \
+      "b.ne 1b\n\t"                                                      \
+      : [src] "+r"(s), [n] "+r"(n), [dst_a] "+r"(da), [lut] "+r"(lut)    \
+      :                                                                  \
+      : CYPERSTEREO_WB_CLOBBERS)
+  static __attribute__((noinline)) void WbPlanarRowAsm(
+      const uchar *src, int64_t blocks, uchar *dst_color, uchar *dst_green,
+      const uint8_t *color_lut, const uint8_t *green_lut, bool color_odd) {
+    const uint32_t black = static_cast<uint32_t>(kBlackLevel);
+    if (!green_lut) {
+      const uchar *s = src;
+      int64_t n = blocks;
+      uchar *da = dst_color, *db = dst_green;
+      const uint8_t *lut = color_lut;
+      if (color_odd)
+        CYPERSTEREO_WB_PASS_IDENTITY("v1", "v0", "q0");
+      else
+        CYPERSTEREO_WB_PASS_IDENTITY("v0", "v1", "q1");
+      return;
+    }
+    {
+      const uchar *s = src;
+      int64_t n = blocks;
+      uchar *da = dst_color;
+      const uint8_t *lut = color_lut;
+      if (color_odd)
+        CYPERSTEREO_WB_PASS_TABLE("v1");
+      else
+        CYPERSTEREO_WB_PASS_TABLE("v0");
+    }
+    {
+      const uchar *s = src;
+      int64_t n = blocks;
+      uchar *da = dst_green;
+      const uint8_t *lut = green_lut;
+      if (color_odd)
+        CYPERSTEREO_WB_PASS_TABLE("v0");
+      else
+        CYPERSTEREO_WB_PASS_TABLE("v1");
+    }
+  }
+#undef CYPERSTEREO_WB_PASS_TABLE
+#undef CYPERSTEREO_WB_PASS_IDENTITY
+#undef CYPERSTEREO_WB_CLOBBERS
+#undef CYPERSTEREO_WB_LUT_APPLY
+#undef CYPERSTEREO_WB_LUT_TABLES
+
+  // Kept out of line: GCC otherwise partially inlines it into the streamed
+  // front, which runs slower (A78AE front 2.07 -> 2.14 ms). The unfiltered
+  // row lambdas are force-inlined: out of line in the exposed-green form,
+  // every byte store forces a reload of all loop state through the closure.
+  // Inlining the BayerNR lambdas as well slows the unfiltered path.
+  // kGreen: 0 identity, 1 ExposeGreen() multiply, 2 green table.
+  template <bool kPlanar, int kGreen>
+  __attribute__((noinline)) void ApplyPreparedRowNeonImpl(
+      const cv::Mat &raw, int y, uchar *dst_even, uchar *dst_odd,
+      const NeonWbRowPlan &plan) const {
     const int width = raw.cols;
     const int height = raw.rows;
     const uchar *src = raw.ptr<uchar>(y);
@@ -2144,11 +2641,25 @@ class WhiteBalance {
     const uchar *odd_col =
         (y & 1) ? (plan.rggb ? lut_b_ : lut_r_) : lut_g_;
     const bool even_is_green = (y & 1) != 0;
+    const bool use_neon_lut = plan.use_neon_lut;
     const NeonLut256 &color_neon =
         (y & 1) ? (plan.rggb ? plan.neon_b : plan.neon_r)
                 : (plan.rggb ? plan.neon_r : plan.neon_b);
     const uint8x16_t black8 =
         vdupq_n_u8(static_cast<unsigned char>(kBlackLevel));
+    const uint16x8_t green_q7 = vdupq_n_u16(plan.green_q7);
+    const uint8x16_t green_clamp8 = vdupq_n_u8(plan.green_clamp);
+    const auto map_green = [&](uint8x16_t values)
+        __attribute__((always_inline)) {
+      if (kGreen == 2) return plan.neon_g.Apply(values);
+      const uint8x16_t signal = vqsubq_u8(values, black8);
+      if (kGreen == 0) return signal;
+      const uint8x16_t clamped = vminq_u8(signal, green_clamp8);
+      const uint16x8_t lo =
+          vmulq_u16(vmovl_u8(vget_low_u8(clamped)), green_q7);
+      const uint16x8_t hi = vmulq_u16(vmovl_high_u8(clamped), green_q7);
+      return vqrshrn_high_n_u16(vqrshrn_n_u16(lo, 7), hi, 7);
+    };
     const auto store_scalar = [&](int x, uchar value) {
       if (kPlanar)
         (x & 1 ? dst_odd : dst_even)[x >> 1] = value;
@@ -2156,7 +2667,8 @@ class WhiteBalance {
         dst_even[x] = value;
     };
     const auto store_vector = [&](int x, uint8x16_t even_values,
-                                  uint8x16_t odd_values) {
+                                  uint8x16_t odd_values)
+        __attribute__((always_inline)) {
       if (kPlanar) {
         vst1q_u8(dst_even + (x >> 1), even_values);
         vst1q_u8(dst_odd + (x >> 1), odd_values);
@@ -2166,17 +2678,32 @@ class WhiteBalance {
                  vzip2q_u8(even_values, odd_values));
       }
     };
-    const auto map_unfiltered = [&](int begin, int end) {
+    const auto map_unfiltered = [&](int begin, int end)
+        __attribute__((always_inline)) {
       int x = begin;
-      if (plan.use_neon_lut && (begin & 1) == 0) {
+      if (use_neon_lut && (begin & 1) == 0) {
+        if (kPlanar && kGreen != 1 && UseNeonWbAsm()) {
+          const int64_t blocks = (end - x) >> 5;
+          if (blocks > 0) {
+            const bool color_odd = even_is_green;
+            WbPlanarRowAsm(
+                src + x, blocks, (color_odd ? dst_odd : dst_even) + (x >> 1),
+                (color_odd ? dst_even : dst_odd) + (x >> 1),
+                reinterpret_cast<const uint8_t *>(&color_neon),
+                kGreen == 2 ? reinterpret_cast<const uint8_t *>(&plan.neon_g)
+                            : nullptr,
+                color_odd);
+            x += static_cast<int>(blocks << 5);
+          }
+        }
         for (; x + 32 <= end; x += 32) {
           uint8x16x2_t values = vld2q_u8(src + x);
           values.val[0] = even_is_green
-              ? vqsubq_u8(values.val[0], black8)
+              ? map_green(values.val[0])
               : color_neon.Apply(values.val[0]);
           values.val[1] = even_is_green
               ? color_neon.Apply(values.val[1])
-              : vqsubq_u8(values.val[1], black8);
+              : map_green(values.val[1]);
           if (kPlanar)
             store_vector(x, values.val[0], values.val[1]);
           else
@@ -2196,9 +2723,10 @@ class WhiteBalance {
     const uchar *down = raw.ptr<uchar>(y + 2);
     map_unfiltered(0, (std::min)(2, width));
     int x = 2;
-    if (plan.use_neon_lut) {
+    if (use_neon_lut) {
       const uint8x16_t threshold_base8 = vdupq_n_u8(
           static_cast<unsigned char>(plan.nr.threshold_base));
+      const bool two_threshold_steps = plan.nr.threshold_signal_q8 == 2;
       const uint16x8_t round4_u16 = vdupq_n_u16(4);
       const int16x8_t strength_s16 =
           vdupq_n_s16(static_cast<short>(plan.nr.strength_q8));
@@ -2211,7 +2739,7 @@ class WhiteBalance {
         const uint8x16_t center = vld1q_u8(src + offset);
         const uint8x16_t signal = vqsubq_u8(center, black8);
         uint8x16_t threshold_extra;
-        if (plan.nr.threshold_signal_q8 == 2) {
+        if (two_threshold_steps) {
           threshold_extra = vaddq_u8(
               vshrq_n_u8(vcgeq_u8(signal, vdupq_n_u8(64)), 7),
               vshrq_n_u8(vcgeq_u8(signal, vdupq_n_u8(192)), 7));
@@ -2278,11 +2806,11 @@ class WhiteBalance {
         const uint8x16_t even_idx = vuzp1q_u8(filtered0, filtered1);
         const uint8x16_t odd_idx = vuzp2q_u8(filtered0, filtered1);
         const uint8x16_t even_values = even_is_green
-            ? vqsubq_u8(even_idx, black8)
+            ? map_green(even_idx)
             : color_neon.Apply(even_idx);
         const uint8x16_t odd_values = even_is_green
             ? color_neon.Apply(odd_idx)
-            : vqsubq_u8(odd_idx, black8);
+            : map_green(odd_idx);
         store_vector(offset, even_values, odd_values);
       };
       for (; x + 32 <= width - 2; x += 32) {
@@ -2314,7 +2842,12 @@ class WhiteBalance {
   // Materialized fallback: preserve the existing interleaved Bayer layout.
   void ApplyPreparedRowNeon(const cv::Mat &raw, int y, uchar *dst,
                             const NeonWbRowPlan &plan) const {
-    ApplyPreparedRowNeonImpl<false>(raw, y, dst, nullptr, plan);
+    if (plan.green_table && plan.use_neon_lut)
+      ApplyPreparedRowNeonImpl<false, 2>(raw, y, dst, nullptr, plan);
+    else if (plan.green_q7 == 128)
+      ApplyPreparedRowNeonImpl<false, 0>(raw, y, dst, nullptr, plan);
+    else
+      ApplyPreparedRowNeonImpl<false, 1>(raw, y, dst, nullptr, plan);
   }
 
   // Streaming high-gain path: one half-width plane per CFA column phase.
@@ -2323,7 +2856,12 @@ class WhiteBalance {
                                   const NeonWbRowPlan &plan) const {
     CV_DbgAssert((raw.cols & 1) == 0 && raw.cols >= 36 &&
                  plan.use_neon_lut);
-    ApplyPreparedRowNeonImpl<true>(raw, y, dst_even, dst_odd, plan);
+    if (plan.green_table)
+      ApplyPreparedRowNeonImpl<true, 2>(raw, y, dst_even, dst_odd, plan);
+    else if (plan.green_q7 == 128)
+      ApplyPreparedRowNeonImpl<true, 0>(raw, y, dst_even, dst_odd, plan);
+    else
+      ApplyPreparedRowNeonImpl<true, 1>(raw, y, dst_even, dst_odd, plan);
   }
 
   void ApplyLutsNeon(cv::Mat &raw, BayerConversion bayer) {
@@ -2366,11 +2904,21 @@ class WhiteBalance {
   static constexpr int kEstStep = 8;
   static constexpr double kGainMin = 0.6;
   static constexpr double kGainMax = 2.6;
+  static constexpr int kMeterBins = 240;  // RAW luma above the pedestal
+  // Per-frame step toward the metered target: 90% settled in ~3 frames.
+  static constexpr double kExposureSmooth = 0.5;
   uint32_t frame_idx_ = 0;
   double b_gain_ = -1.0;
   double r_gain_ = -1.0;
   double lut_bg_ = -1.0;
   double lut_rg_ = -1.0;
+  int lut_exposure_q7_ = 128;
+  bool green_table_ = false;  // lut_g_ is not ExposeGreen() (roll-off)
+  bool display_exposure_ = false;
+  double analog_gain_ = 0.0;
+  bool exposure_init_ = false;
+  double exposure_ = 1.0;
+  double exposure_log_ = 0.0;
   bool built_ = false;
   uchar lut_b_[256], lut_g_[256], lut_r_[256];
   int32_t lut_b_i32_[256], lut_g_i32_[256], lut_r_i32_[256];
@@ -3138,10 +3686,8 @@ CYPERSTEREO_AVX2_TARGET inline __m256i FastEaAverage4U8(
 // x0 is even and covers 32 interior output columns.  Primary BGGR means
 // even rows are B G and odd rows are G R.
 CYPERSTEREO_AVX2_TARGET inline FastEaPlanar32 FastEaDemosaicRow32(
-    const cv::Mat &raw, int y, int x0) {
-  const uchar *up = raw.ptr<uchar>(y - 1);
-  const uchar *cc = raw.ptr<uchar>(y);
-  const uchar *dn = raw.ptr<uchar>(y + 1);
+    const uchar *up, const uchar *cc, const uchar *dn, bool odd_row,
+    int x0) {
   const __m256i center = _mm256_loadu_si256(
       reinterpret_cast<const __m256i *>(cc + x0));
   const __m256i left = _mm256_loadu_si256(
@@ -3170,7 +3716,7 @@ CYPERSTEREO_AVX2_TARGET inline FastEaPlanar32 FastEaDemosaicRow32(
       above_left, above_right, below_left, below_right);
   const __m256i odd = _mm256_set1_epi16(static_cast<short>(0xff00));
   FastEaPlanar32 out;
-  if ((y & 1) == 0) {  // B G row
+  if (!odd_row) {  // B G row
     out.b = _mm256_blendv_epi8(center, horizontal, odd);
     out.g = _mm256_blendv_epi8(green, center, odd);
     out.r = _mm256_blendv_epi8(diagonal, vertical, odd);
@@ -3212,10 +3758,8 @@ CYPERSTEREO_AVX2_TARGET inline __m128i FastEaAverage2x2(
 }
 
 CYPERSTEREO_AVX2_TARGET inline void FastEaDemosaicPixel(
-    const cv::Mat &raw, int y, int x, int &B, int &G, int &R) {
-  const uchar *up = raw.ptr<uchar>(y - 1);
-  const uchar *cc = raw.ptr<uchar>(y);
-  const uchar *dn = raw.ptr<uchar>(y + 1);
+    const uchar *up, const uchar *cc, const uchar *dn, int y, int x,
+    int &B, int &G, int &R) {
   const auto ea_green = [&] {
     const int horizontal =
         std::abs(static_cast<int>(cc[x - 1]) - cc[x + 1]);
@@ -3247,12 +3791,12 @@ CYPERSTEREO_AVX2_TARGET inline void FastEaDemosaicPixel(
   }
 }
 
-CYPERSTEREO_AVX2_TARGET inline void FusedDemosaicFrontAvx2(
-    const cv::Mat &raw, cv::Mat &y8, cv::Mat &cr_h, cv::Mat &cb_h) {
-  CV_Assert(raw.type() == CV_8U && (raw.cols & 1) == 0 &&
-            (raw.rows & 1) == 0 && raw.cols >= 4 && raw.rows >= 4);
-  const int width = raw.cols;
-  const int height = raw.rows;
+// `ensure(r)` must make rows [0, r] available before `row(r)` is read; rows
+// are consumed top to bottom and never more than three rows behind r.
+template <class EnsureRows, class RowPtr>
+CYPERSTEREO_AVX2_TARGET inline void FusedDemosaicFrontAvx2Rows(
+    int width, int height, bool swap_red_blue, EnsureRows ensure,
+    RowPtr row, cv::Mat &y8, cv::Mat &cr_h, cv::Mat &cb_h) {
   const int half_width = width / 2;
   const int half_height = height / 2;
   y8.create(height, width, CV_8U);
@@ -3262,7 +3806,8 @@ CYPERSTEREO_AVX2_TARGET inline void FusedDemosaicFrontAvx2(
   const auto pixel = [&](int y, int x, int &B, int &G, int &R) {
     y = (std::max)(1, (std::min)(y, height - 2));
     x = (std::max)(1, (std::min)(x, width - 2));
-    FastEaDemosaicPixel(raw, y, x, B, G, R);
+    FastEaDemosaicPixel(row(y - 1), row(y), row(y + 1), y, x, B, G, R);
+    if (swap_red_blue) std::swap(B, R);
   };
   const auto scalar_block = [&](int yh, int xh) {
     int bsum = 0, gsum = 0, rsum = 0;
@@ -3294,23 +3839,34 @@ CYPERSTEREO_AVX2_TARGET inline void FusedDemosaicFrontAvx2(
   for (int yh = 0; yh < half_height; ++yh) {
     const int y0 = 2 * yh;
     const int y1 = y0 + 1;
+    ensure((std::min)(y1 + 1, height - 1));
     uchar *yrow0 = y8.ptr<uchar>(y0);
     uchar *yrow1 = y8.ptr<uchar>(y1);
     uchar *pcr = cr_h.ptr<uchar>(yh);
     uchar *pcb = cb_h.ptr<uchar>(yh);
     if (width >= 36) {
+      const bool top = y0 == 0;
+      const bool bottom = y1 == height - 1;
+      const uchar *r_up = top ? nullptr : row(y0 - 1);
+      const uchar *r0 = row(y0);
+      const uchar *r1 = row(y1);
+      const uchar *r_dn = bottom ? nullptr : row(y1 + 1);
       int x = 2;
       for (;;) {
         FastEaPlanar32 p0, p1;
-        if (y0 == 0) {
-          p1 = FastEaDemosaicRow32(raw, y1, x);
+        if (top) {
+          p1 = FastEaDemosaicRow32(r0, r1, r_dn, true, x);
           p0 = p1;  // OpenCV demosaiced row0 := row1.
-        } else if (y1 == height - 1) {
-          p0 = FastEaDemosaicRow32(raw, y0, x);
+        } else if (bottom) {
+          p0 = FastEaDemosaicRow32(r_up, r0, r1, false, x);
           p1 = p0;  // OpenCV demosaiced last row := preceding row.
         } else {
-          p0 = FastEaDemosaicRow32(raw, y0, x);
-          p1 = FastEaDemosaicRow32(raw, y1, x);
+          p0 = FastEaDemosaicRow32(r_up, r0, r1, false, x);
+          p1 = FastEaDemosaicRow32(r0, r1, r_dn, true, x);
+        }
+        if (swap_red_blue) {
+          std::swap(p0.b, p0.r);
+          std::swap(p1.b, p1.r);
         }
         _mm256_storeu_si256(reinterpret_cast<__m256i *>(yrow0 + x),
                             FastEaGray32(p0));
@@ -3338,6 +3894,46 @@ CYPERSTEREO_AVX2_TARGET inline void FusedDemosaicFrontAvx2(
       for (int xh = 0; xh < half_width; ++xh) scalar_block(yh, xh);
     }
   }
+}
+
+CYPERSTEREO_AVX2_TARGET inline void FusedDemosaicFrontAvx2(
+    const cv::Mat &raw, cv::Mat &y8, cv::Mat &cr_h, cv::Mat &cb_h,
+    BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr) {
+  CV_Assert(raw.type() == CV_8U && (raw.cols & 1) == 0 &&
+            (raw.rows & 1) == 0 && raw.cols >= 4 && raw.rows >= 4);
+  // EA interpolation is symmetric in red/blue, so the opposite CFA phase is
+  // the B-G/G-R reconstruction with its red and blue planes exchanged.
+  FusedDemosaicFrontAvx2Rows(
+      raw.cols, raw.rows, bayer == BayerConversion::kColorBayerBg2Bgr,
+      [](int) {}, [&raw](int r) { return raw.ptr<uchar>(r); },
+      y8, cr_h, cb_h);
+}
+
+inline void WhiteBalance::ApplyStreamedDemosaicFrontAvx2(
+    const cv::Mat &raw, cv::Mat &y8, cv::Mat &cr_h, cv::Mat &cb_h,
+    BayerConversion bayer) {
+  CV_Assert(raw.type() == CV_8UC1 && (raw.cols & 1) == 0 &&
+            (raw.rows & 1) == 0 && raw.cols >= 4 && raw.rows >= 4);
+  PrepareLutsForFrame(raw, bayer);
+  const bool rggb = bayer == BayerConversion::kColorBayerBg2Bgr;
+  const int width = raw.cols;
+  constexpr int kRingRows = 8;
+  static thread_local cv::Mat ring;
+  ring.create(kRingRows, (width + 63) & ~63, CV_8UC1);
+  int produced = 0;
+  FusedDemosaicFrontAvx2Rows(
+      width, raw.rows, rggb,
+      [&](int last) {
+        for (; produced <= last; ++produced)
+          LutRowTo(raw.ptr<uchar>(produced),
+                   ring.ptr<uchar>(produced & (kRingRows - 1)), 0, width,
+                   produced, rggb);
+      },
+      [&](int r) {
+        return static_cast<const uchar *>(
+            ring.ptr<uchar>(r & (kRingRows - 1)));
+      },
+      y8, cr_h, cb_h);
 }
 #endif
 
@@ -3502,6 +4098,14 @@ inline bool UseFusedDemosaic() {
 // its own post-demosaic CCM/tone operations to the BGR image and must keep
 // materialising that image.  Fast-balanced instead applies shared-luminance
 // gamma in its final reconstruction, so its intermediate BGR is disposable.
+inline bool FastFusedBgEnabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("CYPERSTEREO_FAST_FUSED_BG");
+    return !(value && value[0] == '0');
+  }();
+  return enabled;
+}
+
 inline bool UseFastFusedDemosaic() {
 #if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
   static const bool enabled = [] {
@@ -3942,6 +4546,200 @@ inline void EmitEaFrontBlockNeon(
                                  EaChroma8(bs_hi, ys_hi, 144)));
 }
 
+#if defined(__aarch64__)
+// Standalone EA front kernel for interior row pairs (default on; =1 restores
+// the EaRowBGPlanar / EaRowGRPlanar block loop below, which is byte-identical).
+inline bool FastNeonFrontRowsEnabled() {
+  static const bool enabled =
+      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_FRONT_ROWS");
+  return enabled;
+}
+
+// The SIMD block loop of FusedDemosaicFrontPairPlanarNeon for a row pair
+// without border replication. In CFA terms `before`/`odd` are G-Q rows and
+// `even`/`after` P-G rows, P = B and Q = R unless swap_red_blue. Exact
+// identities for 8-bit input:
+//  * pixel luma is rshrn8(W), W = kP*P + 150*G + kQ*Q <= 65280, so the 2x2
+//    luma of the chroma path is rshrn8 of the u32 sum of the four W;
+//  * ((d * k + 512) >> 10) == sqrdmulh(d, 32 * k) for |d| <= 1020;
+//  * sat_u8(128 + v) == sqxtn(v) ^ 0x80.
+// The block body is one asm statement because GCC 9 routes the ST2 pairs
+// through the stack and splits every widening op with d-register moves.
+static __attribute__((noinline)) void FastEaFrontRowPairNeon(
+    const EaPlanarBayerRow &before, const EaPlanarBayerRow &even,
+    const EaPlanarBayerRow &odd, const EaPlanarBayerRow &after, int width,
+    bool swap_red_blue, uchar *yrow0, uchar *yrow1, uchar *pcr,
+    uchar *pcb) {
+  const uint8x16_t kp = vdupq_n_u8(swap_red_blue ? 77 : 29);
+  const uint8x16_t kq = vdupq_n_u8(swap_red_blue ? 29 : 77);
+  const uint8x16_t kg = vdupq_n_u8(150);
+  const uint8x16_t k80 = vdupq_n_u8(0x80);
+  int16x8_t kc = vdupq_n_s16(0);
+  kc = vsetq_lane_s16(swap_red_blue ? 183 * 32 : 144 * 32, kc, 0);
+  kc = vsetq_lane_s16(swap_red_blue ? 144 * 32 : 183 * 32, kc, 1);
+  uchar *const dp = swap_red_blue ? pcr : pcb;
+  uchar *const dq = swap_red_blue ? pcb : pcr;
+  const uchar *const bE = before.even, *const bO = before.odd;
+  const uchar *const eE = even.even, *const eO = even.odd;
+  const uchar *const oE = odd.even, *const oO = odd.odd;
+  const uchar *const aE = after.even, *const aO = after.odd;
+  const uchar *const bOl = bO - 1, *const eOl = eO - 1, *const oOl = oO - 1;
+  const uchar *const eEr = eE + 1, *const oEr = oE + 1, *const aEr = aE + 1;
+  const int x0_last = width - 34;
+  int x0 = 2;
+  while (true) {
+    const long pair = x0 >> 1;
+    __asm__ volatile(
+        "ldr q0, [%[bE], %[p]]\n\t"
+        "ldr q1, [%[bO], %[p]]\n\t"
+        "ldr q2, [%[bOl], %[p]]\n\t"
+        "ldr q3, [%[eE], %[p]]\n\t"
+        "ldr q4, [%[eEr], %[p]]\n\t"
+        "ldr q5, [%[eO], %[p]]\n\t"
+        "ldr q6, [%[eOl], %[p]]\n\t"
+        "ldr q7, [%[oE], %[p]]\n\t"
+        "ldr q8, [%[oEr], %[p]]\n\t"
+        "ldr q9, [%[oO], %[p]]\n\t"
+        "ldr q10, [%[oOl], %[p]]\n\t"
+        "ldr q11, [%[aE], %[p]]\n\t"
+        "ldr q12, [%[aEr], %[p]]\n\t"
+        "ldr q13, [%[aO], %[p]]\n\t"
+        // Row 0: P0e = v3, G0o = v5.
+        "urhadd v14.16b, v3.16b, v4.16b\n\t"   // P0o
+        "urhadd v16.16b, v1.16b, v9.16b\n\t"   // Q0o
+        "uabd v17.16b, v6.16b, v5.16b\n\t"
+        "uabd v18.16b, v7.16b, v0.16b\n\t"
+        "cmhi v17.16b, v17.16b, v18.16b\n\t"
+        "urhadd v18.16b, v6.16b, v5.16b\n\t"
+        "urhadd v19.16b, v0.16b, v7.16b\n\t"
+        "bsl v17.16b, v19.16b, v18.16b\n\t"    // G0e
+        "uaddl v18.8h, v2.8b, v10.8b\n\t"
+        "uaddl2 v19.8h, v2.16b, v10.16b\n\t"
+        "uaddl v20.8h, v1.8b, v9.8b\n\t"
+        "uaddl2 v21.8h, v1.16b, v9.16b\n\t"
+        "add v18.8h, v18.8h, v20.8h\n\t"
+        "add v19.8h, v19.8h, v21.8h\n\t"
+        "rshrn v18.8b, v18.8h, #2\n\t"
+        "rshrn2 v18.16b, v19.8h, #2\n\t"       // Q0e
+        // Row 1: G1e = v7, Q1o = v9.
+        "urhadd v19.16b, v10.16b, v9.16b\n\t"  // Q1e
+        "urhadd v20.16b, v3.16b, v11.16b\n\t"  // P1e
+        "uabd v21.16b, v7.16b, v8.16b\n\t"
+        "uabd v22.16b, v13.16b, v5.16b\n\t"
+        "cmhi v21.16b, v21.16b, v22.16b\n\t"
+        "urhadd v22.16b, v7.16b, v8.16b\n\t"
+        "urhadd v23.16b, v5.16b, v13.16b\n\t"
+        "bsl v21.16b, v23.16b, v22.16b\n\t"    // G1o
+        "uaddl v22.8h, v3.8b, v4.8b\n\t"
+        "uaddl2 v23.8h, v3.16b, v4.16b\n\t"
+        "uaddl v24.8h, v11.8b, v12.8b\n\t"
+        "uaddl2 v25.8h, v11.16b, v12.16b\n\t"
+        "add v22.8h, v22.8h, v24.8h\n\t"
+        "add v23.8h, v23.8h, v25.8h\n\t"
+        "rshrn v22.8b, v22.8h, #2\n\t"
+        "rshrn2 v22.16b, v23.8h, #2\n\t"       // P1o
+        // W = kP*P + 150*G + kQ*Q, lo/hi: 0e v0/v1, 0o v2/v4, 1e v6/v8,
+        // 1o v10/v11.
+        "umull v0.8h, v3.8b, %[kp].8b\n\t"
+        "umull2 v1.8h, v3.16b, %[kp].16b\n\t"
+        "umlal v0.8h, v17.8b, %[kg].8b\n\t"
+        "umlal2 v1.8h, v17.16b, %[kg].16b\n\t"
+        "umlal v0.8h, v18.8b, %[kq].8b\n\t"
+        "umlal2 v1.8h, v18.16b, %[kq].16b\n\t"
+        "umull v2.8h, v14.8b, %[kp].8b\n\t"
+        "umull2 v4.8h, v14.16b, %[kp].16b\n\t"
+        "umlal v2.8h, v5.8b, %[kg].8b\n\t"
+        "umlal2 v4.8h, v5.16b, %[kg].16b\n\t"
+        "umlal v2.8h, v16.8b, %[kq].8b\n\t"
+        "umlal2 v4.8h, v16.16b, %[kq].16b\n\t"
+        "umull v6.8h, v20.8b, %[kp].8b\n\t"
+        "umull2 v8.8h, v20.16b, %[kp].16b\n\t"
+        "umlal v6.8h, v7.8b, %[kg].8b\n\t"
+        "umlal2 v8.8h, v7.16b, %[kg].16b\n\t"
+        "umlal v6.8h, v19.8b, %[kq].8b\n\t"
+        "umlal2 v8.8h, v19.16b, %[kq].16b\n\t"
+        "umull v10.8h, v22.8b, %[kp].8b\n\t"
+        "umull2 v11.8h, v22.16b, %[kp].16b\n\t"
+        "umlal v10.8h, v21.8b, %[kg].8b\n\t"
+        "umlal2 v11.8h, v21.16b, %[kg].16b\n\t"
+        "umlal v10.8h, v9.8b, %[kq].8b\n\t"
+        "umlal2 v11.8h, v9.16b, %[kq].16b\n\t"
+        // 2x2 sums of P (v12/v13) and Q (v23/v24).
+        "uaddl v12.8h, v3.8b, v14.8b\n\t"
+        "uaddl2 v13.8h, v3.16b, v14.16b\n\t"
+        "uaddw v12.8h, v12.8h, v20.8b\n\t"
+        "uaddw2 v13.8h, v13.8h, v20.16b\n\t"
+        "uaddw v12.8h, v12.8h, v22.8b\n\t"
+        "uaddw2 v13.8h, v13.8h, v22.16b\n\t"
+        "uaddl v23.8h, v18.8b, v16.8b\n\t"
+        "uaddl2 v24.8h, v18.16b, v16.16b\n\t"
+        "uaddw v23.8h, v23.8h, v19.8b\n\t"
+        "uaddw2 v24.8h, v24.8h, v19.16b\n\t"
+        "uaddw v23.8h, v23.8h, v9.8b\n\t"
+        "uaddw2 v24.8h, v24.8h, v9.16b\n\t"
+        // Pixel luma.
+        "rshrn v16.8b, v0.8h, #8\n\t"
+        "rshrn2 v16.16b, v1.8h, #8\n\t"
+        "rshrn v17.8b, v2.8h, #8\n\t"
+        "rshrn2 v17.16b, v4.8h, #8\n\t"
+        "st2 {v16.16b, v17.16b}, [%[y0]]\n\t"
+        "rshrn v18.8b, v6.8h, #8\n\t"
+        "rshrn2 v18.16b, v8.8h, #8\n\t"
+        "rshrn v19.8b, v10.8h, #8\n\t"
+        "rshrn2 v19.16b, v11.8h, #8\n\t"
+        "st2 {v18.16b, v19.16b}, [%[y1]]\n\t"
+        // 2x2 luma: lanes 0..7 -> v20, 8..15 -> v21.
+        "uaddl v20.4s, v0.4h, v2.4h\n\t"
+        "uaddl2 v21.4s, v0.8h, v2.8h\n\t"
+        "uaddw v20.4s, v20.4s, v6.4h\n\t"
+        "uaddw2 v21.4s, v21.4s, v6.8h\n\t"
+        "uaddw v20.4s, v20.4s, v10.4h\n\t"
+        "uaddw2 v21.4s, v21.4s, v10.8h\n\t"
+        "rshrn v20.4h, v20.4s, #8\n\t"
+        "rshrn2 v20.8h, v21.4s, #8\n\t"
+        "uaddl v21.4s, v1.4h, v4.4h\n\t"
+        "uaddl2 v22.4s, v1.8h, v4.8h\n\t"
+        "uaddw v21.4s, v21.4s, v8.4h\n\t"
+        "uaddw2 v22.4s, v22.4s, v8.8h\n\t"
+        "uaddw v21.4s, v21.4s, v11.4h\n\t"
+        "uaddw2 v22.4s, v22.4s, v11.8h\n\t"
+        "rshrn v21.4h, v21.4s, #8\n\t"
+        "rshrn2 v21.8h, v22.4s, #8\n\t"
+        // Chroma.
+        "sub v12.8h, v12.8h, v20.8h\n\t"
+        "sub v13.8h, v13.8h, v21.8h\n\t"
+        "sub v23.8h, v23.8h, v20.8h\n\t"
+        "sub v24.8h, v24.8h, v21.8h\n\t"
+        "sqrdmulh v12.8h, v12.8h, %[kc].h[0]\n\t"
+        "sqrdmulh v13.8h, v13.8h, %[kc].h[0]\n\t"
+        "sqrdmulh v23.8h, v23.8h, %[kc].h[1]\n\t"
+        "sqrdmulh v24.8h, v24.8h, %[kc].h[1]\n\t"
+        "sqxtn v12.8b, v12.8h\n\t"
+        "sqxtn2 v12.16b, v13.8h\n\t"
+        "sqxtn v23.8b, v23.8h\n\t"
+        "sqxtn2 v23.16b, v24.8h\n\t"
+        "eor v12.16b, v12.16b, %[k80].16b\n\t"
+        "eor v23.16b, v23.16b, %[k80].16b\n\t"
+        "str q12, [%[dp]]\n\t"
+        "str q23, [%[dq]]"
+        :
+        : [bE] "r"(bE), [bO] "r"(bO), [bOl] "r"(bOl), [eE] "r"(eE),
+          [eEr] "r"(eEr), [eO] "r"(eO), [eOl] "r"(eOl), [oE] "r"(oE),
+          [oEr] "r"(oEr), [oO] "r"(oO), [oOl] "r"(oOl), [aE] "r"(aE),
+          [aEr] "r"(aEr), [aO] "r"(aO), [p] "r"(pair),
+          [y0] "r"(yrow0 + x0), [y1] "r"(yrow1 + x0), [dp] "r"(dp + pair),
+          [dq] "r"(dq + pair), [kp] "w"(kp), [kg] "w"(kg), [kq] "w"(kq),
+          [k80] "w"(k80), [kc] "x"(kc)
+        : "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+          "v11", "v12", "v13", "v14", "v16", "v17", "v18", "v19", "v20",
+          "v21", "v22", "v23", "v24", "v25", "memory");
+    if (x0 == x0_last) break;
+    x0 += 32;
+    if (x0 > x0_last) x0 = x0_last;
+  }
+}
+#endif
+
 // Planar-ring counterpart of FusedDemosaicFrontPairNeon.  Every equation,
 // rounding point, overwrite-style SIMD tail and OpenCV EA border replication
 // is intentionally identical; only the way Bayer phases are loaded differs.
@@ -3950,7 +4748,7 @@ inline void FusedDemosaicFrontPairPlanarNeon(
     const EaPlanarBayerRow &odd, const EaPlanarBayerRow &after,
     int width, bool replicate_top, bool replicate_bottom,
     bool swap_red_blue, uchar *yrow0, uchar *yrow1,
-    uchar *pcr, uchar *pcb) {
+    uchar *pcr, uchar *pcb, bool fast_rows = false) {
   CV_DbgAssert(!(replicate_top && replicate_bottom));
   const int half_width = width / 2;
   const auto pixel = [&](int dy, int x, int &B, int &G, int &R) {
@@ -3993,7 +4791,17 @@ inline void FusedDemosaicFrontPairPlanarNeon(
 
   const int x0_last = width - 34;
   int x0 = 2;
-  while (true) {
+  bool blocks_done = false;
+#if defined(__aarch64__)
+  if (fast_rows && !replicate_top && !replicate_bottom) {
+    FastEaFrontRowPairNeon(before, even, odd, after, width, swap_red_blue,
+                           yrow0, yrow1, pcr, pcb);
+    blocks_done = true;
+  }
+#else
+  (void)fast_rows;
+#endif
+  while (!blocks_done) {
     const int pair = x0 >> 1;
     const EaPlanarRowVectors before_v =
         LoadEaPlanarRowVectors(before, pair);
@@ -4073,10 +4881,14 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
   cr_h.create(half_height, width / 2, CV_8U);
   cb_h.create(half_height, width / 2, CV_8U);
 
-  // Low gain has no BayerNR scalar tail and showed no reliable benefit from
-  // planar EA loads. Preserve its established interleaved path (also the
-  // fallback for the diagnostic switch that disables the A64 LUT backend).
-  if (!use_bayer_nr || !plan.use_neon_lut) {
+  // The interleaved ring is the fallback for the diagnostic switch that
+  // disables the A64 LUT backend. Frames without host BayerNR (low gain, or
+  // BayerNR already applied by the camera FPGA) also take the planar ring:
+  // A78AE front 2.17 -> 2.07 ms, bit-exact. CYPERSTEREO_FAST_DISABLE_PLANAR_
+  // FRONT_NO_NR restores the interleaved path for those frames.
+  static const bool planar_without_nr =
+      std::getenv("CYPERSTEREO_FAST_DISABLE_PLANAR_FRONT_NO_NR") == nullptr;
+  if ((!use_bayer_nr && !planar_without_nr) || !plan.use_neon_lut) {
     static thread_local cv::Mat wb_interleaved_ring;
     wb_interleaved_ring.create(4, width, CV_8UC1);
     int row_tag[4] = {-1, -1, -1, -1};
@@ -4116,7 +4928,7 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
     return;
   }
 
-  // High-gain production path. Four rows still occupy exactly 4*W bytes;
+  // Planar production path. Four rows still occupy exactly 4*W bytes;
   // each row's first W/2 bytes hold even CFA columns and its second half odd
   // columns. Advancing an output pair retains two rows and replaces two.
   static thread_local cv::Mat wb_planar_ring;
@@ -4138,6 +4950,7 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
 
   // Deliberately serial inside one camera: the outer four-camera scheduler
   // already pins one ISP to each A76 (CPU4..7), so no A55 is recruited.
+  const bool front_rows = FastNeonFrontRowsEnabled();
   for (int yh = 0; yh < half_height; ++yh) {
     const int r0 = 2 * yh;
     const int r1 = r0 + 1;
@@ -4163,7 +4976,7 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
         planar_row(before_y), planar_row(r0), planar_row(r1),
         planar_row(after_y), width, replicate_top, replicate_bottom,
         swap_red_blue, y8.ptr<uchar>(r0), y8.ptr<uchar>(r1),
-        cr_h.ptr<uchar>(yh), cb_h.ptr<uchar>(yh));
+        cr_h.ptr<uchar>(yh), cb_h.ptr<uchar>(yh), front_rows);
   }
 }
 #endif  // __aarch64__
@@ -4196,6 +5009,47 @@ inline bool UseChromaFullStreamNeon() {
 // pass accumulates u16*[1 4 6 4 1] in u32 and rounds once: (v + 128) >> 8.
 // Horizontal pass for one row: u8 src -> u16 [1 4 6 4 1] sums with
 // REFLECT_101 ends.
+#if defined(__aarch64__)
+inline bool FastNeonGauss5HAsmEnabled() {
+  static const bool enabled =
+      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_GAUSS5H_ASM");
+  return enabled;
+}
+
+// Interior of Gauss5HRowNeon: 16 outputs per step from s[-2..17]. GCC 9
+// splits each vget_low/vget_high operand with a d-register move (10 of the
+// 28 loop instructions); UADDL2/UMLAL2 read the high halves directly.
+static __attribute__((noinline)) void Gauss5HBlocksAsm(const uchar *s,
+                                                       ushort *t,
+                                                       int64_t blocks) {
+  __asm__ volatile(
+      "movi v6.8h, #4\n\t"
+      "movi v7.16b, #6\n\t"
+      "1:\n\t"
+      "ldr q0, [%[s]]\n\t"
+      "ldur q1, [%[s], #1]\n\t"
+      "ldur q2, [%[s], #2]\n\t"
+      "ldur q3, [%[s], #3]\n\t"
+      "ldur q4, [%[s], #4]\n\t"
+      "add %[s], %[s], #16\n\t"
+      "uaddl v16.8h, v0.8b, v4.8b\n\t"
+      "uaddl2 v17.8h, v0.16b, v4.16b\n\t"
+      "uaddl v18.8h, v1.8b, v3.8b\n\t"
+      "uaddl2 v19.8h, v1.16b, v3.16b\n\t"
+      "mla v16.8h, v18.8h, v6.8h\n\t"
+      "mla v17.8h, v19.8h, v6.8h\n\t"
+      "umlal v16.8h, v2.8b, v7.8b\n\t"
+      "umlal2 v17.8h, v2.16b, v7.16b\n\t"
+      "stp q16, q17, [%[t]], #32\n\t"
+      "subs %[n], %[n], #1\n\t"
+      "b.ne 1b\n\t"
+      : [s] "+r"(s), [t] "+r"(t), [n] "+r"(blocks)
+      :
+      : "v0", "v1", "v2", "v3", "v4", "v6", "v7", "v16", "v17", "v18",
+        "v19", "cc", "memory");
+}
+#endif
+
 inline void Gauss5HRowNeon(const uchar *s, ushort *t, int W) {
   const auto at = [&](int x) {
     x = x < 0 ? -x : (x >= W ? 2 * W - 2 - x : x);  // reflect101
@@ -4205,6 +5059,13 @@ inline void Gauss5HRowNeon(const uchar *s, ushort *t, int W) {
     t[x] = static_cast<ushort>(at(x - 2) + 4 * at(x - 1) + 6 * at(x) +
                                4 * at(x + 1) + at(x + 2));
   int x = 2;
+#if defined(__aarch64__)
+  if (W >= 20 && FastNeonGauss5HAsmEnabled()) {
+    const int64_t blocks = (W - 4) / 16;
+    Gauss5HBlocksAsm(s, t + 2, blocks);
+    x += static_cast<int>(blocks * 16);
+  }
+#endif
   for (; x + 16 + 2 <= W; x += 16) {
     const uint8x16_t m2 = vld1q_u8(s + x - 2);
     const uint8x16_t m1 = vld1q_u8(s + x - 1);
@@ -4301,20 +5162,22 @@ inline void Gauss5VPair8Neon(
 // consecutive four columns, and RSHRN performs the established +8/shift/
 // narrow in one instruction.  All sums are <=4080, so u16 is lossless.
 inline void PoolLumaAbs4Neon(const ushort *colsum, uchar *output,
-                             int quarter_width) {
+                             int quarter_width, bool two_rows = false) {
   int xq = 0;
   for (; xq + 8 <= quarter_width; xq += 8) {
     const uint16x8x4_t columns = vld4q_u16(colsum + 4 * xq);
     const uint16x8_t sum = vaddq_u16(
         vaddq_u16(columns.val[0], columns.val[1]),
         vaddq_u16(columns.val[2], columns.val[3]));
-    vst1_u8(output + xq, vrshrn_n_u16(sum, 4));
+    vst1_u8(output + xq,
+            two_rows ? vrshrn_n_u16(sum, 3) : vrshrn_n_u16(sum, 4));
   }
   for (; xq < quarter_width; ++xq) {
     const int x = xq << 2;
     const int sum = colsum[x] + colsum[x + 1] +
                     colsum[x + 2] + colsum[x + 3];
-    output[xq] = static_cast<uchar>((sum + 8) >> 4);
+    output[xq] = static_cast<uchar>(two_rows ? (sum + 4) >> 3
+                                             : (sum + 8) >> 4);
   }
 }
 #endif
@@ -4325,9 +5188,11 @@ inline void PoolLumaAbs4Neon(const ushort *colsum, uchar *output,
 // single-row temporary are never materialized: only the 8-row u16 ring is
 // retained. Outputs use the exact equations and rounding of the established
 // path; paired adjacent rows share four horizontal-sum loads.
+// two_rows (CYPERSTEREO_FAST_LUMA_LITE) pools the band-pass energy over the
+// top 4x2 of each cell only; yq8/sq16 are unchanged.
 inline void FusedLumaChainNeon(const cv::Mat &y8, cv::Mat &hf_q8,
                                cv::Mat &colsum, cv::Mat &yq8, cv::Mat &sq16,
-                               cv::Mat &ring) {
+                               cv::Mat &ring, bool two_rows = false) {
   const int W = y8.cols, H = y8.rows, qW = W / 4, qH = H / 4;
   hf_q8.create(qH, qW, CV_8U);
   colsum.create(1, W, CV_16U);
@@ -4358,7 +5223,7 @@ inline void FusedLumaChainNeon(const cv::Mat &y8, cv::Mat &hf_q8,
       const auto reflect_y = [&](int y) {
         return y < 0 ? -y : (y >= H ? 2 * H - 2 - y : y);
       };
-      for (int pair = 0; pair < 2; ++pair) {
+      for (int pair = 0; pair < (two_rows ? 1 : 2); ++pair) {
         const int y0 = 4 * yq + 2 * pair;
         const int y1 = y0 + 1;
         fill_h(y1 + 2);
@@ -4423,7 +5288,7 @@ inline void FusedLumaChainNeon(const cv::Mat &y8, cv::Mat &hf_q8,
       }
     }
     uchar *po = hf_q8.ptr<uchar>(yq);
-    PoolLumaAbs4Neon(cs, po, qW);
+    PoolLumaAbs4Neon(cs, po, qW, two_rows);
   }
 }
 #endif  // defined(__aarch64__)
@@ -4486,7 +5351,8 @@ inline bool UseStreamedGuidedStatsNeon() {
 // chain (which produces yq8/sq16 as a by-product) can call it directly.
 inline void GuidedStatsFromDecimNeon(const cv::Mat &yq8, const cv::Mat &sq16,
                                      cv::Mat &a_q16, cv::Mat &b_q16,
-                                     cv::Mat &mean_i) {
+                                     cv::Mat &mean_i, float eps = 20.0f) {
+  const float eps81 = 81.0f * eps;
   static thread_local cv::Mat vs16, vs32, a_q, b_q, hs_a, hs_b;
   const int qW = yq8.cols, qH = yq8.rows;
   const cv::Size quarter(qW, qH);
@@ -4541,7 +5407,7 @@ inline void GuidedStatsFromDecimNeon(const cv::Mat &yq8, const cv::Mat &sq16,
       int num = 9 * s9 - m9 * m9;
       if (num < 0) num = 0;
       const float af =
-          static_cast<float>(num) / (static_cast<float>(num) + 1620.0f);
+          static_cast<float>(num) / (static_cast<float>(num) + eps81);
       const float m = static_cast<float>(m9) * (1.0f / 9.0f);
       pa[x] = static_cast<ushort>(af * 4096.0f + 0.5f);
       pb[x] = static_cast<ushort>((m - af * m) * 16.0f + 0.5f);
@@ -4549,7 +5415,7 @@ inline void GuidedStatsFromDecimNeon(const cv::Mat &yq8, const cv::Mat &sq16,
     };
     scalar_px(0);
     int x = 1;
-    const float32x4_t k1620 = vdupq_n_f32(1620.0f);
+    const float32x4_t k1620 = vdupq_n_f32(eps81);
     const float32x4_t k4096 = vdupq_n_f32(4096.0f);
     const float32x4_t kinv9x16 = vdupq_n_f32(16.0f / 9.0f);
     const float32x4_t kinv9 = vdupq_n_f32(1.0f / 9.0f);
@@ -4666,7 +5532,9 @@ inline void GuidedStatsFromDecimNeon(const cv::Mat &yq8, const cv::Mat &sq16,
 inline void GuidedStatsStreamedNeon(const cv::Mat &yq8,
                                     const cv::Mat &sq16,
                                     cv::Mat &a_q16, cv::Mat &b_q16,
-                                    cv::Mat &mean_i, int strength_q8) {
+                                    cv::Mat &mean_i, int strength_q8,
+                                    float eps = 20.0f) {
+  const float eps81 = 81.0f * eps;
   static thread_local cv::Mat v16_row, v32_row, a_row, b_row;
   static thread_local cv::Mat hs_a_ring, hs_b_ring;
   const int qW = yq8.cols, qH = yq8.rows;
@@ -4683,7 +5551,7 @@ inline void GuidedStatsStreamedNeon(const cv::Mat &yq8,
   b_q16.create(quarter, CV_16U);
   mean_i.create(quarter, CV_32F);
 
-  const float32x4_t k1620 = vdupq_n_f32(1620.0f);
+  const float32x4_t k1620 = vdupq_n_f32(eps81);
   const float32x4_t k4096f = vdupq_n_f32(4096.0f);
   const float32x4_t kinv9x16 = vdupq_n_f32(16.0f / 9.0f);
   const float32x4_t kinv9 = vdupq_n_f32(1.0f / 9.0f);
@@ -4792,7 +5660,7 @@ inline void GuidedStatsStreamedNeon(const cv::Mat &yq8,
       int num = 9 * s9 - m9 * m9;
       if (num < 0) num = 0;
       const float af =
-          static_cast<float>(num) / (static_cast<float>(num) + 1620.0f);
+          static_cast<float>(num) / (static_cast<float>(num) + eps81);
       const float m = static_cast<float>(m9) * (1.0f / 9.0f);
       pa[px] = static_cast<ushort>(af * 4096.0f + 0.5f);
       pb[px] = static_cast<ushort>((m - af * m) * 16.0f + 0.5f);
@@ -4887,7 +5755,8 @@ inline void GuidedStatsStreamedNeon(const cv::Mat &yq8,
 }
 
 inline void GuidedStatsIntNeon(const cv::Mat &y_bl, cv::Mat &a_q16,
-                               cv::Mat &b_q16, cv::Mat &mean_i) {
+                               cv::Mat &b_q16, cv::Mat &mean_i,
+                               float eps = 20.0f) {
   static thread_local cv::Mat yq8, sq16;
   const int qW = y_bl.cols / 4, qH = y_bl.rows / 4;
   const cv::Size quarter(qW, qH);
@@ -4914,7 +5783,7 @@ inline void GuidedStatsIntNeon(const cv::Mat &y_bl, cv::Mat &a_q16,
       sq[x] = static_cast<ushort>(v * v);
     }
   }
-  GuidedStatsFromDecimNeon(yq8, sq16, a_q16, b_q16, mean_i);
+  GuidedStatsFromDecimNeon(yq8, sq16, a_q16, b_q16, mean_i, eps);
 }
 #endif
 
@@ -5031,8 +5900,12 @@ CYPERSTEREO_AVX2_TARGET inline void FastLumaGauss5VRowAvx2(
 // ring, and each blurred row is consumed immediately; no full y_bl plane or
 // full Gaussian horizontal temporary is written. The quarter hf plane stays
 // materialized so its OpenCV Gaussian3 keeps the established exact result.
+// two_rows (CYPERSTEREO_FAST_LUMA_LITE) pools the band-pass energy over the
+// top 4x2 of each cell only, as FusedLumaChainNeon does; yq8/sq16 are
+// unchanged.
 CYPERSTEREO_AVX2_TARGET inline void FusedLumaChainAvx2Exact(
-    const cv::Mat &y8, cv::Mat &tex_q, cv::Mat &yq8, cv::Mat &sq16) {
+    const cv::Mat &y8, cv::Mat &tex_q, cv::Mat &yq8, cv::Mat &sq16,
+    bool two_rows = false) {
   CV_Assert(y8.type() == CV_8U && y8.isContinuous() && !y8.isSubmatrix() &&
             y8.cols >= 8 && y8.rows >= 8);
   const int width = y8.cols, height = y8.rows;
@@ -5062,7 +5935,7 @@ CYPERSTEREO_AVX2_TARGET inline void FusedLumaChainAvx2Exact(
       _mm256_storeu_si256(
           reinterpret_cast<__m256i *>(vertical_abs + clear_x), zero);
     for (; clear_x < width; ++clear_x) vertical_abs[clear_x] = 0;
-    for (int row = 0; row < 4; ++row) {
+    for (int row = 0; row < (two_rows ? 2 : 4); ++row) {
       const int y = 4 * yq + row;
       fill_horizontal(y + 2);
       const int ym2 = y < 2 ? 2 - y : y - 2;
@@ -5129,9 +6002,10 @@ CYPERSTEREO_AVX2_TARGET inline void FusedLumaChainAvx2Exact(
     uchar *hf = hf_q.ptr<uchar>(yq);
     for (int xq = 0; xq < qW; ++xq) {
       const int x = 4 * xq;
-      hf[xq] = static_cast<uchar>((vertical_abs[x] + vertical_abs[x + 1] +
-                                  vertical_abs[x + 2] +
-                                  vertical_abs[x + 3] + 8) >> 4);
+      const int sum = vertical_abs[x] + vertical_abs[x + 1] +
+                      vertical_abs[x + 2] + vertical_abs[x + 3];
+      hf[xq] = static_cast<uchar>(two_rows ? (sum + 4) >> 3
+                                           : (sum + 8) >> 4);
     }
   }
   cv::GaussianBlur(hf_q, tex_q, cv::Size(3, 3), 0);
@@ -5586,6 +6460,147 @@ CYPERSTEREO_AVX2_TARGET inline void FastGuidedCoeffStrengthStreamedAvx2(
   emit(height - 1, height - 2, height - 1, height - 1);
 }
 
+// Fused guided statistics below (default on; =1 restores the two OpenCV
+// CV_32F box3 passes, which are byte-identical).
+inline bool FastFusedGuidedStatsEnabled() {
+  static const bool enabled =
+      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_FUSED_GUIDED_STATS");
+  return enabled;
+}
+
+// Reflect-border horizontal box3 sums of a u8 row (u16) and a u16 row (u32).
+CYPERSTEREO_AVX2_TARGET inline void FastGuidedStatsHorizontalAvx2(
+    const uchar *src, const ushort *sq, int width, ushort *dst,
+    int32_t *dst_sq) {
+  dst[0] = static_cast<ushort>(2 * src[0] + src[1]);
+  dst_sq[0] = 2 * static_cast<int32_t>(sq[0]) + sq[1];
+  int x = 1;
+  for (; x + 16 <= width - 1; x += 16) {
+    const __m256i l = _mm256_cvtepu8_epi16(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + x - 1)));
+    const __m256i c = _mm256_cvtepu8_epi16(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + x)));
+    const __m256i r = _mm256_cvtepu8_epi16(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + x + 1)));
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + x),
+                        _mm256_add_epi16(_mm256_add_epi16(l, c), r));
+    for (int h = 0; h < 16; h += 8) {
+      const __m256i ql = _mm256_cvtepu16_epi32(
+          _mm_loadu_si128(reinterpret_cast<const __m128i *>(sq + x + h - 1)));
+      const __m256i qc = _mm256_cvtepu16_epi32(
+          _mm_loadu_si128(reinterpret_cast<const __m128i *>(sq + x + h)));
+      const __m256i qr = _mm256_cvtepu16_epi32(
+          _mm_loadu_si128(reinterpret_cast<const __m128i *>(sq + x + h + 1)));
+      _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst_sq + x + h),
+                          _mm256_add_epi32(_mm256_add_epi32(ql, qc), qr));
+    }
+  }
+  for (; x < width - 1; ++x) {
+    dst[x] = static_cast<ushort>(src[x - 1] + src[x] + src[x + 1]);
+    dst_sq[x] = static_cast<int32_t>(sq[x - 1]) + sq[x] + sq[x + 1];
+  }
+  dst[width - 1] = static_cast<ushort>(src[width - 2] + 2 * src[width - 1]);
+  dst_sq[width - 1] =
+      static_cast<int32_t>(sq[width - 2]) + 2 * static_cast<int32_t>(sq[width - 1]);
+}
+
+// Vertical half of the box3 means. OpenCV's vectorized ColumnSum<int,float>
+// scales by float(1/9) while its scalar tail scales in double, which rounds
+// differently for some sums; callers therefore require width % 8 == 0 so
+// the float product below matches every column.
+CYPERSTEREO_AVX2_TARGET inline void FastGuidedStatsVerticalAvx2(
+    const ushort *s0, const ushort *s1, const ushort *s2, const int32_t *q0,
+    const int32_t *q1, const int32_t *q2, int width, float *mean,
+    float *mean_sq) {
+  const float inv9 = 1.0f / 9.0f;
+  const __m256 vinv9 = _mm256_set1_ps(inv9);
+  int x = 0;
+  for (; x + 8 <= width; x += 8) {
+    const __m256i s = _mm256_cvtepu16_epi32(_mm_add_epi16(
+        _mm_add_epi16(
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(s0 + x)),
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(s1 + x))),
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(s2 + x))));
+    const __m256i q = _mm256_add_epi32(
+        _mm256_add_epi32(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q0 + x)),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q1 + x))),
+        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q2 + x)));
+    _mm256_storeu_ps(mean + x, _mm256_mul_ps(_mm256_cvtepi32_ps(s), vinv9));
+    _mm256_storeu_ps(mean_sq + x,
+                     _mm256_mul_ps(_mm256_cvtepi32_ps(q), vinv9));
+  }
+  for (; x < width; ++x) {
+    mean[x] = static_cast<float>(s0[x] + s1[x] + s2[x]) * inv9;
+    mean_sq[x] = static_cast<float>(q0[x] + q1[x] + q2[x]) * inv9;
+  }
+}
+
+// Streams yq8/sq16 -> box3 means -> raw a/b -> box3 + strength in one pass.
+// Byte-identical to the two OpenCV CV_32F boxFilter calls followed by
+// FastGuidedCoeffStrengthStreamedAvx2. mean_i is still materialized for the
+// chroma gate; mean_ii only ever lives in one row.
+CYPERSTEREO_AVX2_TARGET inline void FastGuidedStatsCoeffStreamedAvx2(
+    const cv::Mat &yq8, const cv::Mat &sq16, float eps, int strength_q8,
+    cv::Mat &mean_i, cv::Mat &a_q16, cv::Mat &b_q16) {
+  CV_Assert(yq8.type() == CV_8U && sq16.type() == CV_16U &&
+            yq8.size() == sq16.size() && yq8.cols >= 8 &&
+            (yq8.cols & 7) == 0 && yq8.rows >= 2 && strength_q8 >= 0 &&
+            strength_q8 <= 256);
+  static thread_local cv::Mat hs_i, hs_ii, mean_sq_row, raw_a, raw_b, hs_a,
+      hs_b;
+  const int width = yq8.cols;
+  const int height = yq8.rows;
+  hs_i.create(3, width, CV_16U);
+  hs_ii.create(3, width, CV_32S);
+  mean_sq_row.create(1, width, CV_32F);
+  raw_a.create(1, width, CV_16U);
+  raw_b.create(1, width, CV_16U);
+  hs_a.create(3, width, CV_16U);
+  hs_b.create(3, width, CV_16U);
+  mean_i.create(yq8.size(), CV_32F);
+  a_q16.create(yq8.size(), CV_16U);
+  b_q16.create(yq8.size(), CV_16U);
+  const auto hsum = [&](int y) {
+    FastGuidedStatsHorizontalAvx2(yq8.ptr<uchar>(y), sq16.ptr<ushort>(y),
+                                  width, hs_i.ptr<ushort>(y % 3),
+                                  hs_ii.ptr<int32_t>(y % 3));
+  };
+  const auto stats = [&](int y) {
+    const int top = (y > 0 ? y - 1 : 0) % 3;
+    const int bottom = (y + 1 < height ? y + 1 : height - 1) % 3;
+    const int center = y % 3;
+    float *mean = mean_i.ptr<float>(y);
+    float *mean_sq = mean_sq_row.ptr<float>();
+    FastGuidedStatsVerticalAvx2(
+        hs_i.ptr<ushort>(top), hs_i.ptr<ushort>(center),
+        hs_i.ptr<ushort>(bottom), hs_ii.ptr<int32_t>(top),
+        hs_ii.ptr<int32_t>(center), hs_ii.ptr<int32_t>(bottom), width, mean,
+        mean_sq);
+    ushort *pa = raw_a.ptr<ushort>();
+    ushort *pb = raw_b.ptr<ushort>();
+    FastGuidedRawCoeffRowAvx2(mean, mean_sq, width, eps, pa, pb);
+    FastGuidedHorizontal3Avx2(pa, hs_a.ptr<ushort>(y % 3), width);
+    FastGuidedHorizontal3Avx2(pb, hs_b.ptr<ushort>(y % 3), width);
+  };
+  const auto emit = [&](int y, int top, int center, int bottom) {
+    FastGuidedSmoothStrengthRowAvx2(
+        hs_a.ptr<ushort>(top % 3), hs_a.ptr<ushort>(center % 3),
+        hs_a.ptr<ushort>(bottom % 3), hs_b.ptr<ushort>(top % 3),
+        hs_b.ptr<ushort>(center % 3), hs_b.ptr<ushort>(bottom % 3), width,
+        strength_q8, a_q16.ptr<ushort>(y), b_q16.ptr<ushort>(y));
+  };
+  hsum(0);
+  hsum(1);
+  stats(0);
+  for (int y = 1; y < height; ++y) {
+    if (y + 1 < height) hsum(y + 1);
+    stats(y);
+    emit(y - 1, y > 1 ? y - 2 : 0, y - 1, y);
+  }
+  emit(height - 1, height - 2, height - 1, height - 1);
+}
+
 CYPERSTEREO_AVX2_TARGET inline __m256i PackAndRepeat2Avx2(__m256i v) {
   const __m128i v8 = _mm_packs_epi32(
       _mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
@@ -5644,7 +6659,7 @@ CYPERSTEREO_AVX2_TARGET inline void FastOutputStoreBgr16Avx2(
 CYPERSTEREO_AVX2_TARGET inline void FusedOutputAvx2(
     const cv::Mat &y8, const cv::Mat &a_q16, const cv::Mat &b_q16,
     const cv::Mat &cr_h, const cv::Mat &cb_h, cv::Mat &color,
-    bool apply_tone = false) {
+    const FastBalancedToneLuts *tone_luts = nullptr) {
   const int full_width = color.cols;
   const int full_height = color.rows;
   const int half_width = cr_h.cols;
@@ -5656,8 +6671,6 @@ CYPERSTEREO_AVX2_TARGET inline void FusedOutputAvx2(
   const __m256i k183 = _mm256_set1_epi32(183);
   const __m256i k88 = _mm256_set1_epi32(88);
   const __m256i k359 = _mm256_set1_epi32(359);
-  const FastBalancedToneLuts *tone_luts =
-      apply_tone ? &GetFastBalancedToneLuts() : nullptr;
 
   for (int y = 0; y < full_height; ++y) {
     const int yh = std::min(y >> 1, half_height - 1);
@@ -5849,13 +6862,295 @@ CYPERSTEREO_AVX2_TARGET inline void FusedOutputAvx2(
   }
 }
 
+// The 32-pixel YCC-tone output below (default on; =1 restores the 8-block
+// FusedOutputAvx2Paired loop, which is byte-identical).
+inline bool FastOutputYcc32Enabled() {
+  static const bool enabled =
+      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_OUTPUT_YCC32");
+  return enabled;
+}
+
+// YCC-tone output for 32 pixels x 2 rows per step, evaluating the same
+// integer equations as the ycc_tone branch of FusedOutputAvx2Paired.
+// Per-pixel vectors stay in unpack order ([0..7|16..23], [8..15|24..31])
+// from the y8 unpack to the final packus, which restores natural order, so
+// the loop needs no cross-lane permutes; the sixteen blocks of a step are in
+// natural order, one any_clip group per 128-bit lane.  tb/tr use i16 mulhi:
+// ((d << 7) * 2k) >> 16 == (d * k) >> 8 for |d| <= 128.
+CYPERSTEREO_AVX2_TARGET inline void FusedOutputAvx2Ycc32(
+    const cv::Mat &y8, const cv::Mat &a_q16, const cv::Mat &b_q16,
+    const cv::Mat &cr_h, const cv::Mat &cb_h, cv::Mat &color,
+    const FastBalancedToneLuts &luts) {
+  const int full_width = color.cols;
+  const int full_height = color.rows;
+  const int half_height = cr_h.rows;
+  const int quarter_height = a_q16.rows;
+  const auto table = [](const void *p) CYPERSTEREO_AVX2_TARGET {
+    return _mm256_broadcastsi128_si256(
+        _mm_loadu_si128(static_cast<const __m128i *>(p)));
+  };
+  const __m256i tone_base_lo = table(luts.y_tone_base.data());
+  const __m256i tone_base_hi = table(luts.y_tone_base.data() + 16);
+  const __m256i tone_delta_lo = table(luts.y_tone_delta.data());
+  const __m256i tone_delta_hi = table(luts.y_tone_delta.data() + 16);
+  const __m256i gain_base_lo = table(luts.y_gain_base.data());
+  const __m256i gain_base_hi = table(luts.y_gain_base.data() + 16);
+  const __m256i gain_delta_lo = table(luts.y_gain_delta.data());
+  const __m256i gain_delta_hi = table(luts.y_gain_delta.data() + 16);
+  const __m256i clip_base = table(luts.clip_base.data());
+  const __m256i clip_delta = table(luts.clip_delta.data());
+
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i ones = _mm256_set1_epi16(1);
+  const __m256i four = _mm256_set1_epi16(4);
+  const __m256i seven = _mm256_set1_epi16(7);
+  const __m256i c64 = _mm256_set1_epi16(64);
+  const __m256i c128 = _mm256_set1_epi16(128);
+  const __m256i c255 = _mm256_set1_epi16(255);
+  const __m256i c256 = _mm256_set1_epi16(256);
+  const __m256i sign16 = _mm256_set1_epi16(static_cast<short>(0x8000));
+  const __m256i fifteen8 = _mm256_set1_epi8(15);
+  const __m256i k908 = _mm256_set1_epi16(908);
+  const __m256i k718 = _mm256_set1_epi16(718);
+  const __m256i k183_88 = _mm256_set1_epi32((88 << 16) | 183);
+  const __m256i round_y = _mm256_set1_epi32(2048);
+  const __m256i round_block = _mm256_set1_epi32(2);
+  const __m128i lane_on = _mm_set1_epi32(-1);
+  const __m128i lane_off = _mm_setzero_si128();
+
+  // 32-entry byte table at 16-bit indices 0..31, zero-extended: the 0x80
+  // high index byte makes PSHUFB write zero there.
+  const auto lut32 = [&](__m256i lo, __m256i hi, __m256i index16)
+      CYPERSTEREO_AVX2_TARGET {
+    const __m256i index = _mm256_or_si256(index16, sign16);
+    return _mm256_blendv_epi8(_mm256_shuffle_epi8(lo, index),
+                              _mm256_shuffle_epi8(hi, index),
+                              _mm256_cmpgt_epi8(index, fifteen8));
+  };
+
+  constexpr char Z = static_cast<char>(-128);
+  const __m256i bgr_b0 = _mm256_broadcastsi128_si256(
+      _mm_setr_epi8(0, Z, Z, 1, Z, Z, 2, Z, Z, 3, Z, Z, 4, Z, Z, 5));
+  const __m256i bgr_g0 = _mm256_broadcastsi128_si256(
+      _mm_setr_epi8(Z, 0, Z, Z, 1, Z, Z, 2, Z, Z, 3, Z, Z, 4, Z, Z));
+  const __m256i bgr_r0 = _mm256_broadcastsi128_si256(
+      _mm_setr_epi8(Z, Z, 0, Z, Z, 1, Z, Z, 2, Z, Z, 3, Z, Z, 4, Z));
+  const __m256i bgr_b1 = _mm256_broadcastsi128_si256(
+      _mm_setr_epi8(Z, Z, 6, Z, Z, 7, Z, Z, 8, Z, Z, 9, Z, Z, 10, Z));
+  const __m256i bgr_g1 = _mm256_broadcastsi128_si256(
+      _mm_setr_epi8(5, Z, Z, 6, Z, Z, 7, Z, Z, 8, Z, Z, 9, Z, Z, 10));
+  const __m256i bgr_r1 = _mm256_broadcastsi128_si256(
+      _mm_setr_epi8(Z, 5, Z, Z, 6, Z, Z, 7, Z, Z, 8, Z, Z, 9, Z, Z));
+  const __m256i bgr_b2 = _mm256_broadcastsi128_si256(
+      _mm_setr_epi8(Z, 11, Z, Z, 12, Z, Z, 13, Z, Z, 14, Z, Z, 15, Z, Z));
+  const __m256i bgr_g2 = _mm256_broadcastsi128_si256(
+      _mm_setr_epi8(Z, Z, 11, Z, Z, 12, Z, Z, 13, Z, Z, 14, Z, Z, 15, Z));
+  const __m256i bgr_r2 = _mm256_broadcastsi128_si256(
+      _mm_setr_epi8(10, Z, Z, 11, Z, Z, 12, Z, Z, 13, Z, Z, 14, Z, Z, 15));
+  // Both 16-pixel halves are interleaved in-lane, then the six 16-byte
+  // pieces are stored in order with three lane permutes.
+  const auto store_bgr32 = [&](uchar *dst, __m256i blue, __m256i green,
+                               __m256i red) CYPERSTEREO_AVX2_TARGET {
+    const __m256i o0 = _mm256_or_si256(
+        _mm256_or_si256(_mm256_shuffle_epi8(blue, bgr_b0),
+                        _mm256_shuffle_epi8(green, bgr_g0)),
+        _mm256_shuffle_epi8(red, bgr_r0));
+    const __m256i o1 = _mm256_or_si256(
+        _mm256_or_si256(_mm256_shuffle_epi8(blue, bgr_b1),
+                        _mm256_shuffle_epi8(green, bgr_g1)),
+        _mm256_shuffle_epi8(red, bgr_r1));
+    const __m256i o2 = _mm256_or_si256(
+        _mm256_or_si256(_mm256_shuffle_epi8(blue, bgr_b2),
+                        _mm256_shuffle_epi8(green, bgr_g2)),
+        _mm256_shuffle_epi8(red, bgr_r2));
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst),
+                        _mm256_permute2x128_si256(o0, o1, 0x20));
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + 32),
+                        _mm256_permute2x128_si256(o2, o0, 0x30));
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + 64),
+                        _mm256_permute2x128_si256(o1, o2, 0x31));
+  };
+
+  for (int y = 0; y < full_height; y += 2) {
+    const int yh = (std::min)(y >> 1, half_height - 1);
+    const int yq = (std::min)(y >> 2, quarter_height - 1);
+    const uchar *py0 = y8.ptr<uchar>(y);
+    const uchar *py1 = y8.ptr<uchar>(y + 1);
+    uchar *pc0 = color.ptr<uchar>(y);
+    uchar *pc1 = color.ptr<uchar>(y + 1);
+    const ushort *pa = a_q16.ptr<ushort>(yq);
+    const ushort *pb = b_q16.ptr<ushort>(yq);
+    const uchar *pcr = cr_h.ptr<uchar>(yh);
+    const uchar *pcb = cb_h.ptr<uchar>(yh);
+    for (int x0 = 0; x0 < full_width; x0 += 32) {
+      const int xh = x0 >> 1;
+      const int xq = x0 >> 2;
+      // [a,b] pairs of quarter cells [0..3|4..7]; pshufd broadcasts cell k
+      // and k+4 to the four pixels of each unpack-order group.
+      const __m128i a8 =
+          _mm_loadu_si128(reinterpret_cast<const __m128i *>(pa + xq));
+      const __m128i b8 =
+          _mm_loadu_si128(reinterpret_cast<const __m128i *>(pb + xq));
+      const __m256i ab = _mm256_set_m128i(_mm_unpackhi_epi16(a8, b8),
+                                          _mm_unpacklo_epi16(a8, b8));
+      const __m256i ab0 = _mm256_shuffle_epi32(ab, 0x00);
+      const __m256i ab1 = _mm256_shuffle_epi32(ab, 0x55);
+      const __m256i ab2 = _mm256_shuffle_epi32(ab, 0xaa);
+      const __m256i ab3 = _mm256_shuffle_epi32(ab, 0xff);
+      const auto guided = [&](const uchar *py, __m256i &lo, __m256i &hi)
+          CYPERSTEREO_AVX2_TARGET {
+        const __m256i yv =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(py + x0));
+        const __m256i y_lo = _mm256_unpacklo_epi8(yv, zero);
+        const __m256i y_hi = _mm256_unpackhi_epi8(yv, zero);
+        const auto quad = [&](__m256i pairs, __m256i y_pairs)
+            CYPERSTEREO_AVX2_TARGET {
+          return _mm256_srli_epi32(
+              _mm256_add_epi32(_mm256_madd_epi16(pairs, y_pairs), round_y),
+              12);
+        };
+        lo = _mm256_packus_epi32(quad(ab0, _mm256_unpacklo_epi16(y_lo, c256)),
+                                 quad(ab1, _mm256_unpackhi_epi16(y_lo, c256)));
+        hi = _mm256_packus_epi32(quad(ab2, _mm256_unpacklo_epi16(y_hi, c256)),
+                                 quad(ab3, _mm256_unpackhi_epi16(y_hi, c256)));
+      };
+      __m256i yn0_lo, yn0_hi, yn1_lo, yn1_hi;
+      guided(py0, yn0_lo, yn0_hi);
+      guided(py1, yn1_lo, yn1_hi);
+
+      const __m256i dcr = _mm256_sub_epi16(
+          _mm256_cvtepu8_epi16(
+              _mm_loadu_si128(reinterpret_cast<const __m128i *>(pcr + xh))),
+          c128);
+      const __m256i dcb = _mm256_sub_epi16(
+          _mm256_cvtepu8_epi16(
+              _mm_loadu_si128(reinterpret_cast<const __m128i *>(pcb + xh))),
+          c128);
+      const __m256i tb = _mm256_mulhi_epi16(_mm256_slli_epi16(dcb, 7), k908);
+      const __m256i tr = _mm256_mulhi_epi16(_mm256_slli_epi16(dcr, 7), k718);
+      const __m256i tg = _mm256_packs_epi32(
+          _mm256_srai_epi32(
+              _mm256_madd_epi16(_mm256_unpacklo_epi16(dcr, dcb), k183_88), 8),
+          _mm256_srai_epi32(
+              _mm256_madd_epi16(_mm256_unpackhi_epi16(dcr, dcb), k183_88),
+              8));
+
+      const auto block_sum = [&](__m256i row0, __m256i row1)
+          CYPERSTEREO_AVX2_TARGET {
+        return _mm256_srai_epi32(
+            _mm256_add_epi32(
+                _mm256_madd_epi16(_mm256_add_epi16(row0, row1), ones),
+                round_block),
+            2);
+      };
+      const __m256i block_luma = _mm256_min_epi16(
+          _mm256_max_epi16(_mm256_packs_epi32(block_sum(yn0_lo, yn1_lo),
+                                              block_sum(yn0_hi, yn1_hi)),
+                           zero),
+          c255);
+      const __m256i chroma_max = _mm256_max_epi16(
+          tb, _mm256_max_epi16(_mm256_sub_epi16(zero, tg), tr));
+      const __m256i block_max = _mm256_min_epi16(
+          _mm256_max_epi16(_mm256_add_epi16(block_luma, chroma_max), zero),
+          c255);
+      const __m256i seg = _mm256_srli_epi16(block_luma, 3);
+      const __m256i gain_delta = _mm256_srai_epi16(
+          _mm256_slli_epi16(lut32(gain_delta_lo, gain_delta_hi, seg), 8), 8);
+      const __m256i tone_q7 = _mm256_srai_epi16(
+          _mm256_add_epi16(
+              _mm256_add_epi16(
+                  _mm256_slli_epi16(lut32(gain_base_lo, gain_base_hi, seg),
+                                    3),
+                  _mm256_mullo_epi16(gain_delta,
+                                     _mm256_and_si256(block_luma, seven))),
+              four),
+          3);
+      const __m256i over =
+          _mm256_max_epi16(_mm256_sub_epi16(block_max, c128), zero);
+      const __m256i clip_index =
+          _mm256_or_si256(_mm256_srli_epi16(over, 3), sign16);
+      const __m256i clip_q7 = _mm256_srli_epi16(
+          _mm256_add_epi16(
+              _mm256_sub_epi16(
+                  _mm256_slli_epi16(_mm256_shuffle_epi8(clip_base, clip_index),
+                                    3),
+                  _mm256_mullo_epi16(
+                      _mm256_shuffle_epi8(clip_delta, clip_index),
+                      _mm256_and_si256(over, seven))),
+              four),
+          3);
+      const __m256i gain =
+          _mm256_slli_epi16(_mm256_min_epi16(tone_q7, clip_q7), 5);
+      const __m256i clip_binds =
+          _mm256_cmpgt_epi16(_mm256_xor_si256(tone_q7, sign16),
+                             _mm256_xor_si256(clip_q7, sign16));
+      const unsigned bind_bits =
+          static_cast<unsigned>(_mm256_movemask_epi8(clip_binds));
+      const bool clip_lo = (bind_bits & 0xffffu) != 0;
+      const bool clip_hi = (bind_bits >> 16) != 0;
+      const bool any_clip = clip_lo || clip_hi;
+      const __m256i cap_lanes = _mm256_set_m128i(clip_hi ? lane_on : lane_off,
+                                                 clip_lo ? lane_on : lane_off);
+      const __m256i luma_cap = _mm256_blendv_epi8(c256, clip_q7, clip_binds);
+      const __m256i sb = _mm256_mulhrs_epi16(_mm256_slli_epi16(tb, 3), gain);
+      const __m256i sg = _mm256_mulhrs_epi16(_mm256_slli_epi16(tg, 3), gain);
+      const __m256i sr = _mm256_mulhrs_epi16(_mm256_slli_epi16(tr, 3), gain);
+      const __m256i sb_lo = _mm256_unpacklo_epi16(sb, sb);
+      const __m256i sb_hi = _mm256_unpackhi_epi16(sb, sb);
+      const __m256i sg_lo = _mm256_unpacklo_epi16(sg, sg);
+      const __m256i sg_hi = _mm256_unpackhi_epi16(sg, sg);
+      const __m256i sr_lo = _mm256_unpacklo_epi16(sr, sr);
+      const __m256i sr_hi = _mm256_unpackhi_epi16(sr, sr);
+      const __m256i cap_lo = _mm256_unpacklo_epi16(luma_cap, luma_cap);
+      const __m256i cap_hi = _mm256_unpackhi_epi16(luma_cap, luma_cap);
+
+      const auto tone16 = [&](__m256i yn, __m256i cap)
+          CYPERSTEREO_AVX2_TARGET {
+        const __m256i yi = _mm256_min_epi16(_mm256_max_epi16(yn, zero), c255);
+        const __m256i index = _mm256_srli_epi16(yi, 3);
+        __m256i u = _mm256_srli_epi16(
+            _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_slli_epi16(
+                        lut32(tone_base_lo, tone_base_hi, index), 3),
+                    _mm256_mullo_epi16(
+                        lut32(tone_delta_lo, tone_delta_hi, index),
+                        _mm256_and_si256(yi, seven))),
+                four),
+            3);
+        if (any_clip) {
+          const __m256i capped = _mm256_min_epu16(
+              u, _mm256_srli_epi16(
+                     _mm256_add_epi16(_mm256_mullo_epi16(yi, cap), c64), 7));
+          u = _mm256_blendv_epi8(u, capped, cap_lanes);
+        }
+        return u;
+      };
+      const auto tone_row = [&](__m256i yn_lo, __m256i yn_hi, uchar *pc)
+          CYPERSTEREO_AVX2_TARGET {
+        const __m256i u_lo = tone16(yn_lo, cap_lo);
+        const __m256i u_hi = tone16(yn_hi, cap_hi);
+        store_bgr32(pc + 3 * x0,
+                    _mm256_packus_epi16(_mm256_add_epi16(u_lo, sb_lo),
+                                        _mm256_add_epi16(u_hi, sb_hi)),
+                    _mm256_packus_epi16(_mm256_sub_epi16(u_lo, sg_lo),
+                                        _mm256_sub_epi16(u_hi, sg_hi)),
+                    _mm256_packus_epi16(_mm256_add_epi16(u_lo, sr_lo),
+                                        _mm256_add_epi16(u_hi, sr_hi)));
+      };
+      tone_row(yn0_lo, yn0_hi, pc0);
+      tone_row(yn1_lo, yn1_hi, pc1);
+    }
+  }
+}
+
 // Two adjacent full-resolution rows share the same 4:2:0 chroma row and
 // quarter-grid guided coefficients. Compute those terms once per pair while
 // retaining the exact per-row tone and interleaved store equations.
 CYPERSTEREO_AVX2_TARGET inline void FusedOutputAvx2Paired(
     const cv::Mat &y8, const cv::Mat &a_q16, const cv::Mat &b_q16,
     const cv::Mat &cr_h, const cv::Mat &cb_h, cv::Mat &color,
-    bool apply_tone = false) {
+    const FastBalancedToneLuts *tone_luts = nullptr) {
   const int full_width = color.cols;
   const int full_height = color.rows;
   const int half_width = cr_h.cols;
@@ -5873,8 +7168,54 @@ CYPERSTEREO_AVX2_TARGET inline void FusedOutputAvx2Paired(
   const __m256i k150_16 = _mm256_set1_epi16(150);
   const __m256i k77_16 = _mm256_set1_epi16(77);
   const __m256i round128_16 = _mm256_set1_epi16(128);
-  const FastBalancedToneLuts *tone_luts =
-      apply_tone ? &GetFastBalancedToneLuts() : nullptr;
+  const bool ycc_tone = tone_luts && tone_luts->y_tone_segments_ok &&
+                        FastToneYccEnabled();
+  __m128i y_tone_base_lo = _mm_setzero_si128();
+  if (ycc_tone && FastOutputYcc32Enabled() && (full_height & 1) == 0 &&
+      (full_width & 31) == 0 && full_width == 2 * half_width &&
+      full_width == 4 * a_q16.cols) {
+    FusedOutputAvx2Ycc32(y8, a_q16, b_q16, cr_h, cb_h, color, *tone_luts);
+    return;
+  }
+  __m128i y_tone_base_hi = _mm_setzero_si128();
+  __m128i y_tone_delta_lo = _mm_setzero_si128();
+  __m128i y_tone_delta_hi = _mm_setzero_si128();
+  __m128i y_gain_base_lo = _mm_setzero_si128();
+  __m128i y_gain_base_hi = _mm_setzero_si128();
+  __m128i y_gain_delta_lo = _mm_setzero_si128();
+  __m128i y_gain_delta_hi = _mm_setzero_si128();
+  __m128i clip_base = _mm_setzero_si128();
+  __m128i clip_delta = _mm_setzero_si128();
+  if (ycc_tone) {
+    const auto load16 = [](const void *p) {
+      return _mm_loadu_si128(static_cast<const __m128i *>(p));
+    };
+    const uint8_t *tb = tone_luts->y_tone_base.data();
+    const uint8_t *td = tone_luts->y_tone_delta.data();
+    const uint8_t *gb = tone_luts->y_gain_base.data();
+    const int8_t *gd = tone_luts->y_gain_delta.data();
+    y_tone_base_lo = load16(tb);
+    y_tone_base_hi = load16(tb + 16);
+    y_tone_delta_lo = load16(td);
+    y_tone_delta_hi = load16(td + 16);
+    y_gain_base_lo = load16(gb);
+    y_gain_base_hi = load16(gb + 16);
+    y_gain_delta_lo = load16(gd);
+    y_gain_delta_hi = load16(gd + 16);
+    clip_base = load16(tone_luts->clip_base.data());
+    clip_delta = load16(tone_luts->clip_delta.data());
+  }
+  // 32-entry byte table lookup for indices 0..31 (NEON vqtbl2).
+  const auto lut32 = [](__m128i lo, __m128i hi, __m128i index)
+      CYPERSTEREO_AVX2_TARGET {
+    return _mm_blendv_epi8(_mm_shuffle_epi8(lo, index),
+                           _mm_shuffle_epi8(hi, index),
+                           _mm_cmpgt_epi8(index, _mm_set1_epi8(15)));
+  };
+  const auto repeat2 = [](__m128i v) CYPERSTEREO_AVX2_TARGET {
+    return _mm256_set_m128i(_mm_unpackhi_epi16(v, v),
+                            _mm_unpacklo_epi16(v, v));
+  };
 
   const int paired_height = full_height & ~1;
   for (int y = 0; y < paired_height; y += 2) {
@@ -5947,14 +7288,126 @@ CYPERSTEREO_AVX2_TARGET inline void FusedOutputAvx2Paired(
           _mm256_cvtepu8_epi32(
               _mm_loadl_epi64(reinterpret_cast<const __m128i *>(pcb + xh))),
           c128_32);
-      const __m256i tb16 = PackAndRepeat2Avx2(_mm256_srai_epi32(
-          _mm256_mullo_epi32(dcb, k454), 8));
-      const __m256i tg16 = PackAndRepeat2Avx2(_mm256_srai_epi32(
+      const __m256i tb32 = _mm256_srai_epi32(_mm256_mullo_epi32(dcb, k454), 8);
+      const __m256i tg32 = _mm256_srai_epi32(
           _mm256_add_epi32(_mm256_mullo_epi32(dcr, k183),
                            _mm256_mullo_epi32(dcb, k88)),
-          8));
-      const __m256i tr16 = PackAndRepeat2Avx2(_mm256_srai_epi32(
-          _mm256_mullo_epi32(dcr, k359), 8));
+          8);
+      const __m256i tr32 = _mm256_srai_epi32(_mm256_mullo_epi32(dcr, k359), 8);
+
+      if (ycc_tone) {
+        // Lane-for-lane port of the FusedOutputNeon YCC branch: eight 2x2
+        // blocks per step, and the luma clip cap is enabled per eight-block
+        // group exactly like its any_clip test.
+        const auto pack8 = [](__m256i v32) CYPERSTEREO_AVX2_TARGET {
+          return _mm_packs_epi32(_mm256_castsi256_si128(v32),
+                                 _mm256_extracti128_si256(v32, 1));
+        };
+        const __m128i zero8 = _mm_setzero_si128();
+        const __m128i max255_8 = _mm_set1_epi16(255);
+        const __m128i seven8 = _mm_set1_epi16(7);
+        const __m128i tb8 = pack8(tb32);
+        const __m128i tg8 = pack8(tg32);
+        const __m128i tr8 = pack8(tr32);
+        const __m256i pair_sum = _mm256_madd_epi16(
+            _mm256_add_epi16(yn16_0, yn16_1), _mm256_set1_epi16(1));
+        const __m128i block_luma = _mm_min_epi16(
+            _mm_max_epi16(pack8(_mm256_srai_epi32(
+                              _mm256_add_epi32(pair_sum,
+                                               _mm256_set1_epi32(2)),
+                              2)),
+                          zero8),
+            max255_8);
+        const __m128i chroma_max = _mm_max_epi16(
+            tb8, _mm_max_epi16(_mm_sub_epi16(zero8, tg8), tr8));
+        const __m128i block_max = _mm_min_epi16(
+            _mm_max_epi16(_mm_add_epi16(block_luma, chroma_max), zero8),
+            max255_8);
+        const __m128i seg = _mm_packus_epi16(_mm_srli_epi16(block_luma, 3),
+                                             zero8);
+        const __m128i tone_q7 = _mm_srai_epi16(
+            _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_slli_epi16(_mm_cvtepu8_epi16(lut32(
+                                       y_gain_base_lo, y_gain_base_hi, seg)),
+                                   3),
+                    _mm_mullo_epi16(
+                        _mm_cvtepi8_epi16(lut32(y_gain_delta_lo,
+                                                y_gain_delta_hi, seg)),
+                        _mm_and_si128(block_luma, seven8))),
+                _mm_set1_epi16(4)),
+            3);
+        const __m128i over = _mm_max_epi16(
+            _mm_sub_epi16(block_max, _mm_set1_epi16(128)), zero8);
+        const __m128i clip_seg =
+            _mm_packus_epi16(_mm_srli_epi16(over, 3), zero8);
+        const __m128i clip_q7 = _mm_srli_epi16(
+            _mm_add_epi16(
+                _mm_sub_epi16(
+                    _mm_slli_epi16(_mm_cvtepu8_epi16(
+                                       _mm_shuffle_epi8(clip_base, clip_seg)),
+                                   3),
+                    _mm_mullo_epi16(_mm_cvtepu8_epi16(_mm_shuffle_epi8(
+                                        clip_delta, clip_seg)),
+                                    _mm_and_si128(over, seven8))),
+                _mm_set1_epi16(4)),
+            3);
+        const __m128i gain =
+            _mm_slli_epi16(_mm_min_epi16(tone_q7, clip_q7), 5);
+        const __m128i sign16 = _mm_set1_epi16(static_cast<short>(0x8000));
+        const __m128i clip_binds =
+            _mm_cmpgt_epi16(_mm_xor_si128(tone_q7, sign16),
+                            _mm_xor_si128(clip_q7, sign16));
+        const bool any_clip = _mm_movemask_epi8(clip_binds) != 0;
+        const __m256i luma_cap = repeat2(
+            _mm_blendv_epi8(_mm_set1_epi16(256), clip_q7, clip_binds));
+        // mulhrs(8 * t, gain) = round(t * gain / 4096), as NEON SQRDMULH.
+        const __m256i sb = repeat2(_mm_mulhrs_epi16(_mm_slli_epi16(tb8, 3), gain));
+        const __m256i sg = repeat2(_mm_mulhrs_epi16(_mm_slli_epi16(tg8, 3), gain));
+        const __m256i sr = repeat2(_mm_mulhrs_epi16(_mm_slli_epi16(tr8, 3), gain));
+        const auto pack_u8 = [](__m256i v) CYPERSTEREO_AVX2_TARGET {
+          return _mm_packus_epi16(_mm256_castsi256_si128(v),
+                                  _mm256_extracti128_si256(v, 1));
+        };
+        const auto tone_row = [&](__m256i yn16, uchar *pc)
+            CYPERSTEREO_AVX2_TARGET {
+          const __m256i yi16 = _mm256_min_epi16(
+              _mm256_max_epi16(yn16, zero16), max255_16);
+          const __m128i yi = pack_u8(yi16);
+          const __m128i s8 = _mm_and_si128(_mm_srli_epi16(yi, 3),
+                                           _mm_set1_epi8(0x1f));
+          const __m256i base16 = _mm256_cvtepu8_epi16(
+              lut32(y_tone_base_lo, y_tone_base_hi, s8));
+          const __m256i delta16 = _mm256_cvtepu8_epi16(
+              lut32(y_tone_delta_lo, y_tone_delta_hi, s8));
+          __m256i u = _mm256_srli_epi16(
+              _mm256_add_epi16(
+                  _mm256_add_epi16(
+                      _mm256_slli_epi16(base16, 3),
+                      _mm256_mullo_epi16(
+                          delta16,
+                          _mm256_and_si256(yi16, _mm256_set1_epi16(7)))),
+                  _mm256_set1_epi16(4)),
+              3);
+          if (any_clip)
+            u = _mm256_min_epu16(
+                u, _mm256_srli_epi16(
+                       _mm256_add_epi16(_mm256_mullo_epi16(yi16, luma_cap),
+                                        _mm256_set1_epi16(64)),
+                       7));
+          FastOutputStoreBgr16Avx2(pc + 3 * x0,
+                                   pack_u8(_mm256_add_epi16(u, sb)),
+                                   pack_u8(_mm256_sub_epi16(u, sg)),
+                                   pack_u8(_mm256_add_epi16(u, sr)));
+        };
+        tone_row(yn16_0, pc0);
+        tone_row(yn16_1, pc1);
+        continue;
+      }
+
+      const __m256i tb16 = PackAndRepeat2Avx2(tb32);
+      const __m256i tg16 = PackAndRepeat2Avx2(tg32);
+      const __m256i tr16 = PackAndRepeat2Avx2(tr32);
 
       const auto emit_row = [&](const __m256i yn16, uchar *pc)
           CYPERSTEREO_AVX2_TARGET {
@@ -6000,18 +7453,17 @@ CYPERSTEREO_AVX2_TARGET inline void FusedOutputAvx2Paired(
               _mm256_i32gather_epi32(clip_table, max_hi, 4));
           const __m256i gain16 = _mm256_permute4x64_epi64(
               _mm256_packus_epi32(gain_lo, gain_hi), 0xd8);
-          // mulhrs performs the same rounded Q12 product after scaling the
-          // gain by eight. The current effective gains are 0 or 4096..5958;
-          // adding 2*value exactly compensates their signed high-bit wrap.
-          const __m256i gain_scale = _mm256_slli_epi16(gain16, 3);
-          const __m256i gain_scale_wrapped =
-              _mm256_cmpgt_epi16(zero16, gain_scale);
+          // (value * gain + 2048) >> 12, evaluated as
+          // ((value << 4) * gain + 32768) >> 16: mulhi supplies the quotient
+          // and bit 15 of the low half is the rounding carry. A signed Q15
+          // mulhrs would be cheaper but only tolerates gains below 12288,
+          // and the filmic curve reaches 3.5x (14336) in the deep shadows.
           const auto tone_channel = [&](const __m256i value)
               CYPERSTEREO_AVX2_TARGET {
+            const __m256i scaled = _mm256_slli_epi16(value, 4);
             return _mm256_add_epi16(
-                _mm256_mulhrs_epi16(value, gain_scale),
-                _mm256_and_si256(_mm256_slli_epi16(value, 1),
-                                 gain_scale_wrapped));
+                _mm256_mulhi_epu16(scaled, gain16),
+                _mm256_srli_epi16(_mm256_mullo_epi16(scaled, gain16), 15));
           };
           const __m256i toned_b = tone_channel(b_clipped);
           const __m256i toned_g = tone_channel(g_clipped);
@@ -6104,6 +7556,486 @@ inline bool UseNeonOutput() {
   return enabled;
 }
 
+#if defined(__aarch64__)
+// Standalone row-pair YCC-tone kernel (default on; =1 restores the inline
+// lambda branch of FusedOutputNeon, which is byte-identical).
+inline bool FastNeonYccRowEnabled() {
+  static const bool enabled =
+      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_YCC_ROW");
+  return enabled;
+}
+
+inline bool FastNeonYccAsmEnabled() {
+  static const bool enabled =
+      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_YCC_ASM");
+  return enabled;
+}
+
+// GCC 9 lowers vget_low_* operands, vcombine and the narrow + *_high pairs
+// with extra d-register moves, and copies vst3q_u8 operands into a fresh
+// register triple. These single-purpose asm forms avoid both.
+inline uint8x16_t FastNeonQmovunPair(int16x8_t lo, int16x8_t hi) {
+  uint8x16_t r;
+  __asm__("sqxtun %0.8b, %1.8h\n\tsqxtun2 %0.16b, %2.8h"
+          : "=&w"(r)
+          : "w"(lo), "w"(hi));
+  return r;
+}
+
+inline uint16x8_t FastNeonRshrn12Pair(uint32x4_t lo, uint32x4_t hi) {
+  uint16x8_t r;
+  __asm__("rshrn %0.4h, %1.4s, #12\n\trshrn2 %0.8h, %2.4s, #12"
+          : "=&w"(r)
+          : "w"(lo), "w"(hi));
+  return r;
+}
+
+inline uint8x16_t FastNeonRshrn3Pair(uint16x8_t lo, uint16x8_t hi) {
+  uint8x16_t r;
+  __asm__("rshrn %0.8b, %1.8h, #3\n\trshrn2 %0.16b, %2.8h, #3"
+          : "=&w"(r)
+          : "w"(lo), "w"(hi));
+  return r;
+}
+
+inline uint8x16_t FastNeonUqrshrn7Pair(uint16x8_t lo, uint16x8_t hi) {
+  uint8x16_t r;
+  __asm__("uqrshrn %0.8b, %1.8h, #7\n\tuqrshrn2 %0.16b, %2.8h, #7"
+          : "=&w"(r)
+          : "w"(lo), "w"(hi));
+  return r;
+}
+
+// acc + y[0..3] * a[lane]
+#define CYPERSTEREO_NEON_UMLAL_LO_LANE(L)                                    \
+  inline uint32x4_t FastNeonUmlalLoLane##L(uint32x4_t acc, uint16x8_t y,     \
+                                           uint16x4_t a) {                   \
+    __asm__("umlal %0.4s, %1.4h, %2.h[" #L "]" : "+w"(acc) : "w"(y), "x"(a)); \
+    return acc;                                                              \
+  }
+CYPERSTEREO_NEON_UMLAL_LO_LANE(0)
+CYPERSTEREO_NEON_UMLAL_LO_LANE(2)
+#undef CYPERSTEREO_NEON_UMLAL_LO_LANE
+
+inline uint16x8_t FastNeonUmullLo(uint8x16_t a, uint8x16_t b) {
+  uint16x8_t r;
+  __asm__("umull %0.8h, %1.8b, %2.8b" : "=w"(r) : "w"(a), "w"(b));
+  return r;
+}
+
+inline uint16x8_t FastNeonUxtlLo(uint8x16_t v) {
+  uint16x8_t r;
+  __asm__("uxtl %0.8h, %1.8b" : "=w"(r) : "w"(v));
+  return r;
+}
+
+// sat_u8 of eight s16 lanes with each byte doubled: [p0 p0 p1 p1 .. p7 p7].
+inline uint8x16_t FastNeonSatDup(int16x8_t v) {
+  uint8x16_t r;
+  __asm__("sqxtun %0.8b, %1.8h\n\tzip1 %0.16b, %0.16b, %0.16b"
+          : "=&w"(r)
+          : "w"(v));
+  return r;
+}
+
+// out_c = uqsub(uqadd(u, p_c), n_c) for B/G/R, then ST3 of 16 pixels.
+inline void FastNeonStoreBgrU8(uchar *dst, uint8x16_t u, uint8x16_t bp,
+                               uint8x16_t bn, uint8x16_t gp, uint8x16_t gn,
+                               uint8x16_t rp, uint8x16_t rn) {
+  uint8x16x3_t t;
+  __asm__("uqadd %S1.16b, %3.16b, %4.16b\n\t"
+          "uqadd %T1.16b, %3.16b, %6.16b\n\t"
+          "uqadd %U1.16b, %3.16b, %8.16b\n\t"
+          "uqsub %S1.16b, %S1.16b, %5.16b\n\t"
+          "uqsub %T1.16b, %T1.16b, %7.16b\n\t"
+          "uqsub %U1.16b, %U1.16b, %9.16b\n\t"
+          "st3 {%S1.16b - %U1.16b}, [%2]"
+          : "=m"(*reinterpret_cast<uchar(*)[48]>(dst)), "=&w"(t)
+          : "r"(dst), "w"(u), "w"(bp), "w"(bn), "w"(gp), "w"(gn), "w"(rp),
+            "w"(rn));
+}
+
+// Same results as the ycc_tone branch of FusedOutputNeon for the 8-aligned
+// part of one row pair; returns the first unprocessed half-res column.
+// A separate function with __restrict outputs keeps the loop state in
+// registers: inside the row lambda every byte store may alias the
+// by-reference captures, so GCC reloads them each step. The per-pixel tail
+// runs in u8: the segment tone 8*base + delta*f rounds to
+// base + ((delta*f + 4) >> 3) <= 255, the luma cap saturates to 255 before
+// the min, and sat(u + s) == uqsub(uqadd(u, sat(s)), sat(-s)).
+static __attribute__((noinline)) int FusedOutputNeonYccRowPair(
+    const uchar *__restrict py0, const uchar *__restrict py1,
+    const ushort *__restrict pa, const ushort *__restrict pb,
+    const uchar *__restrict pcr, const uchar *__restrict pcb,
+    uchar *__restrict pc0, uchar *__restrict pc1, int half_width,
+    const FastBalancedToneLuts &luts) {
+  // The tables are re-read from L1 at each use with one two-register LD1:
+  // held across the loop they spill and get copied into consecutive pairs.
+  // The empty asm makes the pointers opaque so GCC cannot hoist the loads.
+  const uint8_t *tone_base_ptr = luts.y_tone_base.data();
+  const uint8_t *tone_delta_ptr = luts.y_tone_delta.data();
+  const uint8_t *gain_base_ptr = luts.y_gain_base.data();
+  const uint8_t *gain_delta_ptr =
+      reinterpret_cast<const uint8_t *>(luts.y_gain_delta.data());
+  const uint8_t *clip_base_ptr = luts.clip_base.data();
+  const uint8_t *clip_delta_ptr = luts.clip_delta.data();
+  const uint8x16_t c7 = vdupq_n_u8(7);
+  const uint8x8_t c128_8 = vdup_n_u8(128);
+  const uint16x4_t c256_4 = vdup_n_u16(256);
+  const uint16x8_t c256 = vdupq_n_u16(256);
+
+  int xh = 0;
+  for (; xh + 8 <= half_width; xh += 8) {
+    __asm__("" : "+r"(tone_base_ptr), "+r"(tone_delta_ptr),
+            "+r"(gain_base_ptr), "+r"(gain_delta_ptr), "+r"(clip_base_ptr),
+            "+r"(clip_delta_ptr));
+    const int x0 = xh << 1;
+    const int xq = xh >> 1;
+    const uint16x4_t a4 = vld1_u16(pa + xq);
+    const uint16x4_t b4 = vld1_u16(pb + xq);
+    const uint32x4_t b0_lo = vmull_lane_u16(c256_4, b4, 0);
+    const uint32x4_t b0_hi = vmull_lane_u16(c256_4, b4, 1);
+    const uint32x4_t b1_lo = vmull_lane_u16(c256_4, b4, 2);
+    const uint32x4_t b1_hi = vmull_lane_u16(c256_4, b4, 3);
+
+    // (cr - 128) by a wrapping widening subtract; the 454/256 and 359/256
+    // floors as SQDMULH((d << 7), k) = (d * k) >> 8 for |d| <= 128.
+    const int16x8_t dcr =
+        vreinterpretq_s16_u16(vsubl_u8(vld1_u8(pcr + xh), c128_8));
+    const int16x8_t dcb =
+        vreinterpretq_s16_u16(vsubl_u8(vld1_u8(pcb + xh), c128_8));
+    const int16x8_t tb = vqdmulhq_n_s16(vshlq_n_s16(dcb, 7), 454);
+    const int16x8_t tr = vqdmulhq_n_s16(vshlq_n_s16(dcr, 7), 359);
+    const int16x8_t tg = vaddq_s16(
+        dcr, vshrq_n_s16(vmlaq_n_s16(vmulq_n_s16(dcr, -73), dcb, 88), 8));
+
+    const auto luma_row = [&](const uchar *py, int16x8_t &l0, int16x8_t &l1) {
+      const uint8x16_t yv = vld1q_u8(py + x0);
+      const uint16x8_t y0 = FastNeonUxtlLo(yv);
+      const uint16x8_t y1 = vmovl_high_u8(yv);
+      l0 = vreinterpretq_s16_u16(FastNeonRshrn12Pair(
+          FastNeonUmlalLoLane0(b0_lo, y0, a4),
+          vmlal_high_lane_u16(b0_hi, y0, a4, 1)));
+      l1 = vreinterpretq_s16_u16(FastNeonRshrn12Pair(
+          FastNeonUmlalLoLane2(b1_lo, y1, a4),
+          vmlal_high_lane_u16(b1_hi, y1, a4, 3)));
+    };
+    int16x8_t l00, l01, l10, l11;
+    luma_row(py0, l00, l01);
+    luma_row(py1, l10, l11);
+
+    const uint8x8_t block_luma = vqmovun_s16(vrshrq_n_s16(
+        vpaddq_s16(vaddq_s16(l00, l10), vaddq_s16(l01, l11)), 2));
+    const int16x8_t chroma_max = vmaxq_s16(tb, vmaxq_s16(vnegq_s16(tg), tr));
+    const uint8x8_t block_max = vqmovun_s16(
+        vaddq_s16(vreinterpretq_s16_u16(vmovl_u8(block_luma)), chroma_max));
+    const uint8x8_t seg = vshr_n_u8(block_luma, 3);
+    const int16x8_t tone_q7 = vrshrq_n_s16(
+        vmlal_s8(vreinterpretq_s16_u16(vshll_n_u8(
+                     vqtbl2_u8(vld1q_u8_x2(gain_base_ptr), seg), 3)),
+                 vreinterpret_s8_u8(
+                     vqtbl2_u8(vld1q_u8_x2(gain_delta_ptr), seg)),
+                 vreinterpret_s8_u8(vand_u8(block_luma, vget_low_u8(c7)))),
+        3);
+    const uint8x8_t over = vqsub_u8(block_max, c128_8);
+    const uint8x8_t clip_seg = vshr_n_u8(over, 3);
+    const uint16x8_t clip_q7 = vrshrq_n_u16(
+        vmlsl_u8(vshll_n_u8(vqtbl1_u8(vld1q_u8(clip_base_ptr), clip_seg), 3),
+                 vqtbl1_u8(vld1q_u8(clip_delta_ptr), clip_seg),
+                 vand_u8(over, vget_low_u8(c7))),
+        3);
+    const int16x8_t gain =
+        vshlq_n_s16(vminq_s16(tone_q7, vreinterpretq_s16_u16(clip_q7)), 5);
+    const uint16x8_t clip_binds =
+        vcltq_u16(clip_q7, vreinterpretq_u16_s16(tone_q7));
+    const bool any_clip = vmaxvq_u16(clip_binds) != 0;
+    const int16x8_t sb = vqrdmulhq_s16(vshlq_n_s16(tb, 3), gain);
+    const int16x8_t sg = vqrdmulhq_s16(vshlq_n_s16(tg, 3), gain);
+    const int16x8_t sr = vqrdmulhq_s16(vshlq_n_s16(tr, 3), gain);
+    const uint8x16_t bp = FastNeonSatDup(sb);
+    const uint8x16_t bn = FastNeonSatDup(vnegq_s16(sb));
+    const uint8x16_t gp = FastNeonSatDup(vnegq_s16(sg));
+    const uint8x16_t gn = FastNeonSatDup(sg);
+    const uint8x16_t rp = FastNeonSatDup(sr);
+    const uint8x16_t rn = FastNeonSatDup(vnegq_s16(sr));
+
+    const auto tone_row = [&](int16x8_t l0, int16x8_t l1, uchar *pc) {
+      const uint8x16_t yi = FastNeonQmovunPair(l0, l1);
+      const uint8x16_t s = vshrq_n_u8(yi, 3);
+      const uint8x16_t f = vandq_u8(yi, c7);
+      const uint8x16_t base = vqtbl2q_u8(vld1q_u8_x2(tone_base_ptr), s);
+      const uint8x16_t delta = vqtbl2q_u8(vld1q_u8_x2(tone_delta_ptr), s);
+      uint8x16_t u = vaddq_u8(base, FastNeonRshrn3Pair(
+                                        FastNeonUmullLo(delta, f),
+                                        vmull_high_u8(delta, f)));
+      if (any_clip) {
+        // Where the clip binds, cap luma at y * clip; 256 (2x) elsewhere.
+        const uint16x8_t luma_cap = vbslq_u16(clip_binds, clip_q7, c256);
+        u = vminq_u8(u, FastNeonUqrshrn7Pair(
+                            vmulq_u16(FastNeonUxtlLo(yi),
+                                      vzip1q_u16(luma_cap, luma_cap)),
+                            vmulq_u16(vmovl_high_u8(yi),
+                                      vzip2q_u16(luma_cap, luma_cap))));
+      }
+      FastNeonStoreBgrU8(pc + 3 * x0, u, bp, bn, gp, gn, rp, rn);
+    };
+    tone_row(l00, l01, pc0);
+    tone_row(l10, l11, pc1);
+  }
+  return xh;
+}
+// FusedOutputNeonYccRowPair as hand-scheduled asm in two passes over
+// chunks of 8-column blocks. One fused loop is latency-bound on A78: the
+// luma -> block gain -> chroma offset chain is ~70 cycles deep in a ~160
+// instruction iteration, which the out-of-order window cannot overlap.
+// Pass A (luma, chroma, gain, clip) writes per block to an L1 scratch:
+// yi0 q, yi1 q, bp bn gp gn rp rn (8 B each), luma cap 8h; flags[k] != 0
+// where a clip binds. Pass B (tone, clip cap, BGR store) is short. Same
+// operations and order per lane, so the output is byte-identical. A whole
+// row pair per chunk measured fastest on Orin (smaller chunks: 0-10% slower).
+// Registers: v26-v31 / v22-v25 tables, v19 = 256.h, v20 = 128.b,
+// v21 = 7.b, v15 = by-element constants (must be v0-v15).
+static __attribute__((noinline)) void FusedOutputNeonYccPassAAsm(
+    const uchar *py0, const uchar *py1, const ushort *pa, const ushort *pb,
+    const uchar *pcr, const uchar *pcb, uchar *scr, uchar *flags,
+    int64_t blocks, const FastBalancedToneLuts &luts) {
+  static const int16_t kConstants[8] = {454, 359, -73, 88, 0, 0, 0, 0};
+  uint64_t any_clip;
+  __asm__ volatile(
+      "ld1 {v26.16b, v27.16b}, [%[gain_base]]\n\t"
+      "ld1 {v28.16b, v29.16b}, [%[gain_delta]]\n\t"
+      "ldr q30, [%[clip_base]]\n\t"
+      "ldr q31, [%[clip_delta]]\n\t"
+      "ldr q15, [%[constants]]\n\t"
+      "movi v19.8h, #1, lsl #8\n\t"
+      "movi v20.16b, #128\n\t"
+      "movi v21.16b, #7\n\t"
+      "1:\n\t"
+      "ldr d0, [%[pa]], #8\n\t"
+      "ldr d1, [%[pb]], #8\n\t"
+      "ldr q8, [%[py0]], #16\n\t"
+      "ldr q9, [%[py1]], #16\n\t"
+      "ldr d2, [%[pcr]], #8\n\t"
+      "ldr d3, [%[pcb]], #8\n\t"
+      "umull v4.4s, v19.4h, v1.h[0]\n\t"
+      "umull v5.4s, v19.4h, v1.h[1]\n\t"
+      "umull v6.4s, v19.4h, v1.h[2]\n\t"
+      "umull v7.4s, v19.4h, v1.h[3]\n\t"
+      "uxtl v10.8h, v8.8b\n\t"
+      "uxtl2 v11.8h, v8.16b\n\t"
+      "umull v12.4s, v10.4h, v0.h[0]\n\t"
+      "umull2 v13.4s, v10.8h, v0.h[1]\n\t"
+      "add v12.4s, v12.4s, v4.4s\n\t"
+      "add v13.4s, v13.4s, v5.4s\n\t"
+      "rshrn v14.4h, v12.4s, #12\n\t"
+      "rshrn2 v14.8h, v13.4s, #12\n\t"
+      "umull v12.4s, v11.4h, v0.h[2]\n\t"
+      "umull2 v13.4s, v11.8h, v0.h[3]\n\t"
+      "add v12.4s, v12.4s, v6.4s\n\t"
+      "add v13.4s, v13.4s, v7.4s\n\t"
+      "rshrn v16.4h, v12.4s, #12\n\t"
+      "rshrn2 v16.8h, v13.4s, #12\n\t"
+      "uxtl v10.8h, v9.8b\n\t"
+      "uxtl2 v11.8h, v9.16b\n\t"
+      "umull v12.4s, v10.4h, v0.h[0]\n\t"
+      "umull2 v13.4s, v10.8h, v0.h[1]\n\t"
+      "add v12.4s, v12.4s, v4.4s\n\t"
+      "add v13.4s, v13.4s, v5.4s\n\t"
+      "rshrn v17.4h, v12.4s, #12\n\t"
+      "rshrn2 v17.8h, v13.4s, #12\n\t"
+      "umull v12.4s, v11.4h, v0.h[2]\n\t"
+      "umull2 v13.4s, v11.8h, v0.h[3]\n\t"
+      "add v12.4s, v12.4s, v6.4s\n\t"
+      "add v13.4s, v13.4s, v7.4s\n\t"
+      "rshrn v18.4h, v12.4s, #12\n\t"
+      "rshrn2 v18.8h, v13.4s, #12\n\t"
+      "add v10.8h, v14.8h, v17.8h\n\t"
+      "add v11.8h, v16.8h, v18.8h\n\t"
+      "addp v10.8h, v10.8h, v11.8h\n\t"
+      "srshr v10.8h, v10.8h, #2\n\t"
+      "sqxtun v10.8b, v10.8h\n\t"
+      "sqxtun v8.8b, v14.8h\n\t"
+      "sqxtun2 v8.16b, v16.8h\n\t"
+      "sqxtun v9.8b, v17.8h\n\t"
+      "sqxtun2 v9.16b, v18.8h\n\t"
+      "stp q8, q9, [%[scr]]\n\t"
+      "usubl v2.8h, v2.8b, v20.8b\n\t"
+      "usubl v3.8h, v3.8b, v20.8b\n\t"
+      "shl v4.8h, v3.8h, #7\n\t"
+      "sqdmulh v4.8h, v4.8h, v15.h[0]\n\t"
+      "shl v5.8h, v2.8h, #7\n\t"
+      "sqdmulh v5.8h, v5.8h, v15.h[1]\n\t"
+      "mul v6.8h, v2.8h, v15.h[2]\n\t"
+      "mla v6.8h, v3.8h, v15.h[3]\n\t"
+      "sshr v6.8h, v6.8h, #8\n\t"
+      "add v6.8h, v6.8h, v2.8h\n\t"
+      "neg v7.8h, v6.8h\n\t"
+      "smax v7.8h, v7.8h, v5.8h\n\t"
+      "smax v7.8h, v4.8h, v7.8h\n\t"
+      "uxtl v11.8h, v10.8b\n\t"
+      "add v11.8h, v11.8h, v7.8h\n\t"
+      "sqxtun v11.8b, v11.8h\n\t"
+      "ushr v12.8b, v10.8b, #3\n\t"
+      "tbl v13.8b, {v26.16b, v27.16b}, v12.8b\n\t"
+      "tbl v17.8b, {v28.16b, v29.16b}, v12.8b\n\t"
+      "and v18.8b, v10.8b, v21.8b\n\t"
+      "ushll v13.8h, v13.8b, #3\n\t"
+      "smlal v13.8h, v17.8b, v18.8b\n\t"
+      "srshr v13.8h, v13.8h, #3\n\t"
+      "uqsub v11.8b, v11.8b, v20.8b\n\t"
+      "ushr v12.8b, v11.8b, #3\n\t"
+      "tbl v17.8b, {v30.16b}, v12.8b\n\t"
+      "tbl v18.8b, {v31.16b}, v12.8b\n\t"
+      "and v11.8b, v11.8b, v21.8b\n\t"
+      "ushll v17.8h, v17.8b, #3\n\t"
+      "umlsl v17.8h, v18.8b, v11.8b\n\t"
+      "urshr v17.8h, v17.8h, #3\n\t"
+      "smin v18.8h, v13.8h, v17.8h\n\t"
+      "shl v18.8h, v18.8h, #5\n\t"
+      "cmhi v12.8h, v13.8h, v17.8h\n\t"
+      "umaxv h10, v12.8h\n\t"
+      "bsl v12.16b, v17.16b, v19.16b\n\t"
+      "str q12, [%[scr], #80]\n\t"
+      "umov %w[any_clip], v10.h[0]\n\t"
+      "strb %w[any_clip], [%[flags]], #1\n\t"
+      "shl v4.8h, v4.8h, #3\n\t"
+      "sqrdmulh v4.8h, v4.8h, v18.8h\n\t"
+      "shl v6.8h, v6.8h, #3\n\t"
+      "sqrdmulh v6.8h, v6.8h, v18.8h\n\t"
+      "shl v5.8h, v5.8h, #3\n\t"
+      "sqrdmulh v5.8h, v5.8h, v18.8h\n\t"
+      "sqxtun v0.8b, v4.8h\n\t"
+      "neg v4.8h, v4.8h\n\t"
+      "sqxtun v1.8b, v4.8h\n\t"
+      "sqxtun v3.8b, v6.8h\n\t"
+      "neg v6.8h, v6.8h\n\t"
+      "sqxtun v2.8b, v6.8h\n\t"
+      "sqxtun v4.8b, v5.8h\n\t"
+      "neg v5.8h, v5.8h\n\t"
+      "sqxtun v5.8b, v5.8h\n\t"
+      "stp d0, d1, [%[scr], #32]\n\t"
+      "stp d2, d3, [%[scr], #48]\n\t"
+      "stp d4, d5, [%[scr], #64]\n\t"
+      "add %[scr], %[scr], #96\n\t"
+      "subs %[blocks], %[blocks], #1\n\t"
+      "b.ne 1b\n\t"
+      : [py0] "+r"(py0), [py1] "+r"(py1), [pa] "+r"(pa), [pb] "+r"(pb),
+        [pcr] "+r"(pcr), [pcb] "+r"(pcb), [scr] "+r"(scr), [flags] "+r"(flags),
+        [blocks] "+r"(blocks), [any_clip] "=&r"(any_clip)
+      : [gain_base] "r"(luts.y_gain_base.data()),
+        [gain_delta] "r"(luts.y_gain_delta.data()),
+        [clip_base] "r"(luts.clip_base.data()),
+        [clip_delta] "r"(luts.clip_delta.data()),
+        [constants] "r"(kConstants)
+      : "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
+        "v21", "v26", "v27", "v28", "v29", "v30", "v31", "cc", "memory");
+}
+
+static __attribute__((noinline)) void FusedOutputNeonYccPassBAsm(
+    const uchar *scr, const uchar *flags, uchar *pc0, uchar *pc1,
+    int64_t blocks, const FastBalancedToneLuts &luts) {
+  uint64_t any_clip;
+  __asm__ volatile(
+      "ld1 {v22.16b, v23.16b}, [%[tone_base]]\n\t"
+      "ld1 {v24.16b, v25.16b}, [%[tone_delta]]\n\t"
+      "movi v21.16b, #7\n\t"
+      "1:\n\t"
+      "ldp q8, q9, [%[scr]]\n\t"
+      "ldp d0, d1, [%[scr], #32]\n\t"
+      "ldp d2, d3, [%[scr], #48]\n\t"
+      "ldp d4, d5, [%[scr], #64]\n\t"
+      "ldrb %w[any_clip], [%[flags]], #1\n\t"
+      "ushr v11.16b, v8.16b, #3\n\t"
+      "and v12.16b, v8.16b, v21.16b\n\t"
+      "tbl v14.16b, {v22.16b, v23.16b}, v11.16b\n\t"
+      "tbl v13.16b, {v24.16b, v25.16b}, v11.16b\n\t"
+      "umull v11.8h, v13.8b, v12.8b\n\t"
+      "umull2 v13.8h, v13.16b, v12.16b\n\t"
+      "rshrn v11.8b, v11.8h, #3\n\t"
+      "rshrn2 v11.16b, v13.8h, #3\n\t"
+      "add v14.16b, v14.16b, v11.16b\n\t"
+      "ushr v11.16b, v9.16b, #3\n\t"
+      "and v12.16b, v9.16b, v21.16b\n\t"
+      "tbl v16.16b, {v22.16b, v23.16b}, v11.16b\n\t"
+      "tbl v13.16b, {v24.16b, v25.16b}, v11.16b\n\t"
+      "umull v11.8h, v13.8b, v12.8b\n\t"
+      "umull2 v13.8h, v13.16b, v12.16b\n\t"
+      "rshrn v11.8b, v11.8h, #3\n\t"
+      "rshrn2 v11.16b, v13.8h, #3\n\t"
+      "add v16.16b, v16.16b, v11.16b\n\t"
+      "zip1 v0.16b, v0.16b, v0.16b\n\t"
+      "zip1 v1.16b, v1.16b, v1.16b\n\t"
+      "zip1 v2.16b, v2.16b, v2.16b\n\t"
+      "zip1 v3.16b, v3.16b, v3.16b\n\t"
+      "zip1 v4.16b, v4.16b, v4.16b\n\t"
+      "zip1 v5.16b, v5.16b, v5.16b\n\t"
+      "cbz %w[any_clip], 2f\n\t"
+      "ldr q12, [%[scr], #80]\n\t"
+      "zip1 v13.8h, v12.8h, v12.8h\n\t"
+      "zip2 v12.8h, v12.8h, v12.8h\n\t"
+      "uxtl v6.8h, v8.8b\n\t"
+      "uxtl2 v7.8h, v8.16b\n\t"
+      "mul v6.8h, v6.8h, v13.8h\n\t"
+      "mul v7.8h, v7.8h, v12.8h\n\t"
+      "uqrshrn v6.8b, v6.8h, #7\n\t"
+      "uqrshrn2 v6.16b, v7.8h, #7\n\t"
+      "umin v14.16b, v14.16b, v6.16b\n\t"
+      "uxtl v6.8h, v9.8b\n\t"
+      "uxtl2 v7.8h, v9.16b\n\t"
+      "mul v6.8h, v6.8h, v13.8h\n\t"
+      "mul v7.8h, v7.8h, v12.8h\n\t"
+      "uqrshrn v6.8b, v6.8h, #7\n\t"
+      "uqrshrn2 v6.16b, v7.8h, #7\n\t"
+      "umin v16.16b, v16.16b, v6.16b\n\t"
+      "2:\n\t"
+      "add %[scr], %[scr], #96\n\t"
+      "uqadd v6.16b, v14.16b, v0.16b\n\t"
+      "uqadd v7.16b, v14.16b, v2.16b\n\t"
+      "uqadd v8.16b, v14.16b, v4.16b\n\t"
+      "uqsub v6.16b, v6.16b, v1.16b\n\t"
+      "uqsub v7.16b, v7.16b, v3.16b\n\t"
+      "uqsub v8.16b, v8.16b, v5.16b\n\t"
+      "st3 {v6.16b, v7.16b, v8.16b}, [%[pc0]], #48\n\t"
+      "uqadd v10.16b, v16.16b, v0.16b\n\t"
+      "uqadd v11.16b, v16.16b, v2.16b\n\t"
+      "uqadd v12.16b, v16.16b, v4.16b\n\t"
+      "uqsub v10.16b, v10.16b, v1.16b\n\t"
+      "uqsub v11.16b, v11.16b, v3.16b\n\t"
+      "uqsub v12.16b, v12.16b, v5.16b\n\t"
+      "st3 {v10.16b, v11.16b, v12.16b}, [%[pc1]], #48\n\t"
+      "subs %[blocks], %[blocks], #1\n\t"
+      "b.ne 1b\n\t"
+      : [scr] "+r"(scr), [flags] "+r"(flags), [pc0] "+r"(pc0), [pc1] "+r"(pc1),
+        [blocks] "+r"(blocks), [any_clip] "=&r"(any_clip)
+      : [tone_base] "r"(luts.y_tone_base.data()),
+        [tone_delta] "r"(luts.y_tone_delta.data())
+      : "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+        "v11", "v12", "v13", "v14", "v16", "v21", "v22", "v23", "v24", "v25",
+        "cc", "memory");
+}
+
+static __attribute__((noinline)) int FusedOutputNeonYccRowPairAsm(
+    const uchar *py0, const uchar *py1, const ushort *pa, const ushort *pb,
+    const uchar *pcr, const uchar *pcb, uchar *pc0, uchar *pc1,
+    int half_width, const FastBalancedToneLuts &luts) {
+  constexpr int64_t kChunk = 128;
+  alignas(64) uchar scratch[kChunk * 96];
+  uchar flags[kChunk];
+  const int64_t blocks = half_width >> 3;
+  for (int64_t k = 0; k < blocks;) {
+    const int64_t n = std::min<int64_t>(kChunk, blocks - k);
+    FusedOutputNeonYccPassAAsm(py0 + 16 * k, py1 + 16 * k, pa + 4 * k,
+                               pb + 4 * k, pcr + 8 * k, pcb + 8 * k, scratch,
+                               flags, n, luts);
+    FusedOutputNeonYccPassBAsm(scratch, flags, pc0 + 48 * k, pc1 + 48 * k, n,
+                               luts);
+    k += n;
+  }
+  return static_cast<int>(blocks) << 3;
+}
+#endif
+
 // AArch64/ARM NEON backend for RK3588 and other ARM targets. NEON is
 // 128-bit (16 output pixels per vector step like the portable path), but
 // this kernel walks TWO image rows per iteration: rows 2k and 2k+1 share
@@ -6114,16 +8046,36 @@ inline bool UseNeonOutput() {
 inline void FusedOutputNeon(
     const cv::Mat &y8, const cv::Mat &a_q16, const cv::Mat &b_q16,
     const cv::Mat &cr_h, const cv::Mat &cb_h, cv::Mat &color,
-    bool apply_tone) {
+    const FastBalancedToneLuts *tone_luts) {
   const int full_width = color.cols;
   const int full_height = color.rows;
   const int half_width = cr_h.cols;
   const int half_height = cr_h.rows;
   const int quarter_height = a_q16.rows;
+#if !defined(__aarch64__)
   const uint32x4_t round_y = vdupq_n_u32(2048);
+#endif
   const int16x8_t c128_16 = vdupq_n_s16(128);
-  const FastBalancedToneLuts *tone_luts =
-      apply_tone ? &GetFastBalancedToneLuts() : nullptr;
+#if defined(__aarch64__)
+  const bool ycc_tone = tone_luts && tone_luts->y_tone_segments_ok &&
+                        FastToneYccEnabled();
+  const bool ycc_row = ycc_tone && FastNeonYccRowEnabled();
+  const bool ycc_asm = ycc_row && FastNeonYccAsmEnabled();
+  uint8x16x2_t y_tone_base{}, y_tone_delta{}, y_gain_base{}, y_gain_delta{};
+  uint8x16_t clip_base{}, clip_delta{};
+  if (ycc_tone) {
+    const auto load32 = [](const void *p) {
+      const uint8_t *b = static_cast<const uint8_t *>(p);
+      return uint8x16x2_t{{vld1q_u8(b), vld1q_u8(b + 16)}};
+    };
+    y_tone_base = load32(tone_luts->y_tone_base.data());
+    y_tone_delta = load32(tone_luts->y_tone_delta.data());
+    y_gain_base = load32(tone_luts->y_gain_base.data());
+    y_gain_delta = load32(tone_luts->y_gain_delta.data());
+    clip_base = vld1q_u8(tone_luts->clip_base.data());
+    clip_delta = vld1q_u8(tone_luts->clip_delta.data());
+  }
+#endif
 
   const int paired_height = full_height & ~1;
   FastParallelForRows(paired_height / 2, "output", [&](int pair_row) {
@@ -6140,6 +8092,11 @@ inline void FusedOutputNeon(
     uchar *pc0 = color.ptr<uchar>(y);
     uchar *pc1 = color.ptr<uchar>(y + 1);
     int xh = 0;
+#if defined(__aarch64__)
+    if (ycc_row)
+      xh = (ycc_asm ? FusedOutputNeonYccRowPairAsm : FusedOutputNeonYccRowPair)(
+          py0, py1, pa, pb, pcr, pcb, pc0, pc1, half_width, *tone_luts);
+#endif
 
     for (; xh + 8 <= half_width; xh += 8) {
       const int x0 = xh << 1;
@@ -6176,6 +8133,25 @@ inline void FusedOutputNeon(
       const int16x8x2_t tg2 = vzipq_s16(tg, tg);
       const int16x8x2_t tr2 = vzipq_s16(tr, tr);
 
+#if defined(__aarch64__)
+      // a*y + (b << 8) < 2^26, so RSHRN #12 equals the add/shift/narrow.
+      const uint32x4_t b0_lo = vshll_n_u16(vget_low_u16(bv0), 8);
+      const uint32x4_t b0_hi = vshll_high_n_u16(bv0, 8);
+      const uint32x4_t b1_lo = vshll_n_u16(vget_low_u16(bv1), 8);
+      const uint32x4_t b1_hi = vshll_high_n_u16(bv1, 8);
+      const auto make_row = [&](const uchar *py) {
+        const uint8x16_t yv = vld1q_u8(py + x0);
+        const uint16x8_t y0 = vmovl_u8(vget_low_u8(yv));
+        const uint16x8_t y1 = vmovl_high_u8(yv);
+        const int16x8_t yns0 = vreinterpretq_s16_u16(vrshrn_high_n_u32(
+            vrshrn_n_u32(vmlal_u16(b0_lo, vget_low_u16(av0),
+                                   vget_low_u16(y0)), 12),
+            vmlal_high_u16(b0_hi, av0, y0), 12));
+        const int16x8_t yns1 = vreinterpretq_s16_u16(vrshrn_high_n_u32(
+            vrshrn_n_u32(vmlal_u16(b1_lo, vget_low_u16(av1),
+                                   vget_low_u16(y1)), 12),
+            vmlal_high_u16(b1_hi, av1, y1), 12));
+#else
       const auto luma_mac = [&](uint16x8_t a, uint16x8_t b,
                                 uint16x8_t yy) {
         uint32x4_t lo =
@@ -6194,6 +8170,7 @@ inline void FusedOutputNeon(
             luma_mac(av0, bv0, vmovl_u8(vget_low_u8(yv))));
         const int16x8_t yns1 = vreinterpretq_s16_u16(
             luma_mac(av1, bv1, vmovl_u8(vget_high_u8(yv))));
+#endif
         uint8x16x3_t out;
         out.val[0] = vcombine_u8(
             vqmovun_s16(vaddq_s16(yns0, tb2.val[0])),
@@ -6206,6 +8183,100 @@ inline void FusedOutputNeon(
             vqmovun_s16(vaddq_s16(yns1, tr2.val[1])));
         return out;
       };
+#if defined(__aarch64__)
+      if (ycc_tone) {
+        const auto luma_row = [&](const uchar *py, int16x8_t &l0,
+                                  int16x8_t &l1) {
+          const uint8x16_t yv = vld1q_u8(py + x0);
+          const uint16x8_t y0 = vmovl_u8(vget_low_u8(yv));
+          const uint16x8_t y1 = vmovl_high_u8(yv);
+          l0 = vreinterpretq_s16_u16(vrshrn_high_n_u32(
+              vrshrn_n_u32(vmlal_u16(b0_lo, vget_low_u16(av0),
+                                     vget_low_u16(y0)), 12),
+              vmlal_high_u16(b0_hi, av0, y0), 12));
+          l1 = vreinterpretq_s16_u16(vrshrn_high_n_u32(
+              vrshrn_n_u32(vmlal_u16(b1_lo, vget_low_u16(av1),
+                                     vget_low_u16(y1)), 12),
+              vmlal_high_u16(b1_hi, av1, y1), 12));
+        };
+        int16x8_t l00, l01, l10, l11;
+        luma_row(py0, l00, l01);
+        luma_row(py1, l10, l11);
+        // Per-block gain min(gain(Y), 255/max) in Q7 from the segments;
+        // Y = rounded 2x2 mean luma, max = Y + largest chroma term.
+        const uint8x8_t block_luma = vqmovun_s16(vrshrq_n_s16(
+            vpaddq_s16(vaddq_s16(l00, l10), vaddq_s16(l01, l11)), 2));
+        const int16x8_t chroma_max =
+            vmaxq_s16(tb, vmaxq_s16(vnegq_s16(tg), tr));
+        const uint8x8_t block_max = vqmovun_s16(vaddq_s16(
+            vreinterpretq_s16_u16(vmovl_u8(block_luma)), chroma_max));
+        const uint8x8_t seg = vshr_n_u8(block_luma, 3);
+        const int16x8_t tone_q7 = vrshrq_n_s16(
+            vmlal_s8(vreinterpretq_s16_u16(
+                         vshll_n_u8(vqtbl2_u8(y_gain_base, seg), 3)),
+                     vreinterpret_s8_u8(vqtbl2_u8(y_gain_delta, seg)),
+                     vreinterpret_s8_u8(vand_u8(block_luma, vdup_n_u8(7)))),
+            3);
+        const uint8x8_t over = vqsub_u8(block_max, vdup_n_u8(128));
+        const uint8x8_t clip_seg = vshr_n_u8(over, 3);
+        const uint16x8_t clip_q7 = vrshrq_n_u16(
+            vmlsl_u8(vshll_n_u8(vqtbl1_u8(clip_base, clip_seg), 3),
+                     vqtbl1_u8(clip_delta, clip_seg),
+                     vand_u8(over, vdup_n_u8(7))),
+            3);
+        const int16x8_t gain = vshlq_n_s16(
+            vminq_s16(tone_q7, vreinterpretq_s16_u16(clip_q7)), 5);
+        // Where the clip binds, the per-pixel tone dims the whole pixel (hue
+        // kept), so cap luma at y * clip too; 256 (2x) leaves it untouched.
+        const uint16x8_t clip_binds =
+            vcltq_u16(clip_q7, vreinterpretq_u16_s16(tone_q7));
+        const bool any_clip = vmaxvq_u16(clip_binds) != 0;
+        const uint16x8_t luma_cap =
+            vbslq_u16(clip_binds, clip_q7, vdupq_n_u16(256));
+        const uint16x8x2_t luma_cap2 = vzipq_u16(luma_cap, luma_cap);
+        // SQRDMULH(8 * t, gain) = round(t * gain / 4096); |8 * t| < 2048.
+        const int16x8_t sb = vqrdmulhq_s16(vshlq_n_s16(tb, 3), gain);
+        const int16x8_t sg = vqrdmulhq_s16(vshlq_n_s16(tg, 3), gain);
+        const int16x8_t sr = vqrdmulhq_s16(vshlq_n_s16(tr, 3), gain);
+        const int16x8x2_t sb2 = vzipq_s16(sb, sb);
+        const int16x8x2_t sg2 = vzipq_s16(sg, sg);
+        const int16x8x2_t sr2 = vzipq_s16(sr, sr);
+        const auto tone_row = [&](int16x8_t l0, int16x8_t l1) {
+          const uint8x16_t yi = vcombine_u8(vqmovun_s16(l0), vqmovun_s16(l1));
+          const uint8x16_t s = vshrq_n_u8(yi, 3);
+          const uint8x16_t f = vandq_u8(yi, vdupq_n_u8(7));
+          const uint8x16_t base = vqtbl2q_u8(y_tone_base, s);
+          const uint8x16_t delta = vqtbl2q_u8(y_tone_delta, s);
+          uint16x8_t u0 = vrshrq_n_u16(
+              vmlal_u8(vshll_n_u8(vget_low_u8(base), 3), vget_low_u8(delta),
+                       vget_low_u8(f)),
+              3);
+          uint16x8_t u1 = vrshrq_n_u16(
+              vmlal_high_u8(vshll_high_n_u8(base, 3), delta, f), 3);
+          if (any_clip) {
+            u0 = vminq_u16(u0, vrshrq_n_u16(vmulq_u16(vmovl_u8(vget_low_u8(yi)),
+                                                      luma_cap2.val[0]),
+                                            7));
+            u1 = vminq_u16(u1, vrshrq_n_u16(vmulq_u16(vmovl_high_u8(yi),
+                                                      luma_cap2.val[1]),
+                                            7));
+          }
+          const int16x8_t t0 = vreinterpretq_s16_u16(u0);
+          const int16x8_t t1 = vreinterpretq_s16_u16(u1);
+          uint8x16x3_t out;
+          out.val[0] = vcombine_u8(vqmovun_s16(vaddq_s16(t0, sb2.val[0])),
+                                   vqmovun_s16(vaddq_s16(t1, sb2.val[1])));
+          out.val[1] = vcombine_u8(vqmovun_s16(vsubq_s16(t0, sg2.val[0])),
+                                   vqmovun_s16(vsubq_s16(t1, sg2.val[1])));
+          out.val[2] = vcombine_u8(vqmovun_s16(vaddq_s16(t0, sr2.val[0])),
+                                   vqmovun_s16(vaddq_s16(t1, sr2.val[1])));
+          return out;
+        };
+        vst3q_u8(pc0 + 3 * x0, tone_row(l00, l01));
+        vst3q_u8(pc1 + 3 * x0, tone_row(l10, l11));
+        continue;
+      }
+#endif
       uint8x16x3_t out0 = make_row(py0);
       uint8x16x3_t out1 = make_row(py1);
       const auto apply_tone_row = [&](uint8x16x3_t &out) {
@@ -6861,13 +8932,48 @@ inline void FastChromaPairStats8U16Neon(
       vaddq_u16(vpaddlq_u8(magnitude0), vpaddlq_u8(magnitude1));
 }
 
+// Eight-cell counterpart of FastFlatChromaCell.
+inline void FastFlatChroma8U16Neon(
+    const int16x8_t sum_cr, const int16x8_t sum_cb, const uint8x8_t base_cr,
+    const uint8x8_t base_cb, uint16x8_t &keep, uint16x8_t &blend,
+    uint16x8_t &hue) {
+  const int8x8_t center8 = vdup_n_s8(static_cast<int8_t>(-128));
+  const int16x8_t base_cr4 = vshll_n_s8(
+      veor_s8(vreinterpret_s8_u8(base_cr), center8), 2);
+  const int16x8_t base_cb4 = vshll_n_s8(
+      veor_s8(vreinterpret_s8_u8(base_cb), center8), 2);
+  const uint16x8_t departure = vshrq_n_u16(
+      vaddq_u16(
+          vaddq_u16(vreinterpretq_u16_s16(
+                        vabsq_s16(vsubq_s16(sum_cr, base_cr4))),
+                    vreinterpretq_u16_s16(
+                        vabsq_s16(vsubq_s16(sum_cb, base_cb4)))),
+          vdupq_n_u16(2)),
+      2);
+  const uint16x8_t c255 = vdupq_n_u16(255);
+  const uint16x8_t flat_delta = vminq_u16(
+      vdupq_n_u16(9), vqsubq_u16(vdupq_n_u16(14), departure));
+  const uint16x8_t flat = vshrq_n_u16(vmulq_n_u16(flat_delta, 3627), 7);
+  keep = FastDiv255U16Neon(vmulq_u16(
+      keep, vsubq_u16(c255, vshrq_n_u16(vmulq_n_u16(flat, 3), 2))));
+  blend = vaddq_u16(
+      blend, FastDiv255U16Neon(vmulq_u16(
+                 vqsubq_u16(vdupq_n_u16(224), blend), flat)));
+  hue = vbicq_u16(hue, vcgtq_u16(flat, vdupq_n_u16(127)));
+  const uint16x8_t detail_delta = vminq_u16(
+      vdupq_n_u16(12), vqsubq_u16(departure, vdupq_n_u16(12)));
+  const uint16x8_t detail =
+      vshrq_n_u16(vmulq_n_u16(detail_delta, 2720), 7);
+  blend = FastDiv255U16Neon(vmulq_u16(blend, vsubq_u16(c255, detail)));
+}
+
 inline void FastChromaGate8U16Neon(
     const uchar *src_cr0, const uchar *src_cr1, const uchar *src_cb0,
     const uchar *src_cb1, const uchar *texture_source,
     const float *mean_luma, const uchar *base_cr_source,
     const uchar *base_cb_source, const float shadow_lo,
-    const float shadow_scale, const int sat_q128, uchar *residual_q7,
-    uchar *blend, uchar *hue, uchar *min_keep) {
+    const float shadow_scale, const int sat_q128, const bool flat_chroma,
+    uchar *residual_q7, uchar *blend, uchar *hue, uchar *min_keep) {
   int16x8_t sum_cr, sum_cb;
   uint16x8_t abs_cr, abs_cb;
   FastChromaPairStats8U16Neon(src_cr0, src_cr1, sum_cr, abs_cr);
@@ -6895,9 +9001,10 @@ inline void FastChromaGate8U16Neon(
       shade4(vld1q_f32(mean_luma)), shade4(vld1q_f32(mean_luma + 4)));
 
   const uint8x8_t center8 = vdup_n_u8(128);
-  const uint16x8_t base_chroma = vaddl_u8(
-      vabd_u8(vld1_u8(base_cr_source), center8),
-      vabd_u8(vld1_u8(base_cb_source), center8));
+  const uint8x8_t base_cr = vld1_u8(base_cr_source);
+  const uint8x8_t base_cb = vld1_u8(base_cb_source);
+  const uint16x8_t base_chroma =
+      vaddl_u8(vabd_u8(base_cr, center8), vabd_u8(base_cb, center8));
   const uint16x8_t protect_delta = vminq_u16(
       vdupq_n_u16(18), vqsubq_u16(base_chroma, vdupq_n_u16(10)));
   // For delta in [0,18], floor(delta*255/18) == (delta*907)>>6.
@@ -6923,17 +9030,23 @@ inline void FastChromaGate8U16Neon(
   residual_keep = vmaxq_u16(residual_keep, local_protect);
   const uint16x8_t color_protect = vmaxq_u16(protect, local_protect);
 
-  const uint16x8_t residual = FastDiv255U16Neon(vmulq_n_u16(
+  uint16x8_t residual = FastDiv255U16Neon(vmulq_n_u16(
       residual_keep, static_cast<uint16_t>(sat_q128)));
   const uint16x8_t base_blend = vsubq_u16(
       vdupq_n_u16(144),
       FastDiv255U16Neon(vmulq_n_u16(color_protect, 104)));
   const uint16x8_t texture_blend = FastDiv255U16Neon(
       vmulq_u16(texture, vsubq_u16(c255, protect)));
+  uint16x8_t blend_value = vmaxq_u16(base_blend, texture_blend);
+  uint16x8_t hue_value = color_protect;
+  if (flat_chroma) {
+    FastFlatChroma8U16Neon(sum_cr, sum_cb, base_cr, base_cb, residual,
+                           blend_value, hue_value);
+  }
 
   vst1_u8(residual_q7, vmovn_u16(residual));
-  vst1_u8(blend, vmovn_u16(vmaxq_u16(base_blend, texture_blend)));
-  vst1_u8(hue, vmovn_u16(color_protect));
+  vst1_u8(blend, vmovn_u16(blend_value));
+  vst1_u8(hue, vmovn_u16(hue_value));
   vst1_u8(min_keep, vmovn_u16(
       FastDiv255U16Neon(vmulq_n_u16(protect, 216))));
 }
@@ -7165,7 +9278,166 @@ inline void FastBlendHue16Neon(
   vst1q_u8(output_cb, vcombine_u8(vqmovun_s16(cb_out_lo),
                                    vqmovun_s16(cb_out_hi)));
 }
+
+// Standalone reconstruct / blend row kernels (default on; =1 restores the
+// per-block helpers above, which are byte-identical).
+inline bool FastNeonTailRowsEnabled() {
+  static const bool enabled =
+      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_TAIL_ROWS");
+  return enabled;
+}
+
+// Eight bytes from p, each doubled: [p0 p0 p1 p1 .. p7 p7].
+inline uint8x16_t FastNeonLoadRepeat2(const uchar *p) {
+  const uint8x16_t q = vcombine_u8(vld1_u8(p), vdup_n_u8(0));
+  uint8x16_t r;
+  __asm__("zip1 %0.16b, %1.16b, %1.16b" : "=w"(r) : "w"(q));
+  return r;
+}
+
+// Round half away from zero of x / 128 for both halves, narrowed:
+// (x + (x >> 31) + 64) >> 7.
+inline int16x8_t FastNeonRoundAway7Pair(int32x4_t lo, int32x4_t hi) {
+  int16x8_t r;
+  __asm__("ssra %1.4s, %1.4s, #31\n\tssra %2.4s, %2.4s, #31\n\t"
+          "rshrn %0.4h, %1.4s, #7\n\trshrn2 %0.8h, %2.4s, #7"
+          : "=&w"(r), "+w"(lo), "+w"(hi));
+  return r;
+}
+
+inline int32x4_t FastNeonAddwLo(int32x4_t acc, uint16x8_t v) {
+  int32x4_t r;
+  __asm__("uaddw %0.4s, %1.4s, %2.4h" : "=w"(r) : "w"(acc), "w"(v));
+  return r;
+}
+
+// FastReconstructChroma16Neon for one row pair of one plane, 16-aligned
+// part; returns the first unprocessed column. The same integer delta is
+// regrouped per quarter cell:
+//   (base - 128) * bq7 + (v - base) * keep
+//     = [base * (bq7 - keep) - 128 * bq7] + v * keep,
+// so each pixel costs one u8 x u8 multiply and a widening add.
+static __attribute__((noinline)) int FastReconstructRowPairNeon(
+    const uchar *__restrict base_q, const uchar *__restrict keep_q,
+    uchar *__restrict row0, uchar *__restrict row1, int width,
+    int base_q7) {
+  const int16x8_t bq7 = vdupq_n_s16(static_cast<int16_t>(base_q7));
+  const int32x4_t offset = vdupq_n_s32(-128 * base_q7);
+  const int16x8_t c128 = vdupq_n_s16(128);
+  int x = 0;
+  for (; x + 16 <= width; x += 16) {
+    const int xq = x >> 1;
+    const uint8x16_t base16 = FastNeonLoadRepeat2(base_q + xq);
+    const uint8x16_t keep16 = FastNeonLoadRepeat2(keep_q + xq);
+    const int16x8_t base_lo =
+        vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(base16)));
+    const int16x8_t base_hi = vreinterpretq_s16_u16(vmovl_high_u8(base16));
+    const int16x8_t gain_lo = vsubq_s16(
+        bq7, vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(keep16))));
+    const int16x8_t gain_hi =
+        vsubq_s16(bq7, vreinterpretq_s16_u16(vmovl_high_u8(keep16)));
+    const int32x4_t c0 =
+        vmlal_s16(offset, vget_low_s16(base_lo), vget_low_s16(gain_lo));
+    const int32x4_t c1 = vmlal_high_s16(offset, base_lo, gain_lo);
+    const int32x4_t c2 =
+        vmlal_s16(offset, vget_low_s16(base_hi), vget_low_s16(gain_hi));
+    const int32x4_t c3 = vmlal_high_s16(offset, base_hi, gain_hi);
+    const auto row = [&](uchar *pv) {
+      const uint8x16_t v = vld1q_u8(pv + x);
+      const uint16x8_t p_lo = FastNeonUmullLo(v, keep16);
+      const uint16x8_t p_hi = vmull_high_u8(v, keep16);
+      const int16x8_t r_lo = FastNeonRoundAway7Pair(
+          FastNeonAddwLo(c0, p_lo),
+          vreinterpretq_s32_u32(
+              vaddw_high_u16(vreinterpretq_u32_s32(c1), p_lo)));
+      const int16x8_t r_hi = FastNeonRoundAway7Pair(
+          FastNeonAddwLo(c2, p_hi),
+          vreinterpretq_s32_u32(
+              vaddw_high_u16(vreinterpretq_u32_s32(c3), p_hi)));
+      vst1q_u8(pv + x, FastNeonQmovunPair(vaddq_s16(r_lo, c128),
+                                          vaddq_s16(r_hi, c128)));
+    };
+    row(row0);
+    row(row1);
+  }
+  return x;
+}
+
+// out = s + sign(f - s) * ((|f - s| * alpha + 128) >> 8) in u8, exactly
+// FastBlendChroma8Neon: the step never passes f, so s +/- m cannot wrap.
+inline uint8x16_t FastNeonBlendU8(uint8x16_t s, uint8x16_t f, uint8x16_t a) {
+  const uint8x16_t d = vabdq_u8(f, s);
+  uint8x16_t m;
+  __asm__("umull %0.8h, %1.8b, %2.8b" : "=&w"(m) : "w"(d), "w"(a));
+  const uint16x8_t p_hi = vmull_high_u8(d, a);
+  __asm__("rshrn %0.8b, %0.8h, #8\n\trshrn2 %0.16b, %1.8h, #8"
+          : "+w"(m)
+          : "w"(p_hi));
+  return vbslq_u8(vcgtq_u8(f, s), vaddq_u8(s, m), vsubq_u8(s, m));
+}
+
+// The blend_row NEON loop for the 16-aligned part of one half-grid row;
+// returns the first unprocessed column. Blocks with any hue-active cell go
+// through FastBlendHue16Neon unchanged; the rest blend in u8.
+static __attribute__((noinline)) int FastBlendRowNeon(
+    const uchar *__restrict src_cr, const uchar *__restrict src_cb,
+    uchar *__restrict dst_cr, uchar *__restrict dst_cb,
+    const uchar *__restrict blend_q8, const uchar *__restrict hue_active,
+    const uchar *__restrict hue_min_keep, bool apply_hue, int width) {
+  int x = 0;
+  for (; x + 16 <= width; x += 16) {
+    const int xq = x >> 1;
+    if (apply_hue &&
+        vget_lane_u64(vreinterpret_u64_u8(vld1_u8(hue_active + xq)), 0) !=
+            0) {
+      FastBlendHue16Neon(src_cr + x, src_cb + x, dst_cr + x, dst_cb + x,
+                         blend_q8 + xq, hue_active + xq, hue_min_keep + xq,
+                         true, dst_cr + x, dst_cb + x);
+      continue;
+    }
+    const uint8x16_t alpha = FastNeonLoadRepeat2(blend_q8 + xq);
+    vst1q_u8(dst_cr + x,
+             FastNeonBlendU8(vld1q_u8(src_cr + x), vld1q_u8(dst_cr + x),
+                             alpha));
+    vst1q_u8(dst_cb + x,
+             FastNeonBlendU8(vld1q_u8(src_cb + x), vld1q_u8(dst_cb + x),
+                             alpha));
+  }
+  return x;
+}
 #endif
+
+// The colour protection of the chroma gate is keyed on how saturated the wide
+// base is, so on a flat saturated surface (a ColorChecker patch) it keeps the
+// whole per-pixel residual and the noise survives as colour grain. What it
+// should protect is a colour edge or fine coloured detail, where the local
+// 2x2 mean departs from the wide base by much more than the noise of a 2x2
+// mean. Where it does not, filter like a flat neutral area. sum_cr / sum_cb
+// are the 2x2 sums of u8-128.
+inline void FastFlatChromaCell(int sum_cr, int sum_cb, int base_cr,
+                               int base_cb, int &keep, int &blend, int &hue) {
+  constexpr int kFlatLo = 5;  // |dCr| + |dCb| of the 2x2 mean, 8-bit
+  constexpr int kFlatHi = 14;
+  constexpr int kFlatBlend = 224;
+  constexpr int kDetailLo = 12;  // well above the noise of a 2x2 mean
+  constexpr int kDetailHi = 24;
+  const int departure = (std::abs(sum_cr - 4 * (base_cr - 128)) +
+                         std::abs(sum_cb - 4 * (base_cb - 128)) + 2) >>
+                        2;
+  int f = (kFlatHi - departure) * 255 / (kFlatHi - kFlatLo);
+  f = f < 0 ? 0 : (f > 255 ? 255 : f);
+  if (f > 0) {
+    keep = keep * (255 - f * 3 / 4) / 255;
+    if (blend < kFlatBlend) blend += (kFlatBlend - blend) * f / 255;
+    if (f >= 128) hue = 0;
+  }
+  // Conversely a departure far above the noise is a colour edge or coloured
+  // detail (backlit key legends): the half-grid gauss5 + median3 candidate
+  // would smear it, so pass the source through.
+  int d = (departure - kDetailLo) * 255 / (kDetailHi - kDetailLo);
+  d = d < 0 ? 0 : (d > 255 ? 255 : d);
+  if (d > 0) blend = blend * (255 - d) / 255;
+}
 
 #if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
 // Eight-cell x86 counterpart of FastChromaGate8U16Neon.  The gate's full
@@ -7215,13 +9487,50 @@ CYPERSTEREO_AVX2_TARGET inline void FastChromaPairStats8U16Avx2(
       _mm_maddubs_epi16(_mm_abs_epi8(centered1), ones));
 }
 
+// Eight-cell counterpart of FastFlatChromaCell.
+CYPERSTEREO_AVX2_TARGET inline void FastFlatChroma8U16Avx2(
+    const __m128i sum_cr, const __m128i sum_cb, const __m128i base_cr,
+    const __m128i base_cb, __m128i &keep, __m128i &blend, __m128i &hue) {
+  const __m128i center16 = _mm_set1_epi16(128);
+  const __m128i c255 = _mm_set1_epi16(255);
+  const __m128i departure = _mm_srli_epi16(
+      _mm_add_epi16(
+          _mm_add_epi16(
+              _mm_abs_epi16(_mm_sub_epi16(
+                  sum_cr,
+                  _mm_slli_epi16(_mm_sub_epi16(base_cr, center16), 2))),
+              _mm_abs_epi16(_mm_sub_epi16(
+                  sum_cb,
+                  _mm_slli_epi16(_mm_sub_epi16(base_cb, center16), 2)))),
+          _mm_set1_epi16(2)),
+      2);
+  const __m128i flat_delta = _mm_min_epu16(
+      _mm_set1_epi16(9), _mm_subs_epu16(_mm_set1_epi16(14), departure));
+  const __m128i flat = _mm_srli_epi16(
+      _mm_mullo_epi16(flat_delta, _mm_set1_epi16(3627)), 7);
+  keep = FastDiv255U16Avx2(_mm_mullo_epi16(
+      keep, _mm_sub_epi16(
+                c255, _mm_srli_epi16(
+                          _mm_mullo_epi16(flat, _mm_set1_epi16(3)), 2))));
+  blend = _mm_add_epi16(
+      blend, FastDiv255U16Avx2(_mm_mullo_epi16(
+                 _mm_subs_epu16(_mm_set1_epi16(224), blend), flat)));
+  hue = _mm_andnot_si128(_mm_cmpgt_epi16(flat, _mm_set1_epi16(127)), hue);
+  const __m128i detail_delta = _mm_min_epu16(
+      _mm_set1_epi16(12), _mm_subs_epu16(departure, _mm_set1_epi16(12)));
+  const __m128i detail = _mm_srli_epi16(
+      _mm_mullo_epi16(detail_delta, _mm_set1_epi16(2720)), 7);
+  blend = FastDiv255U16Avx2(
+      _mm_mullo_epi16(blend, _mm_sub_epi16(c255, detail)));
+}
+
 CYPERSTEREO_AVX2_TARGET inline void FastChromaGate8U16Avx2(
     const uchar *src_cr0, const uchar *src_cr1, const uchar *src_cb0,
     const uchar *src_cb1, const uchar *texture_source,
     const float *mean_luma, const uchar *base_cr_source,
     const uchar *base_cb_source, const float shadow_lo,
-    const float shadow_scale, const int sat_q128, uchar *residual_q7,
-    uchar *blend, uchar *hue, uchar *min_keep) {
+    const float shadow_scale, const int sat_q128, const bool flat_chroma,
+    uchar *residual_q7, uchar *blend, uchar *hue, uchar *min_keep) {
   __m128i sum_cr, sum_cb, abs_cr, abs_cb;
   FastChromaPairStats8U16Avx2(src_cr0, src_cr1, sum_cr, abs_cr);
   FastChromaPairStats8U16Avx2(src_cb0, src_cb1, sum_cb, abs_cb);
@@ -7254,11 +9563,11 @@ CYPERSTEREO_AVX2_TARGET inline void FastChromaGate8U16Avx2(
       _mm256_extracti128_si256(shade32, 1));
 
   const __m128i center16 = _mm_set1_epi16(128);
+  const __m128i base_cr = FastLoad8U16Avx2(base_cr_source);
+  const __m128i base_cb = FastLoad8U16Avx2(base_cb_source);
   const __m128i base_chroma = _mm_add_epi16(
-      _mm_abs_epi16(_mm_sub_epi16(
-          FastLoad8U16Avx2(base_cr_source), center16)),
-      _mm_abs_epi16(_mm_sub_epi16(
-          FastLoad8U16Avx2(base_cb_source), center16)));
+      _mm_abs_epi16(_mm_sub_epi16(base_cr, center16)),
+      _mm_abs_epi16(_mm_sub_epi16(base_cb, center16)));
   const __m128i protect_delta = _mm_min_epu16(
       _mm_set1_epi16(18),
       _mm_subs_epu16(base_chroma, _mm_set1_epi16(10)));
@@ -7288,17 +9597,23 @@ CYPERSTEREO_AVX2_TARGET inline void FastChromaGate8U16Avx2(
   const __m128i color_protect =
       _mm_max_epu16(protect, local_protect);
 
-  const __m128i residual = FastDiv255U16Avx2(_mm_mullo_epi16(
+  __m128i residual = FastDiv255U16Avx2(_mm_mullo_epi16(
       residual_keep, _mm_set1_epi16(static_cast<short>(sat_q128))));
   const __m128i base_blend = _mm_sub_epi16(
       _mm_set1_epi16(144), FastDiv255U16Avx2(_mm_mullo_epi16(
                                    color_protect, _mm_set1_epi16(104))));
   const __m128i texture_blend = FastDiv255U16Avx2(
       _mm_mullo_epi16(texture, _mm_sub_epi16(c255, protect)));
+  __m128i blend_value = _mm_max_epu16(base_blend, texture_blend);
+  __m128i hue_value = color_protect;
+  if (flat_chroma) {
+    FastFlatChroma8U16Avx2(sum_cr, sum_cb, base_cr, base_cb, residual,
+                           blend_value, hue_value);
+  }
 
   FastStore8U16Avx2(residual_q7, residual);
-  FastStore8U16Avx2(blend, _mm_max_epu16(base_blend, texture_blend));
-  FastStore8U16Avx2(hue, color_protect);
+  FastStore8U16Avx2(blend, blend_value);
+  FastStore8U16Avx2(hue, hue_value);
   FastStore8U16Avx2(min_keep, FastDiv255U16Avx2(
       _mm_mullo_epi16(protect, _mm_set1_epi16(216))));
 }
@@ -7460,6 +9775,130 @@ CYPERSTEREO_AVX2_TARGET inline void FastApplyHueGuard16Avx2(
   dst_cr_u16 = _mm256_add_epi16(cr1, center16);
   dst_cb_u16 = _mm256_add_epi16(cb1, center16);
 }
+
+// One half-grid row of the chroma reconstruction, exactly as the full-plane
+// reconstruct pass computes it, written to `dst` instead of in place.
+CYPERSTEREO_AVX2_TARGET inline void FastReconstructRowAvx2(
+    const uchar *src, uchar *dst, const uchar *pbase, const uchar *pkeep,
+    int half_width, int quarter_width, int base_q7) {
+  int x = 0;
+  for (; x + 16 <= half_width; x += 16) {
+    const int xq = x >> 1;
+    const __m128i base8 =
+        _mm_loadl_epi64(reinterpret_cast<const __m128i *>(pbase + xq));
+    const __m128i keep8 =
+        _mm_loadl_epi64(reinterpret_cast<const __m128i *>(pkeep + xq));
+    _mm_storeu_si128(
+        reinterpret_cast<__m128i *>(dst + x),
+        FastReconstructChroma16Avx2(
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + x)),
+            _mm_unpacklo_epi8(base8, base8), _mm_unpacklo_epi8(keep8, keep8),
+            base_q7));
+  }
+  for (; x < half_width; ++x) {
+    const int xq = (std::min)(x >> 1, quarter_width - 1);
+    const int base = pbase[xq];
+    const int delta = (base - 128) * base_q7 +
+                      (static_cast<int>(src[x]) - base) * pkeep[xq];
+    const int rounded = delta >= 0 ? (delta + 64) >> 7
+                                   : -((-delta + 64) >> 7);
+    dst[x] = cv::saturate_cast<uchar>(128 + rounded);
+  }
+}
+
+// 3x3 median of one row with BORDER_REPLICATE columns (the caller clamps the
+// rows), byte-identical to cv::medianBlur(src, dst, 3).  Each column triple
+// is sorted once; the median is med3(max of lows, med3 of mids, min of
+// highs).  Requires width >= 34.
+CYPERSTEREO_AVX2_TARGET inline void FastMedian3RowAvx2(
+    const uchar *up, const uchar *cc, const uchar *dn, uchar *out,
+    int width) {
+  const auto scalar = [&](int x) {
+    const int xl = x > 0 ? x - 1 : 0;
+    const int xr = x < width - 1 ? x + 1 : width - 1;
+    int v[9] = {up[xl], up[x], up[xr], cc[xl], cc[x],
+                cc[xr], dn[xl], dn[x], dn[xr]};
+    std::nth_element(v, v + 4, v + 9);
+    out[x] = static_cast<uchar>(v[4]);
+  };
+  const auto sort3 = [](__m256i &a, __m256i &b, __m256i &c)
+      CYPERSTEREO_AVX2_TARGET {
+    __m256i t = _mm256_min_epu8(a, b);
+    b = _mm256_max_epu8(a, b);
+    a = t;
+    t = _mm256_min_epu8(b, c);
+    c = _mm256_max_epu8(b, c);
+    b = t;
+    t = _mm256_min_epu8(a, b);
+    b = _mm256_max_epu8(a, b);
+    a = t;
+  };
+  const auto med3 = [](__m256i a, __m256i b, __m256i c)
+      CYPERSTEREO_AVX2_TARGET {
+    return _mm256_max_epu8(_mm256_min_epu8(a, b),
+                           _mm256_min_epu8(_mm256_max_epu8(a, b), c));
+  };
+  scalar(0);
+  scalar(width - 1);
+  const int last = width - 33;
+  for (int x = 1; x <= last;
+       x = (x == last || x + 32 <= last) ? x + 32 : last) {
+    __m256i lo[3], mi[3], hi[3];
+    for (int k = 0; k < 3; ++k) {
+      const int o = x - 1 + k;
+      lo[k] = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(up + o));
+      mi[k] = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(cc + o));
+      hi[k] = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(dn + o));
+      sort3(lo[k], mi[k], hi[k]);
+    }
+    const __m256i max_lo =
+        _mm256_max_epu8(lo[0], _mm256_max_epu8(lo[1], lo[2]));
+    const __m256i min_hi =
+        _mm256_min_epu8(hi[0], _mm256_min_epu8(hi[1], hi[2]));
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(out + x),
+                        med3(max_lo, med3(mi[0], mi[1], mi[2]), min_hi));
+  }
+}
+
+// Per-thread reconstructed-chroma rows for the fused chroma tail.  Slots are
+// tagged with the row they hold and invalidated by a per-call epoch, so a
+// helper thread that served another frame never reuses stale rows.
+struct FastChromaTailRing {
+  uint64_t epoch = 0;
+  int stride = 0;
+  int row[4] = {-1, -1, -1, -1};
+  std::vector<uchar> rows;
+  std::vector<int16_t> hd_keep;
+  void Reset(uint64_t call_epoch, int half_width, int quarter_width) {
+    if (epoch == call_epoch) return;
+    epoch = call_epoch;
+    stride = (half_width + 63) & ~63;
+    rows.resize(static_cast<size_t>(stride) * 8);
+    hd_keep.resize(static_cast<size_t>(quarter_width) + 8);
+    for (int &r : row) r = -1;
+  }
+  uchar *Row(int slot, int channel) {
+    return rows.data() + static_cast<size_t>(2 * slot + channel) * stride;
+  }
+};
+
+inline FastChromaTailRing &GetFastChromaTailRing() {
+  static thread_local FastChromaTailRing ring;
+  return ring;
+}
+
+inline uint64_t NextFastChromaTailEpoch() {
+  static std::atomic<uint64_t> counter{0};
+  return ++counter;
+}
+
+// Reconstruct, median3, blend/hue and the highlight fade as one streamed
+// half-grid pass (default on; =1 restores the four full-plane passes).
+inline bool FastFusedChromaTailEnabled() {
+  static const bool enabled =
+      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_FUSED_CHROMA_TAIL");
+  return enabled;
+}
 #endif
 
 // Keep the persistent ISP working planes behind one block-scope TLS object.
@@ -7499,7 +9938,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
                                    WhiteBalance *stream_wb = nullptr,
                                    bool stream_bayer_nr = false,
                                    IspPixelFormat output_format =
-                                       IspPixelFormat::kBgr888) {
+                                       IspPixelFormat::kBgr888,
+                                   double exposure_scale = 1.0) {
 #if !defined(CYPERSTEREO_HAVE_NEON) || !defined(__aarch64__)
   (void)stream_wb;
   (void)stream_bayer_nr;
@@ -7583,14 +10023,14 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
                          cv::BORDER_REPLICATE);
       SuppressFalseColorImpl(&padded_raw, padded_color, sensor_gain,
                              linear_input, apply_tone, raw_bayer, nullptr,
-                             nullptr, false, output_format);
+                             nullptr, false, output_format, exposure_scale);
     } else {
       cv::copyMakeBorder(color, padded_color, 0, bottom, 0, right,
                          cv::BORDER_REPLICATE);
       SuppressFalseColorImpl(nullptr, padded_color, sensor_gain, linear_input,
                              apply_tone,
                              BayerConversion::kColorBayerRg2Bgr, nullptr,
-                             nullptr, false, output_format);
+                             nullptr, false, output_format, exposure_scale);
     }
     padded_color(cv::Rect(0, 0, full.width, full.height)).copyTo(color);
     return;
@@ -7600,11 +10040,17 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   int gain_t_q8 = 0;
   if (linear_input) {
     if (!(sensor_gain >= 1.0)) sensor_gain = 1.0;  // also rejects NaN
+    if (!(exposure_scale >= 1.0)) exposure_scale = 1.0;
+    if (exposure_scale > 8.0) exposure_scale = 8.0;
+    // Luma NR saturates at 8x: stronger guided smoothing above it was
+    // measured to trade edge contrast for grain one-for-one.
     sensor_gain = (std::min)(sensor_gain, 8.0);
     gain_t_q8 = static_cast<int>(
         (sensor_gain - 1.0) * (256.0 / 7.0) + 0.5);
   }
-  const int guided_strength_q8 =
+  const FastBalancedToneLuts *tone_luts =
+      apply_tone ? &GetFastBalancedToneLuts() : nullptr;
+  int guided_strength_q8 =
       linear_input ? 64 + ((192 - 64) * gain_t_q8 + 128) / 256 : 256;
   using DetailClock = std::chrono::steady_clock;
   const bool detail_profile = FastPostDetailProfileEnabled();
@@ -7622,8 +10068,12 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   const bool have_chroma =
       raw_wb != nullptr || stream_raw != nullptr || fused_front;
 #if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
-  if (raw_wb) {
-    FusedDemosaicFrontAvx2(*raw_wb, y8, ch_h[1], ch_h[2]);
+  if (stream_raw) {
+    CV_Assert(stream_wb != nullptr && !stream_bayer_nr);
+    stream_wb->ApplyStreamedDemosaicFrontAvx2(*stream_raw, y8, ch_h[1],
+                                              ch_h[2], raw_bayer);
+  } else if (raw_wb) {
+    FusedDemosaicFrontAvx2(*raw_wb, y8, ch_h[1], ch_h[2], raw_bayer);
   } else
 #elif defined(CYPERSTEREO_HAVE_NEON)
 #if defined(__aarch64__)
@@ -7644,6 +10094,24 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
     cv::cvtColor(color, y8, cv::COLOR_BGR2GRAY);
   }
   const auto detail_t1 = detail_now();
+
+  // Digital exposure scales the luma noise together with the signal, so the
+  // guided filter's variance threshold grows with it -- linearly, as the
+  // full square over-smooths edges -- and the blend toward the unfiltered
+  // luma closes as the exposure goes from 1x to 2x.
+  double nr_exposure = linear_input ? exposure_scale : 1.0;
+#if (defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)) || \
+    defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
+  if (linear_input && stream_wb != nullptr &&
+      stream_wb->DisplayExposure() >= 1.0)
+    nr_exposure = (std::min)(8.0, stream_wb->DisplayExposure());
+#endif
+  const float luma_eps_scale = static_cast<float>(nr_exposure);
+  if (nr_exposure > 1.0) {
+    const double t = (std::min)(1.0, nr_exposure - 1.0);
+    guided_strength_q8 +=
+        static_cast<int>((256 - guided_strength_q8) * t);
+  }
 
   // Luma NR (mechanism 3): self-guided filter, stats on the 1/4 grid
   // (box3 there ~= 12px full-res support). eps ~= (edge threshold)^2:
@@ -7668,13 +10136,15 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   bool quarter_texture_fused = false;
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
   if (UseNeonGauss5() && UseNeonGuided() && UseFusedLumaChain()) {
-    FusedLumaChainNeon(y8, hf_q8, colsum, yq8, sq_q, g5_tmp_full);
+    FusedLumaChainNeon(y8, hf_q8, colsum, yq8, sq_q, g5_tmp_full,
+                       FastLumaLiteEnabled());
     if (UseStreamedGuidedStatsNeon()) {
       GuidedStatsStreamedNeon(yq8, sq_q, a_q16, b_q16, mean_i,
-                              guided_strength_q8);
+                              guided_strength_q8, 20.0f * luma_eps_scale);
       guided_strength_fused = true;
     } else {
-      GuidedStatsFromDecimNeon(yq8, sq_q, a_q16, b_q16, mean_i);
+      GuidedStatsFromDecimNeon(yq8, sq_q, a_q16, b_q16, mean_i,
+                               20.0f * luma_eps_scale);
     }
     luma_prepared = true;
     luma_fused = true;
@@ -7689,7 +10159,7 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       CpuHasAvx2Output() && UseStreamedLumaAvx2() &&
       UseFusedQuarterTextureAvx2() && y8.isContinuous() &&
       !y8.isSubmatrix()) {
-    FusedLumaChainAvx2Exact(y8, tex_q, yq8, sq_q);
+    FusedLumaChainAvx2Exact(y8, tex_q, yq8, sq_q, FastLumaLiteEnabled());
     luma_prepared = true;
     quarter_texture_fused = true;
   }
@@ -7710,11 +10180,13 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   // is slightly stronger than the HDR reference at the same numerical eps,
   // so cap the high-gain value at 20 to retain the same strong-edge contrast.
   const float luma_nr_eps =
-      linear_input ? static_cast<float>(8 + ((20 - 8) * gain_t_q8 + 128) / 256)
-                   : 20.0f;
+      (linear_input
+           ? static_cast<float>(8 + ((20 - 8) * gain_t_q8 + 128) / 256)
+           : 20.0f) *
+      luma_eps_scale;
 #if defined(CYPERSTEREO_HAVE_NEON)
   if (!luma_fused && UseNeonGuided()) {
-    GuidedStatsIntNeon(y_bl, a_q16, b_q16, mean_i);
+    GuidedStatsIntNeon(y_bl, a_q16, b_q16, mean_i, 20.0f * luma_eps_scale);
   } else if (!luma_fused)
 #else
   if (!luma_fused)
@@ -7723,20 +10195,35 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
     if (!quarter_texture_fused)
       cv::resize(y_bl, yq8, quarter, 0, 0, cv::INTER_NEAREST);
     const cv::Size w3(3, 3);
-    cv::boxFilter(yq8, mean_i, CV_32F, w3, cv::Point(-1, -1), true,
-                  cv::BORDER_REFLECT);
     if (!quarter_texture_fused)
       cv::multiply(yq8, yq8, sq_q, 1.0, CV_16U);
-    cv::boxFilter(sq_q, mean_ii, CV_32F, w3, cv::Point(-1, -1), true,
-                  cv::BORDER_REFLECT);
+    bool guided_stats_fused = false;
+#if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
+    if (CpuHasAvx2Output() && UseStreamedGuidedCoeffAvx2() &&
+        FastFusedGuidedStatsEnabled() && quarter.width >= 8 &&
+        (quarter.width & 7) == 0 && quarter.height >= 2) {
+      FastGuidedStatsCoeffStreamedAvx2(yq8, sq_q, luma_nr_eps,
+                                       guided_strength_q8, mean_i, a_q16,
+                                       b_q16);
+      guided_stats_fused = true;
+      guided_strength_fused = true;
+    }
+#endif
+    if (!guided_stats_fused) {
+      cv::boxFilter(yq8, mean_i, CV_32F, w3, cv::Point(-1, -1), true,
+                    cv::BORDER_REFLECT);
+      cv::boxFilter(sq_q, mean_ii, CV_32F, w3, cv::Point(-1, -1), true,
+                    cv::BORDER_REFLECT);
+    }
     // a,b are quantized to fixed point HERE (a Q12, b Q4) and the smoothing
     // box3 runs on u16 planes: vs f32 boxes + convertTo this is 1.08 ->
     // 0.70 ms and the rounding lands within 1 LSB of the f32 path (the box
     // average smooths the quantization noise).
-    bool guided_coeff_done = false;
-    bool guided_smooth_done = false;
+    bool guided_coeff_done = guided_stats_fused;
+    bool guided_smooth_done = guided_stats_fused;
 #if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
-    if (CpuHasAvx2Output() && UseStreamedGuidedCoeffAvx2() &&
+    if (guided_stats_fused) {
+    } else if (CpuHasAvx2Output() && UseStreamedGuidedCoeffAvx2() &&
         quarter.width >= 2 && quarter.height >= 2) {
       FastGuidedCoeffStrengthStreamedAvx2(
           mean_i, mean_ii, luma_nr_eps, guided_strength_q8,
@@ -7853,7 +10340,9 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
         chroma_box_ring_cr.ptr<uint16_t>(),
         chroma_box_ring_cb.ptr<uint16_t>(),
         chroma_down_cr.ptr<uint8_t>(), chroma_down_cb.ptr<uint8_t>()};
-    const int status = cyper_chroma_proto::ChromaGaussAreaBox7Neon(
+    const int status = (FastChromaLiteEnabled()
+                            ? cyper_chroma_proto::ChromaGauss3AreaBox7Neon
+                            : cyper_chroma_proto::ChromaGaussAreaBox7Neon)(
         ch_h[1].ptr<uint8_t>(), ch_h[1].step,
         ch_h[2].ptr<uint8_t>(), ch_h[2].step,
         cr_h.ptr<uint8_t>(), cr_h.step, cb_h.ptr<uint8_t>(), cb_h.step,
@@ -7884,7 +10373,10 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
         chroma_box_ring_cr.ptr<uint16_t>(),
         chroma_box_ring_cb.ptr<uint16_t>(),
         chroma_down_cr.ptr<uint8_t>(), chroma_down_cb.ptr<uint8_t>()};
-    const int status = cyper_chroma_x86_proto::ChromaGaussAreaBox7Avx2(
+    const int status =
+        (FastChromaLiteEnabled()
+             ? cyper_chroma_x86_proto::ChromaGauss3AreaBox7Avx2
+             : cyper_chroma_x86_proto::ChromaGaussAreaBox7Avx2)(
         ch_h[1].ptr<uint8_t>(), ch_h[1].step,
         ch_h[2].ptr<uint8_t>(), ch_h[2].step,
         cr_h.ptr<uint8_t>(), cr_h.step, cb_h.ptr<uint8_t>(), cb_h.step,
@@ -7928,10 +10420,27 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   // LINEAR pipeline; luma now arrives tone-mapped by the WB LUT, so map
   // the thresholds through the same curve to keep the gate firing on the
   // same scene content.
-  const float kShadowLo = static_cast<float>(
-      linear_input ? 16.0 : ToneEncode(16.0));
-  const float kShadowHi = static_cast<float>(
-      linear_input ? 64.0 : ToneEncode(64.0));
+  // Digital exposure multiplies luma before this gate. Scale the shadow
+  // band with it, or a region that was dark enough to suppress chroma noise
+  // is lifted into the "keep" band and the noise comes back as colour.
+  double gate_exposure = exposure_scale;
+#if (defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)) || \
+    defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
+  if (stream_wb != nullptr && stream_wb->DisplayExposure() >= 1.0)
+    gate_exposure = stream_wb->DisplayExposure();
+#endif
+  if (!(gate_exposure >= 1.0)) gate_exposure = 1.0;
+  if (gate_exposure > 8.0) gate_exposure = 8.0;
+  float shadow_lo = static_cast<float>(linear_input ? 16.0 * gate_exposure
+                                                    : ToneEncode(16.0));
+  float shadow_hi = static_cast<float>(linear_input ? 64.0 * gate_exposure
+                                                    : ToneEncode(64.0));
+  if (linear_input && shadow_hi > 220.0f) {
+    shadow_lo *= 220.0f / shadow_hi;
+    shadow_hi = 220.0f;
+  }
+  const float kShadowLo = shadow_lo;
+  const float kShadowHi = shadow_hi;
   const float kShadowScale = 255.0f / (kShadowHi - kShadowLo);
   // The saturation gain (HSC) is folded into the keep gate, which turns it
   // from a Q8 attenuator (255 = 1.0x) into a Q7 chroma gain (128 = 1.0x,
@@ -7952,6 +10461,7 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   cv::Mat *gate_blend = &chroma_blend_q8;
   cv::Mat *gate_hue = &hue_protect_q8;
   cv::Mat *gate_min_keep = &hue_min_keep_q8;
+  const bool flat_chroma_nr = linear_input && FastFlatChromaEnabled();
   FastParallelForRows(quarter.height, "gate", [&](int y) {
     const int hy = y << 1;
     const uchar *src_cr0 = gate_source_cr->ptr<uchar>(hy);
@@ -7974,7 +10484,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       FastChromaGate8U16Neon(
           src_cr0 + hx, src_cr1 + hx, src_cb0 + hx, src_cb1 + hx,
           pt + x, pl + x, pbase_cr + x, pbase_cb + x, kShadowLo,
-          kShadowScale, kSatQ128, pr + x, pblend + x, phue + x, pmin + x);
+          kShadowScale, kSatQ128, flat_chroma_nr, pr + x, pblend + x,
+          phue + x, pmin + x);
     }
 #elif defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
     if (CpuHasAvx2Output()) {
@@ -7983,7 +10494,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
         FastChromaGate8U16Avx2(
             src_cr0 + hx, src_cr1 + hx, src_cb0 + hx, src_cb1 + hx,
             pt + x, pl + x, pbase_cr + x, pbase_cb + x, kShadowLo,
-            kShadowScale, kSatQ128, pr + x, pblend + x, phue + x, pmin + x);
+            kShadowScale, kSatQ128, flat_chroma_nr, pr + x, pblend + x,
+            phue + x, pmin + x);
       }
     }
 #endif
@@ -8042,8 +10554,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
         residual_keep = (std::max)(residual_keep, local_protect);
         color_protect = (std::max)(color_protect, local_protect);
       }
-      const int residual_q7 = residual_keep * kSatQ128 / 255;
-      pr[x] = static_cast<uchar>(residual_q7 > 255 ? 255 : residual_q7);
+      int residual_q7 = residual_keep * kSatQ128 / 255;
+      if (residual_q7 > 255) residual_q7 = 255;
       // HDR ChromaNR blends 56.25% around neutral and only 15.625% on
       // stable saturated colour. Dense near-neutral texture may use the full
       // false-colour correction, while colour confidence reduces the blend.
@@ -8053,17 +10565,33 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       // around weakly coloured high-frequency detail.
       const int texture_blend = strength * (255 - protect) / 255;
       blend_q8 = (std::max)(blend_q8, texture_blend);
+      int hue_q8 = color_protect;
+      if (flat_chroma_nr) {
+        FastFlatChromaCell(sum_cr, sum_cb, pbase_cr[x], pbase_cb[x],
+                           residual_q7, blend_q8, hue_q8);
+      }
+      pr[x] = static_cast<uchar>(residual_q7);
       pblend[x] = static_cast<uchar>(blend_q8);
-      phue[x] = static_cast<uchar>(color_protect);
+      phue[x] = static_cast<uchar>(hue_q8);
       pmin[x] = static_cast<uchar>(protect * 216 / 255);
     }
   });
+  const bool highlight_nr = linear_input && FastHighlightEnabled();
   const auto detail_t3 = detail_now();
-
   // Reconstruct the filtered chroma candidate on the half grid, then remove
   // isolated speckle with median3. The source half-grid chroma remains the
   // dominant term on real colour and edges in the blend below.
   const int base_q7 = (std::min)(kSatQ128, 255);
+#if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
+  const bool fused_chroma_tail = CpuHasAvx2Output() &&
+                                 FastFusedChromaTailEnabled() &&
+                                 half.width >= 34;
+#else
+  const bool fused_chroma_tail = false;
+#endif
+#if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
+  const bool tail_rows = FastNeonTailRowsEnabled();
+#endif
 #if CV_SIMD128
   const cv::v_int32x4 round63 = cv::v_setall_s32(63);
   const cv::v_int32x4 round64 = cv::v_setall_s32(64);
@@ -8101,7 +10629,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   cv::Mat *const reconstruct_planes[2] = {&cr_h, &cb_h};
   const cv::Mat *const reconstruct_bases[2] = {&base_cr_q, &base_cb_q};
   const cv::Mat *const reconstruct_keep = &residual_keep_q8;
-  FastParallelForRows(half.height / 2, "reconstruct", [&](int pair_row) {
+  FastParallelForRows(fused_chroma_tail ? 0 : half.height / 2, "reconstruct",
+                      [&](int pair_row) {
     const int y = pair_row << 1;
     const int yq = (std::min)(y >> 1, quarter.height - 1);
     const uchar *pr = reconstruct_keep->ptr<uchar>(yq);
@@ -8111,6 +10640,11 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       uchar *pv0 = plane->ptr<uchar>(y);
       uchar *pv1 = plane->ptr<uchar>(y + 1);
       int x = 0;
+#if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
+      if (tail_rows)
+        x = FastReconstructRowPairNeon(pbase, pr, pv0, pv1, half.width,
+                                       base_q7);
+#endif
 #if CV_SIMD128 || \
     (defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__))
       for (; x + 16 <= half.width; x += 16) {
@@ -8175,7 +10709,7 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       }
     }
   });
-  if ((half.height & 1) != 0) {
+  if (!fused_chroma_tail && (half.height & 1) != 0) {
     const int reconstruction_y = half.height - 1;
     const int yq = (std::min)(reconstruction_y >> 1,
                               quarter.height - 1);
@@ -8195,15 +10729,17 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       }
     }
   }
+  if (!fused_chroma_tail) {
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
-  FastMedian3U8Neon(cr_h, cr_med_h);
-  FastMedian3U8Neon(cb_h, cb_med_h);
+    FastMedian3U8Neon(cr_h, cr_med_h);
+    FastMedian3U8Neon(cb_h, cb_med_h);
 #else
-  cv::medianBlur(cr_h, cr_med_h, 3);
-  cv::medianBlur(cb_h, cb_med_h, 3);
+    cv::medianBlur(cr_h, cr_med_h, 3);
+    cv::medianBlur(cb_h, cb_med_h, 3);
 #endif
-  std::swap(cr_h, cr_med_h);
-  std::swap(cb_h, cb_med_h);
+    std::swap(cr_h, cr_med_h);
+    std::swap(cb_h, cb_med_h);
+  }
   const auto detail_t4 = detail_now();
 
   // Match the HDR ChromaNR strength policy instead of replacing every pixel
@@ -8255,18 +10791,14 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   };
   const cv::Mat *blend_source_cr = &ch_h[1];
   const cv::Mat *blend_source_cb = &ch_h[2];
-  cv::Mat *blend_filtered_cr = &cr_h;
-  cv::Mat *blend_filtered_cb = &cb_h;
   const cv::Mat *blend_map = &chroma_blend_q8;
   const cv::Mat *blend_hue_map = &hue_protect_q8;
   const cv::Mat *blend_min_map = &hue_min_keep_q8;
   const cv::Mat *blend_base_cr = &base_cr_q;
   const cv::Mat *blend_base_cb = &base_cb_q;
-  FastParallelForRows(half.height, "blend", [&](int y) {
+  const auto blend_row = [&](int y, uchar *dst_cr, uchar *dst_cb) {
     const uchar *src_cr = blend_source_cr->ptr<uchar>(y);
     const uchar *src_cb = blend_source_cb->ptr<uchar>(y);
-    uchar *dst_cr = blend_filtered_cr->ptr<uchar>(y);
-    uchar *dst_cb = blend_filtered_cb->ptr<uchar>(y);
     const int yq = (std::min)(y >> 1, quarter.height - 1);
     const uchar *pblend = blend_map->ptr<uchar>(yq);
     const uchar *phue = blend_hue_map->ptr<uchar>(yq);
@@ -8275,6 +10807,9 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
     const uchar *pbase_cb = blend_base_cb->ptr<uchar>(yq);
     int x = 0;
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
+    if (tail_rows)
+      x = FastBlendRowNeon(src_cr, src_cb, dst_cr, dst_cb, pblend, phue,
+                           pmin, hue_guard, half.width);
     for (; x + 16 <= half.width; x += 16) {
       const int xq = x >> 1;
       FastBlendHue16Neon(
@@ -8431,6 +10966,207 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       dst_cr[x] = static_cast<uchar>(128 + cr);
       dst_cb[x] = static_cast<uchar>(128 + cb);
     }
+  };
+  // Once green clips, the colour of what is left is wrong (a lamp's rim
+  // turns blue under a warm WB), so fade chroma to neutral as the local
+  // luma approaches the WB LUT's full-scale white.
+  float hd_lo = 0.0f, hd_scale = 0.0f;
+  if (highlight_nr) {
+    const float white = static_cast<float>(
+        (std::min)(255.0, (255.0 - kIspBlackLevel) * gate_exposure));
+    hd_lo = white * 0.80f;
+    hd_scale = 256.0f / (white * (0.95f - 0.80f));
+  }
+  const cv::Mat *hd_luma = gate_mean_luma;
+  // keep[xq] = 256 - clamp(t, 0, 256); returns false when the whole quarter
+  // row keeps 256 (no highlight), so the fade can be skipped for it.
+  const auto highlight_keep_row = [&](int yq, int16_t *keep) {
+    const float *pl = hd_luma->ptr<float>(yq);
+    int xq = 0;
+    bool any = false;
+#if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
+    // FCVTZS truncates toward zero like the scalar int cast.
+    const float32x4_t lo = vdupq_n_f32(hd_lo);
+    const float32x4_t scale = vdupq_n_f32(hd_scale);
+    const int32x4_t zero = vdupq_n_s32(0);
+    const int32x4_t full = vdupq_n_s32(256);
+    uint32x4_t hit = vdupq_n_u32(0);
+    for (; xq + 8 <= quarter.width; xq += 8) {
+      const int32x4_t t0 = vminq_s32(vmaxq_s32(vcvtq_s32_f32(vmulq_f32(
+          vsubq_f32(vld1q_f32(pl + xq), lo), scale)), zero), full);
+      const int32x4_t t1 = vminq_s32(vmaxq_s32(vcvtq_s32_f32(vmulq_f32(
+          vsubq_f32(vld1q_f32(pl + xq + 4), lo), scale)), zero), full);
+      hit = vorrq_u32(hit, vreinterpretq_u32_s32(vorrq_s32(t0, t1)));
+      vst1q_s16(keep + xq,
+                vsubq_s16(vdupq_n_s16(256),
+                          vcombine_s16(vmovn_s32(t0), vmovn_s32(t1))));
+    }
+    any = vmaxvq_u32(hit) != 0;
+#elif defined(__AVX2__) || defined(_M_AVX2)
+    // vcvttps truncates toward zero like the scalar int cast.
+    const __m256 lo = _mm256_set1_ps(hd_lo);
+    const __m256 scale = _mm256_set1_ps(hd_scale);
+    const __m256i full = _mm256_set1_epi32(256);
+    __m256i hit = _mm256_setzero_si256();
+    for (; xq + 8 <= quarter.width; xq += 8) {
+      const __m256i t = _mm256_min_epi32(
+          _mm256_max_epi32(
+              _mm256_cvttps_epi32(_mm256_mul_ps(
+                  _mm256_sub_ps(_mm256_loadu_ps(pl + xq), lo), scale)),
+              _mm256_setzero_si256()),
+          full);
+      hit = _mm256_or_si256(hit, t);
+      const __m256i k = _mm256_sub_epi32(full, t);
+      _mm_storeu_si128(reinterpret_cast<__m128i *>(keep + xq),
+                       _mm_packs_epi32(_mm256_castsi256_si128(k),
+                                       _mm256_extracti128_si256(k, 1)));
+    }
+    any = !_mm256_testz_si256(hit, hit);
+#endif
+    for (; xq < quarter.width; ++xq) {
+      const int t = static_cast<int>((pl[xq] - hd_lo) * hd_scale);
+      const int clamped = t <= 0 ? 0 : (t >= 256 ? 256 : t);
+      keep[xq] = static_cast<int16_t>(256 - clamped);
+      any = any || clamped != 0;
+    }
+    return any;
+  };
+  // dst = 128 + (dst - 128) * keep / 256 with C truncating division.  Half
+  // pixels past 2 * quarter.width have no quarter cell and stay unchanged.
+  const auto desaturate_row = [&](const int16_t *keep, uchar *dst_cr,
+                                  uchar *dst_cb) {
+    const int x_limit = (std::min)(half.width, 2 * quarter.width);
+    int x = 0;
+#if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
+    const int16x8_t center = vdupq_n_s16(128);
+    const int16x8_t round_toward_zero = vdupq_n_s16(255);
+    // |d| <= 128 and keep <= 256, so d * keep fits in i16 ([-32768, 32512]).
+    const auto fade8 = [&](uint8x8_t value, int16x8_t keep8) {
+      const int16x8_t d =
+          vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(value)), center);
+      int16x8_t product = vmulq_s16(d, keep8);
+      product = vaddq_s16(
+          product, vandq_s16(vshrq_n_s16(product, 15), round_toward_zero));
+      return vqmovun_s16(vaddq_s16(vshrq_n_s16(product, 8), center));
+    };
+    for (; x + 16 <= x_limit; x += 16) {
+      const int16x8_t k = vld1q_s16(keep + (x >> 1));
+      const int16x8x2_t k2 = vzipq_s16(k, k);
+      for (uchar *plane : {dst_cr, dst_cb}) {
+        const uint8x16_t value = vld1q_u8(plane + x);
+        vst1q_u8(plane + x,
+                 vcombine_u8(fade8(vget_low_u8(value), k2.val[0]),
+                             fade8(vget_high_u8(value), k2.val[1])));
+      }
+    }
+#elif defined(__AVX2__) || defined(_M_AVX2)
+    // Same i16 product and toward-zero rounding as the NEON loop.
+    const __m256i center = _mm256_set1_epi16(128);
+    const __m256i round_toward_zero = _mm256_set1_epi16(255);
+    for (; x + 16 <= x_limit; x += 16) {
+      const __m128i k8 = _mm_loadu_si128(
+          reinterpret_cast<const __m128i *>(keep + (x >> 1)));
+      const __m256i k16 = _mm256_set_m128i(_mm_unpackhi_epi16(k8, k8),
+                                           _mm_unpacklo_epi16(k8, k8));
+      for (uchar *plane : {dst_cr, dst_cb}) {
+        const __m256i d = _mm256_sub_epi16(
+            _mm256_cvtepu8_epi16(_mm_loadu_si128(
+                reinterpret_cast<const __m128i *>(plane + x))),
+            center);
+        __m256i product = _mm256_mullo_epi16(d, k16);
+        product = _mm256_add_epi16(
+            product, _mm256_and_si256(_mm256_srai_epi16(product, 15),
+                                      round_toward_zero));
+        const __m256i value =
+            _mm256_add_epi16(_mm256_srai_epi16(product, 8), center);
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(plane + x),
+                         _mm_packus_epi16(_mm256_castsi256_si128(value),
+                                          _mm256_extracti128_si256(value, 1)));
+      }
+    }
+#endif
+    for (; x < x_limit; ++x) {
+      const int k = keep[x >> 1];
+      if (k == 256) continue;
+      dst_cr[x] = static_cast<uchar>(
+          128 + (((static_cast<int>(dst_cr[x]) - 128) * k) / 256));
+      dst_cb[x] = static_cast<uchar>(
+          128 + (((static_cast<int>(dst_cb[x]) - 128) * k) / 256));
+    }
+  };
+
+  // Blend/hue and the highlight fade share one pass over row pairs: both
+  // rows of a pair use the same quarter-grid keep factors, and the fade
+  // rewrites the blended row while it is still in L1.  Reconstruct and
+  // median3 stay full-plane passes; streaming them per row measured slower
+  // on Cortex-A78AE.
+#if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
+  if (fused_chroma_tail) {
+    // The filtered planes are only read; reconstructed rows go to the ring,
+    // and each median row is blended and faded while it is still in L1.
+    const uint64_t epoch = NextFastChromaTailEpoch();
+    const cv::Mat *const tail_src[2] = {&cr_h, &cb_h};
+    const cv::Mat *const tail_base[2] = {&base_cr_q, &base_cb_q};
+    const cv::Mat *const tail_keep = &residual_keep_q8;
+    cv::Mat *const tail_dst[2] = {&cr_med_h, &cb_med_h};
+    cr_med_h.create(half, CV_8UC1);
+    cb_med_h.create(half, CV_8UC1);
+    FastParallelForRows((half.height + 1) / 2, "blend", [&](int pair) {
+      FastChromaTailRing &ring = GetFastChromaTailRing();
+      ring.Reset(epoch, half.width, quarter.width);
+      const auto ensure = [&](int r) {
+        const int slot = r & 3;
+        if (ring.row[slot] == r) return;
+        const int yq = (std::min)(r >> 1, quarter.height - 1);
+        for (int c = 0; c < 2; ++c)
+          FastReconstructRowAvx2(tail_src[c]->ptr<uchar>(r),
+                                 ring.Row(slot, c),
+                                 tail_base[c]->ptr<uchar>(yq),
+                                 tail_keep->ptr<uchar>(yq), half.width,
+                                 quarter.width, base_q7);
+        ring.row[slot] = r;
+      };
+      int16_t *const hd_keep = ring.hd_keep.data();
+      const int y0 = pair << 1;
+      const bool hd_any =
+          highlight_nr &&
+          highlight_keep_row((std::min)(pair, quarter.height - 1), hd_keep);
+      for (int y = y0; y < (std::min)(y0 + 2, half.height); ++y) {
+        const int up = y > 0 ? y - 1 : 0;
+        const int dn = y + 1 < half.height ? y + 1 : half.height - 1;
+        ensure(up);
+        ensure(y);
+        ensure(dn);
+        uchar *dst[2];
+        for (int c = 0; c < 2; ++c) {
+          dst[c] = tail_dst[c]->ptr<uchar>(y);
+          FastMedian3RowAvx2(ring.Row(up & 3, c), ring.Row(y & 3, c),
+                             ring.Row(dn & 3, c), dst[c], half.width);
+        }
+        blend_row(y, dst[0], dst[1]);
+        if (hd_any) desaturate_row(hd_keep, dst[0], dst[1]);
+      }
+    });
+    std::swap(cr_h, cr_med_h);
+    std::swap(cb_h, cb_med_h);
+  }
+#endif
+  cv::Mat *const blend_planes[2] = {&cr_h, &cb_h};
+  FastParallelForRows(fused_chroma_tail ? 0 : (half.height + 1) / 2, "blend",
+                      [&](int pair) {
+    static thread_local std::vector<int16_t> hd_scratch;
+    hd_scratch.resize(static_cast<size_t>(quarter.width) + 8);
+    int16_t *const hd_keep = hd_scratch.data();
+    const int y0 = pair << 1;
+    const bool hd_any =
+        highlight_nr &&
+        highlight_keep_row((std::min)(pair, quarter.height - 1), hd_keep);
+    for (int y = y0; y < (std::min)(y0 + 2, half.height); ++y) {
+      uchar *dst_cr = blend_planes[0]->ptr<uchar>(y);
+      uchar *dst_cb = blend_planes[1]->ptr<uchar>(y);
+      blend_row(y, dst_cr, dst_cb);
+      if (hd_any) desaturate_row(hd_keep, dst_cr, dst_cb);
+    }
   });
   const auto detail_t5 = detail_now();
 
@@ -8466,20 +11202,18 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   }
 #if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
   if (CpuHasAvx2Output()) {
-    FusedOutputAvx2Paired(y8, a_q16, b_q16, cr_h, cb_h, color, apply_tone);
+    FusedOutputAvx2Paired(y8, a_q16, b_q16, cr_h, cb_h, color, tone_luts);
     report_detail();
     return;
   }
 #endif
 #if defined(CYPERSTEREO_HAVE_NEON)
   if (UseNeonOutput()) {
-    FusedOutputNeon(y8, a_q16, b_q16, cr_h, cb_h, color, apply_tone);
+    FusedOutputNeon(y8, a_q16, b_q16, cr_h, cb_h, color, tone_luts);
     report_detail();
     return;
   }
 #endif
-  const FastBalancedToneLuts *tone_luts =
-      apply_tone ? &GetFastBalancedToneLuts() : nullptr;
   for (int y = 0; y < full.height; ++y) {
     const int yh = (y >> 1) < half.height ? (y >> 1) : half.height - 1;
     const int yq = (y >> 2) < quarter.height ? (y >> 2) : quarter.height - 1;
@@ -8706,7 +11440,7 @@ inline void ApplyISP(cv::Mat &raw, cv::Mat &color, WhiteBalance &wb,
 inline void ApplyFastBalancedISPImpl(
     cv::Mat &raw, cv::Mat &color, WhiteBalance &wb, const char *name,
     double sensor_gain, BayerConversion bayer,
-    IspPixelFormat output_format) {
+    IspPixelFormat output_format, bool raw_bayer_nr_done = false) {
   CV_Assert(output_format == IspPixelFormat::kBgr888 ||
             output_format == IspPixelFormat::kUyvy422Bt601FullRange);
   if (output_format == IspPixelFormat::kUyvy422Bt601FullRange)
@@ -8732,9 +11466,10 @@ inline void ApplyFastBalancedISPImpl(
   // can swap the red/blue planes in registers for the opposite CFA phase.
   const bool fused_bayer_supported = true;
 #else
-  // The AVX2 implementation currently handles the B-G/G-R phase only.
+  // The AVX2 front exchanges red/blue in registers for the R-G/G-B phase;
+  // CYPERSTEREO_FAST_FUSED_BG=0 restores OpenCV EA for that phase.
   const bool fused_bayer_supported =
-      bayer == BayerConversion::kColorBayerRg2Bgr;
+      bayer == BayerConversion::kColorBayerRg2Bgr || FastFusedBgEnabled();
 #endif
   const bool fused_demosaic = UseFastFusedDemosaic() &&
                               fused_geometry_safe &&
@@ -8743,19 +11478,25 @@ inline void ApplyFastBalancedISPImpl(
       ? cv::COLOR_BayerBG2BGR_EA
       : cv::COLOR_BayerRG2BGR_EA;
   const bool use_bayer_nr = FastBalancedBayerNrEnabled() &&
-                            sensor_gain >= 3.0;
+                            sensor_gain >= 3.0 && !raw_bayer_nr_done;
   const bool apply_tone =
       output_format == IspPixelFormat::kBgr888 &&
       FastBalancedGammaEnabled();
+  wb.SetDisplayExposure(apply_tone && GetFastExposureConfig().enabled,
+                        sensor_gain);
   const bool streamed_wb_front =
       fused_demosaic && FastBalancedStreamedWbFrontEnabled() &&
+#if !defined(CYPERSTEREO_HAVE_NEON)
+      !use_bayer_nr && raw.cols >= 36 &&
+#endif
       (raw.cols & 3) == 0 && (raw.rows & 3) == 0;
   static thread_local cv::Mat raw_wb;
 
   if (!IspProfiler::Enabled()) {
     if (streamed_wb_front) {
       SuppressFalseColorImpl(nullptr, color, sensor_gain, true, apply_tone,
-                             bayer, &raw, &wb, use_bayer_nr, output_format);
+                             bayer, &raw, &wb, use_bayer_nr, output_format,
+                             wb.DisplayExposure());
       return;
     }
     if (use_bayer_nr) {
@@ -8768,11 +11509,13 @@ inline void ApplyFastBalancedISPImpl(
     }
     if (fused_demosaic)
       SuppressFalseColorImpl(&raw_wb, color, sensor_gain, true, apply_tone,
-                             bayer, nullptr, nullptr, false, output_format);
+                             bayer, nullptr, nullptr, false, output_format,
+                             wb.DisplayExposure());
     else {
       cv::cvtColor(raw_wb, color, bayer_code);
       SuppressFalseColorImpl(nullptr, color, sensor_gain, true, apply_tone,
-                             bayer, nullptr, nullptr, false, output_format);
+                             bayer, nullptr, nullptr, false, output_format,
+                             wb.DisplayExposure());
     }
     return;
   }
@@ -8780,7 +11523,8 @@ inline void ApplyFastBalancedISPImpl(
   const auto t0 = std::chrono::steady_clock::now();
   if (streamed_wb_front) {
     SuppressFalseColorImpl(nullptr, color, sensor_gain, true, apply_tone,
-                           bayer, &raw, &wb, use_bayer_nr, output_format);
+                           bayer, &raw, &wb, use_bayer_nr, output_format,
+                           wb.DisplayExposure());
     const auto t3 = std::chrono::steady_clock::now();
     const auto ms = [](std::chrono::steady_clock::duration d) {
       return std::chrono::duration<double, std::milli>(d).count();
@@ -8803,10 +11547,12 @@ inline void ApplyFastBalancedISPImpl(
   const auto t2 = std::chrono::steady_clock::now();
   if (fused_demosaic)
     SuppressFalseColorImpl(&raw_wb, color, sensor_gain, true, apply_tone,
-                           bayer, nullptr, nullptr, false, output_format);
+                           bayer, nullptr, nullptr, false, output_format,
+                           wb.DisplayExposure());
   else
     SuppressFalseColorImpl(nullptr, color, sensor_gain, true, apply_tone,
-                           bayer, nullptr, nullptr, false, output_format);
+                           bayer, nullptr, nullptr, false, output_format,
+                           wb.DisplayExposure());
   const auto t3 = std::chrono::steady_clock::now();
   const auto ms = [](std::chrono::steady_clock::duration d) {
     return std::chrono::duration<double, std::milli>(d).count();
@@ -8819,9 +11565,10 @@ inline void ApplyFastBalancedISPImpl(
 inline void ApplyFastBalancedISP(
     cv::Mat &raw, cv::Mat &color, WhiteBalance &wb, const char *name,
     double sensor_gain = 1.0,
-    BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr) {
+    BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr,
+    bool raw_bayer_nr_done = false) {
   ApplyFastBalancedISPImpl(raw, color, wb, name, sensor_gain, bayer,
-                           IspPixelFormat::kBgr888);
+                           IspPixelFormat::kBgr888, raw_bayer_nr_done);
 }
 
 // Direct processed UYVY422 output.  `uyvy` is created as CV_8UC2 with the
@@ -8831,11 +11578,12 @@ inline void ApplyFastBalancedISP(
 inline void ApplyFastBalancedISPUyvy422(
     cv::Mat &raw, cv::Mat &uyvy, WhiteBalance &wb, const char *name,
     double sensor_gain = 1.0,
-    BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr) {
+    BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr,
+    bool raw_bayer_nr_done = false) {
   CV_Assert(raw.cols >= 2 && (raw.cols & 1) == 0);
   ApplyFastBalancedISPImpl(
       raw, uyvy, wb, name, sensor_gain, bayer,
-      IspPixelFormat::kUyvy422Bt601FullRange);
+      IspPixelFormat::kUyvy422Bt601FullRange, raw_bayer_nr_done);
   CV_Assert(uyvy.type() == CV_8UC2 && uyvy.size() == raw.size());
 }
 
@@ -8938,11 +11686,12 @@ class FastBalancedIspWorker {
   void Submit(cv::Mat &raw, cv::Mat &color, WhiteBalance &wb,
               const char *name, double sensor_gain,
               BayerConversion bayer, int big_little_lane = -1,
-              IspPixelFormat output_format = IspPixelFormat::kBgr888) {
+              IspPixelFormat output_format = IspPixelFormat::kBgr888,
+              bool raw_bayer_nr_done = false) {
     std::unique_lock<std::mutex> lock(mutex_);
     done_.wait(lock, [this] { return !has_job_; });
     job_ = Job{&raw, &color, &wb, name, sensor_gain, bayer,
-               big_little_lane, output_format};
+               big_little_lane, output_format, raw_bayer_nr_done};
     error_ = nullptr;
     has_job_ = true;
     lock.unlock();
@@ -8967,6 +11716,7 @@ class FastBalancedIspWorker {
     BayerConversion bayer;
     int big_little_lane;
     IspPixelFormat output_format;
+    bool raw_bayer_nr_done;
   };
 
   void Run() {
@@ -8982,7 +11732,7 @@ class FastBalancedIspWorker {
         FastIspBigLittleLaneGuard lane_guard(job.big_little_lane);
         ApplyFastBalancedISPImpl(*job.raw, *job.color, *job.wb, job.name,
                                  job.sensor_gain, job.bayer,
-                                 job.output_format);
+                                 job.output_format, job.raw_bayer_nr_done);
       } catch (...) {
         error = std::current_exception();
       }
@@ -9011,12 +11761,15 @@ struct FastBalancedIspJob {
   const char *name;
   double sensor_gain;
   BayerConversion bayer;
+  bool raw_bayer_nr_done;
 
   FastBalancedIspJob(
       cv::Mat &r, cv::Mat &c, WhiteBalance &w, const char *n,
       double gain = 1.0,
-      BayerConversion b = BayerConversion::kColorBayerRg2Bgr)
-      : raw(&r), color(&c), wb(&w), name(n), sensor_gain(gain), bayer(b) {}
+      BayerConversion b = BayerConversion::kColorBayerRg2Bgr,
+      bool nr_done = false)
+      : raw(&r), color(&c), wb(&w), name(n), sensor_gain(gain), bayer(b),
+        raw_bayer_nr_done(nr_done) {}
 };
 
 struct FastBalancedIspUyvyJob {
@@ -9026,12 +11779,15 @@ struct FastBalancedIspUyvyJob {
   const char *name;
   double sensor_gain;
   BayerConversion bayer;
+  bool raw_bayer_nr_done;
 
   FastBalancedIspUyvyJob(
       cv::Mat &r, cv::Mat &u, WhiteBalance &w, const char *n,
       double gain = 1.0,
-      BayerConversion b = BayerConversion::kColorBayerRg2Bgr)
-      : raw(&r), uyvy(&u), wb(&w), name(n), sensor_gain(gain), bayer(b) {}
+      BayerConversion b = BayerConversion::kColorBayerRg2Bgr,
+      bool nr_done = false)
+      : raw(&r), uyvy(&u), wb(&w), name(n), sensor_gain(gain), bayer(b),
+        raw_bayer_nr_done(nr_done) {}
 };
 
 namespace detail {
@@ -9043,6 +11799,7 @@ struct FastBalancedIspDispatchJob {
   double sensor_gain = 1.0;
   BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr;
   IspPixelFormat output_format = IspPixelFormat::kBgr888;
+  bool raw_bayer_nr_done = false;
 };
 
 inline void ApplyFastBalancedISPParallelImpl(
@@ -9084,13 +11841,15 @@ inline void ApplyFastBalancedISPParallelImpl(
     workers[i - 1]->Submit(*jobs[i].raw, *jobs[i].output, *jobs[i].wb,
                            jobs[i].name, jobs[i].sensor_gain, jobs[i].bayer,
                            big_little_batch ? i : -1,
-                           jobs[i].output_format);
+                           jobs[i].output_format,
+                           jobs[i].raw_bayer_nr_done);
   std::exception_ptr caller_error;
   try {
     FastIspBigLittleLaneGuard lane_guard(big_little_batch ? 0 : -1);
     ApplyFastBalancedISPImpl(
         *jobs[0].raw, *jobs[0].output, *jobs[0].wb, jobs[0].name,
-        jobs[0].sensor_gain, jobs[0].bayer, jobs[0].output_format);
+        jobs[0].sensor_gain, jobs[0].bayer, jobs[0].output_format,
+        jobs[0].raw_bayer_nr_done);
   } catch (...) {
     caller_error = std::current_exception();
   }
@@ -9121,6 +11880,7 @@ inline void ApplyFastBalancedISPParallel(const FastBalancedIspJob *jobs,
     dispatch[i].sensor_gain = jobs[i].sensor_gain;
     dispatch[i].bayer = jobs[i].bayer;
     dispatch[i].output_format = IspPixelFormat::kBgr888;
+    dispatch[i].raw_bayer_nr_done = jobs[i].raw_bayer_nr_done;
   }
   detail::ApplyFastBalancedISPParallelImpl(dispatch.data(), n);
 }
@@ -9145,6 +11905,7 @@ inline void ApplyFastBalancedISPUyvy422Parallel(
     dispatch[i].bayer = jobs[i].bayer;
     dispatch[i].output_format =
         IspPixelFormat::kUyvy422Bt601FullRange;
+    dispatch[i].raw_bayer_nr_done = jobs[i].raw_bayer_nr_done;
   }
   detail::ApplyFastBalancedISPParallelImpl(dispatch.data(), n);
 }
@@ -9183,11 +11944,15 @@ struct IspFrameJob {
   const char *name;
   double sensor_gain;
   BayerConversion bayer;
+  // Fast modes only: the RAW already carries the FPGA BayerNR.
+  bool raw_bayer_nr_done;
 
   IspFrameJob(
       cv::Mat &r, cv::Mat &o, const char *n, double gain = 1.0,
-      BayerConversion b = BayerConversion::kColorBayerRg2Bgr)
-      : raw(&r), output(&o), name(n), sensor_gain(gain), bayer(b) {}
+      BayerConversion b = BayerConversion::kColorBayerRg2Bgr,
+      bool nr_done = false)
+      : raw(&r), output(&o), name(n), sensor_gain(gain), bayer(b),
+        raw_bayer_nr_done(nr_done) {}
 };
 
 namespace detail {
@@ -9230,6 +11995,7 @@ class IspProcessor {
         dispatch[i].sensor_gain = jobs[i].sensor_gain;
         dispatch[i].bayer = jobs[i].bayer;
         dispatch[i].output_format = output_format;
+        dispatch[i].raw_bayer_nr_done = jobs[i].raw_bayer_nr_done;
       }
       detail::ApplyFastBalancedISPParallelImpl(dispatch.data(), n);
       return;
@@ -9254,6 +12020,14 @@ class IspProcessor {
   }
   void ApplyParallel(std::initializer_list<IspFrameJob> jobs) {
     ApplyParallel(jobs.begin(), static_cast<int>(jobs.size()));
+  }
+
+  // Digital exposure the fast-balanced path applied to job slot `i` in the
+  // last ApplyParallel call; 1 when it is disabled (UYVY output, quality
+  // path, CYPERSTEREO_FAST_EXPOSURE=off). Read it between calls only.
+  double DigitalGain(int i) const {
+    if (!UsesFastBalanced() || i < 0 || i >= 4) return 1.0;
+    return fast_wb_[i].DisplayExposure();
   }
 
  private:
@@ -9606,11 +12380,18 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
               fs.exposure_time[p] = 0.0;
               fs.camera_temperature[p] = 0.0;
               fs.camera_gain[p] = 0.0;
+              fs.fpga_bayer_nr[p] = false;
               fs.image_midpoint_timestamp[p] = fs.image_timestamp;
             }
+            const int ae_marker = meta_u(smartsens_layout.ae_marker_col);
+            const bool ae_marker_ok =
+                (ae_marker >> 8) == kSmartSensAeMarkerHigh;
             const int active_cameras = std::min(prof.num_cameras, 4);
             for (int p = 0; p < active_cameras; ++p) {
               const int sensor = kSensorByPlane[p];
+              fs.fpga_bayer_nr[p] =
+                  ae_marker_ok &&
+                  ((ae_marker >> (kSmartSensFpgaBayerNrShift + sensor)) & 1);
               const int lines =
                   meta_u(smartsens_layout.exposure_base_col + sensor);
               fs.exposure_lines[p] = static_cast<uint16_t>(lines);
@@ -9634,6 +12415,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
               fs.exposure_time[p] = 0.0;
               fs.camera_temperature[p] = 0.0;
               fs.camera_gain[p] = 0.0;
+              fs.fpga_bayer_nr[p] = false;
               fs.image_midpoint_timestamp[p] = fs.image_timestamp;
             }
           }
