@@ -281,7 +281,8 @@ static void LogCaptureDiagnostics(
   if (log_status && capture_log_every > 0) {
     capture_log << "frame_rate " << frame_rate
                 << "  image_drops=" << frame_info.image_drop_count
-                << "  imu_drops=" << frame_info.imu_drop_count << '\n';
+                << "  imu_drops=" << frame_info.imu_drop_count
+                << "  torn_images=" << frame_info.torn_image_count << '\n';
   }
   std::cout << capture_log.str() << std::flush;
 }
@@ -518,12 +519,14 @@ static int run(int argc, char *argv[]) {
     double camera_temperature[4]{};
     uint32_t hardware_version = 0;
     uint32_t software_version = 0;
+    bool image_valid = true;
     cyperstereo::IMUStreamData imu_data{};
     cyperstereo::GNSSStreamData gnss_data{};
 
     {
       std::lock_guard<std::mutex> lock(frame_info.mtx);
       image_timestamp = frame_info.framestream.image_timestamp;
+      image_valid = frame_info.framestream.image_valid;
       hardware_version = frame_info.framestream.hardware_version;
       software_version = frame_info.framestream.software_version;
       cv::swap(frame_info.framestream.left_image, left_image);
@@ -556,7 +559,11 @@ static int run(int argc, char *argv[]) {
       break;
     }
 
-    if (is_smartsens)
+    if (!image_valid)
+    {
+      // Torn pixel planes: keep the previous preview, still log the IMU.
+    }
+    else if (is_smartsens)
     {
       TicToc proc;
       // Run the selected ISP pipeline. Fast-balanced is the default; the

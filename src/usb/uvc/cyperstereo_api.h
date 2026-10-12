@@ -379,6 +379,55 @@ static inline void DeinterleaveTwoPlanes(
   }
 }
 
+// After an FX3 self-resync the next frame can arrive full-length with an
+// intact metadata row while alternate DMA buffers of its upper rows hold
+// foreign data. The byte lanes are interleaved, so those rows are vertical
+// discontinuities in all planes at once, though a flat dark region can hide
+// the seam in one of them. A natural horizontal edge rarely lines up across
+// three of four differently aimed sensors, but it does across a stereo pair
+// (e.g. lines of text on a screen), so two planes need every plane and
+// stricter thresholds. Rows r and r-2 share the Bayer colour, as do columns
+// 8 apart.
+inline bool DetectTornImage(const cv::Mat *const *planes, int n, int rows,
+                            int *seam_rows) {
+  *seam_rows = 0;
+  if (n <= 0 || rows < 8 || planes[0]->cols <= 0) return false;
+  const bool quad = n >= 4;
+  const int ratio = quad ? 3 : 4;
+  const int floor_level = quad ? 4 : 8;
+  const int min_rows = quad ? 4 : 8;
+  const int min_planes = quad ? n - 1 : n;
+  constexpr int kColStep = 8;
+  const int cols = planes[0]->cols;
+  const int samples = (cols + kColStep - 1) / kColStep;
+  const int count = rows - 2;
+  thread_local std::vector<int> sums, sorted;
+  thread_local std::vector<unsigned char> hits;
+  sums.resize(count);
+  hits.assign(count, 0);
+  for (int p = 0; p < n; ++p) {
+    const cv::Mat &plane = *planes[p];
+    for (int r = 2; r < rows; ++r) {
+      const uchar *cur = plane.ptr<uchar>(r);
+      const uchar *up = plane.ptr<uchar>(r - 2);
+      int sum = 0;
+      for (int x = 0; x < cols; x += kColStep)
+        sum += std::abs(static_cast<int>(cur[x]) - static_cast<int>(up[x]));
+      sums[r - 2] = sum;
+    }
+    sorted = sums;
+    std::nth_element(sorted.begin(), sorted.begin() + count / 2, sorted.end());
+    const int64_t limit = static_cast<int64_t>(ratio) * sorted[count / 2] +
+                          static_cast<int64_t>(floor_level) * samples;
+    for (int i = 0; i < count; ++i)
+      if (sums[i] > limit) ++hits[i];
+  }
+  int seams = 0;
+  for (const unsigned char h : hits) seams += h >= min_planes;
+  *seam_rows = seams;
+  return seams >= min_rows;
+}
+
 static constexpr int kSmartSensCamWidth = 1280;
 static constexpr int kFx3FrameWidthStereo = kSmartSensCamWidth;
 static constexpr int kFx3FrameWidth = kSmartSensCamWidth * 2;
@@ -603,6 +652,12 @@ struct FrameStreamData {
   uint32_t software_version{0};
 	double image_timestamp;   // exposure END, common to all sensors (seconds)
 
+  // False when the pixel planes of this frame are corrupt (FX3 recovery
+  // burst: full-length transfer with a valid metadata row but torn image
+  // rows). The metadata, IMU and GNSS of such a frame are still valid and
+  // published; consumers must skip the image planes.
+  bool image_valid{true};
+
   // Per-display-plane AE telemetry, parsed from the SmartSens metadata row.
   // Index: 0=image1(left), 1=image2(right), 2=image3(left_front),
   // 3=image4(right_front). Unused SmartSens planes and all MT9V planes stay 0.
@@ -696,6 +751,13 @@ struct FrameInfo {
   uint64_t meta_bad_suppressed{0};
   int meta_bad_logged_in_window{0};
   std::chrono::steady_clock::time_point meta_bad_window_start{};
+
+  // Frames published with framestream.image_valid=false (torn pixel rows
+  // behind an intact metadata row).
+  uint64_t torn_image_count{0};
+  uint64_t torn_image_suppressed{0};
+  int torn_image_logged_in_window{0};
+  std::chrono::steady_clock::time_point torn_image_window_start{};
 
   void Init(const CameraProfile &p) {
     profile = p;
@@ -12211,7 +12273,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           lo_plane = &fs.right_image;
           hi_plane = &fs.left_image;
         }
-
+        fs.image_valid = true;
         const int imu_end_col =
             kMetaImuBaseCol + prof.imu_samples_per_frame * kImuWordsPerSample;
         const int gnss_end_col = prof.gnss_base_col + 23;
@@ -12349,6 +12411,48 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             return;
           }
 
+          {
+            const cv::Mat *planes[4] = {lo_plane, hi_plane, nullptr, nullptr};
+            int n_planes = 2;
+            if (prof.num_cameras >= 4) {
+              planes[0] = &fs.left_image;
+              planes[1] = &fs.right_image;
+              planes[2] = &fs.left_front_image;
+              planes[3] = &fs.right_front_image;
+              n_planes = 4;
+            }
+            int seam_rows = 0;
+            if (DetectTornImage(planes, n_planes, prof.meta_row, &seam_rows)) {
+              fs.image_valid = false;
+              ++frame_info.torn_image_count;
+              const auto now = std::chrono::steady_clock::now();
+              if (frame_info.torn_image_window_start.time_since_epoch()
+                          .count() == 0 ||
+                  now - frame_info.torn_image_window_start >
+                      std::chrono::seconds(5)) {
+                if (frame_info.torn_image_suppressed > 0) {
+                  std::cout << "[api] torn-image burst: "
+                            << frame_info.torn_image_suppressed
+                            << " further torn images suppressed from logging"
+                            << "  (total=" << frame_info.torn_image_count
+                            << ")" << std::endl;
+                }
+                frame_info.torn_image_window_start = now;
+                frame_info.torn_image_logged_in_window = 0;
+                frame_info.torn_image_suppressed = 0;
+              }
+              if (frame_info.torn_image_logged_in_window < 3) {
+                ++frame_info.torn_image_logged_in_window;
+                std::cout << "[api] TORN IMAGE (" << seam_rows
+                          << " seam rows across planes, metadata intact): "
+                             "image_valid=false, IMU/GNSS still published"
+                          << "  total=" << frame_info.torn_image_count
+                          << std::endl;
+              } else {
+                ++frame_info.torn_image_suppressed;
+              }
+            }
+          }
           fs.hardware_version = static_cast<uint32_t>(ver0);
           fs.software_version = static_cast<uint32_t>(ver1);
           double image_count_hour = meta_u(2);

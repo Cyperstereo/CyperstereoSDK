@@ -133,11 +133,13 @@ public:
             uint32_t software_version = 0;
             std::array<double, 4> camera_gain{{1.0, 1.0, 1.0, 1.0}};
             std::array<bool, 4> fpga_bayer_nr{};
+            bool image_valid = true;
             cyperstereo::IMUStreamData imu_data{};
 
             {
                 std::lock_guard<std::mutex> lock(frame_info.mtx);
                 image_timestamp = frame_info.framestream.image_timestamp;
+                image_valid = frame_info.framestream.image_valid;
                 hardware_version = frame_info.framestream.hardware_version;
                 software_version = frame_info.framestream.software_version;
                 cv::swap(frame_info.framestream.left_image, left_image);
@@ -159,7 +161,11 @@ public:
             cv_bridge::CvImage msg0, msg1, msg2, msg3;
             rclcpp::Time custom_time(image_timestamp*1e9); // seconds -> ns
 
-            if (is_smartsens)
+            if (!image_valid)
+            {
+                // Torn pixel planes: publish only the IMU samples of this frame.
+            }
+            else if (is_smartsens)
             {
                 // SmartSens: use the SDK's persistent fast-balanced worker
                 // pool instead of constructing three threads every frame.
@@ -266,13 +272,16 @@ public:
                 imu_pub->publish(imu_msg);
             }
 
-            cam0_image_pub->publish(*msg0.toImageMsg());
-            if (process_cameras >= 2)
-                cam1_image_pub->publish(*msg1.toImageMsg());
-            if (process_cameras >= 4)
+            if (image_valid)
             {
-                cam2_image_pub->publish(*msg2.toImageMsg());
-                cam3_image_pub->publish(*msg3.toImageMsg());
+                cam0_image_pub->publish(*msg0.toImageMsg());
+                if (process_cameras >= 2)
+                    cam1_image_pub->publish(*msg1.toImageMsg());
+                if (process_cameras >= 4)
+                {
+                    cam2_image_pub->publish(*msg2.toImageMsg());
+                    cam3_image_pub->publish(*msg3.toImageMsg());
+                }
             }
             
         }

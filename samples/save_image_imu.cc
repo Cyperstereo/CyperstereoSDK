@@ -152,12 +152,14 @@ int main(int argc, char *argv[]) {
     uint32_t software_version = 0;
     std::array<double, 4> camera_gain{};
     std::array<bool, 4> fpga_bayer_nr{};
+    bool image_valid = true;
     cyperstereo::IMUStreamData imu_data{};
     cyperstereo::GNSSStreamData gnss_data{};
 
     {
       std::lock_guard<std::mutex> lock(frame_info.mtx);
       image_timestamp = frame_info.framestream.image_timestamp;
+      image_valid = frame_info.framestream.image_valid;
       hardware_version = frame_info.framestream.hardware_version;
       software_version = frame_info.framestream.software_version;
       cv::swap(frame_info.framestream.left_image, left_image);
@@ -177,17 +179,19 @@ int main(int argc, char *argv[]) {
       gnss_data = frame_info.framestream.gnss;
     }
 
-    std::vector<cv::Mat> images;
-    images.push_back(left_image);
-    if (process_cameras >= 2)
-      images.push_back(right_image);
-    if (process_cameras >= 4) {
-      images.push_back(left_front_image);
-      images.push_back(right_front_image);
+    if (image_valid) {
+      std::vector<cv::Mat> images;
+      images.push_back(left_image);
+      if (process_cameras >= 2)
+        images.push_back(right_image);
+      if (process_cameras >= 4) {
+        images.push_back(left_front_image);
+        images.push_back(right_front_image);
+      }
+      InputIMAGE(image_timestamp, hardware_version, software_version,
+                 camera_gain, fpga_bayer_nr, process_cameras,
+                 images);  // clones into the save queue
     }
-    InputIMAGE(image_timestamp, hardware_version, software_version,
-               camera_gain, fpga_bayer_nr, process_cameras,
-               images);  // clones into the save queue
     for (int i = 0; i < imu_data.imu_count; ++i) {
       InputIMU(imu_data.imu_timestamp[i], imu_data.gyro_x[i], imu_data.gyro_y[i],
                imu_data.gyro_z[i], imu_data.acc_x[i], imu_data.acc_y[i],

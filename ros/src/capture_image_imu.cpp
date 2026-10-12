@@ -124,11 +124,13 @@ int main(int argc, char *argv[]) {
     uint32_t software_version = 0;
     std::array<double, 4> camera_gain{{1.0, 1.0, 1.0, 1.0}};
     std::array<bool, 4> fpga_bayer_nr{};
+    bool image_valid = true;
     cyperstereo::IMUStreamData imu_data{};
 
     {
       std::lock_guard<std::mutex> lock(frame_info.mtx);
       image_timestamp = frame_info.framestream.image_timestamp;
+      image_valid = frame_info.framestream.image_valid;
       hardware_version = frame_info.framestream.hardware_version;
       software_version = frame_info.framestream.software_version;
       cv::swap(frame_info.framestream.left_image, left_image);
@@ -148,7 +150,9 @@ int main(int argc, char *argv[]) {
     }
 
     sensor_msgs::ImagePtr msg0, msg1, msg2, msg3;
-    if (is_smartsens) {
+    if (!image_valid) {
+      // Torn pixel planes: publish only the IMU samples of this frame.
+    } else if (is_smartsens) {
       // SmartSens: each plane is RAW Bayer with no on-chip AWB.  The SDK's
       // fast-balanced path owns three persistent workers and runs the fourth
       // camera on this thread, avoiding three thread creations every frame.
@@ -208,7 +212,8 @@ int main(int argc, char *argv[]) {
       msg0 = cv_bridge::CvImage(std_msgs::Header(), "mono8", left_image).toImageMsg();
       msg1 = cv_bridge::CvImage(std_msgs::Header(), "mono8", right_image).toImageMsg();
     }
-    msg0->header.stamp = ros::Time(image_timestamp);
+    if (msg0)
+      msg0->header.stamp = ros::Time(image_timestamp);
     if (msg1)
       msg1->header.stamp = ros::Time(image_timestamp);
 
@@ -243,12 +248,14 @@ int main(int argc, char *argv[]) {
 
         IMU_pub.publish(imu_msg);
     }
-    cam0_image_pub.publish(msg0);
-    if (process_cameras >= 2)
-      cam1_image_pub.publish(msg1);
-    if (process_cameras >= 4) {
-      cam2_image_pub.publish(msg2);
-      cam3_image_pub.publish(msg3);
+    if (image_valid) {
+      cam0_image_pub.publish(msg0);
+      if (process_cameras >= 2)
+        cam1_image_pub.publish(msg1);
+      if (process_cameras >= 4) {
+        cam2_image_pub.publish(msg2);
+        cam3_image_pub.publish(msg3);
+      }
     }
     ros::spinOnce();
   }
