@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <chrono>
+#include <csignal>
 #include <condition_variable>
 #include <iomanip>
 #include <fstream>
@@ -29,7 +30,7 @@
 #else
 #include <sys/stat.h>
 #endif
-#include "../src/usb/uvc/cyperstereo_api.h"
+#include "../src/usb/uvc/camera_output.h"
 #include "../src/usb/uvc/hdr_isp.h"
 #include "../src/usb/uvc/tic_toc.h"
 #include "../src/usb/uvc/thread_priority.h"
@@ -45,9 +46,11 @@ struct ImageRecord {
   uint32_t hardware_version;
   uint32_t software_version;
   std::array<double, 4> camera_gain{};
+  std::array<double, 2> c56_gain{};  // six-camera C5/C6 AE gain
   int process_cameras{0};
   std::vector<cv::Mat> images;
   std::array<bool, 4> fpga_bayer_nr{};
+  RawTelemetrySnapshot raw_telemetry{};
 };
 std::queue<ImageRecord> IMAGE;
 struct GnssRecord {
@@ -68,12 +71,17 @@ struct GnssRecord {
 std::queue<GnssRecord> GNSS;
 std::mutex m_buf;
 std::condition_variable con;
+bool capture_finished = false;  // guarded by m_buf
+static volatile std::sig_atomic_t stop_requested = 0;
+extern "C" void save_stop_handler(int) { stop_requested = 1; }
 void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<ImageRecord> &image_data, std::queue<GnssRecord> &gnss_data);
 void DataFlow();
 void InputIMAGE(const double timestamp, uint32_t hardware_version,
                 uint32_t software_version,
                 const std::array<double, 4> &camera_gain,
+                const std::array<double, 2> &c56_gain,
                 const std::array<bool, 4> &fpga_bayer_nr,
+                 const RawTelemetrySnapshot &raw_telemetry,
                 int process_cameras,
                 const std::vector<cv::Mat>& images);
 void InputIMU(const double timestamp, double gyro_x, double gyro_y, double gyro_z, double acc_x, double acc_y, double acc_z);
@@ -81,17 +89,21 @@ void InputGNSS(const cyperstereo::GNSSStreamData &gnss);
 
 int main(int argc, char *argv[]) {
 #ifdef _WIN32
-  _mkdir("left");
-  _mkdir("right");
-  _mkdir("left_front");
-  _mkdir("right_front");
+  _mkdir("cam1");
+  _mkdir("cam2");
+  _mkdir("cam3");
+  _mkdir("cam4");
+  _mkdir("cam5");
+  _mkdir("cam6");
   _mkdir("imu");
   _mkdir("gnss");
 #else
-  mkdir("left", 0755);
-  mkdir("right", 0755);
-  mkdir("left_front", 0755);
-  mkdir("right_front", 0755);
+  mkdir("cam1", 0755);
+  mkdir("cam2", 0755);
+  mkdir("cam3", 0755);
+  mkdir("cam4", 0755);
+  mkdir("cam5", 0755);
+  mkdir("cam6", 0755);
   mkdir("imu", 0755);
   mkdir("gnss", 0755);
 #endif
@@ -101,15 +113,14 @@ int main(int argc, char *argv[]) {
   // Raise the main (capture) thread to real-time priority, just below the poll
   // and worker threads. All priorities are configured in thread_priority.h.
   cyperstereo::ApplyThreadPriority(cyperstereo::ThreadRole::kMain, "main");
-  std::thread data_flow{DataFlow};
   std::shared_ptr<cyperstereo::uvc::device> cyperstereo_device{nullptr};
   if (!cyperstereo::FindCyperstereoDevices(cyperstereo_device)) {
-    return 0;
+    return 1;
   }
   cyperstereo::FrameInfo frame_info{};
   // The USB serial number is a static device property, so read it once and use
   // it (or, when unset, the advertised UVC size) to auto-select the camera
-  // profile (MT9V034 vs SmartSens) before starting the stream.
+  // profile (MT9V034, SC136HGS or AR0234) before starting the stream.
   const std::string serial_num =
       cyperstereo::uvc::get_serial_number(*cyperstereo_device);
   const cyperstereo::CameraProfile &profile =
@@ -126,7 +137,7 @@ int main(int argc, char *argv[]) {
   if (process_cameras == 1 && num_cameras > 1)
     std::cout << "  process: C1 only (S1 color SKU)";
   std::cout << std::endl;
-  const bool is_smartsens = cyperstereo::IsSmartSensProfile(profile);
+  const bool is_bayer = cyperstereo::IsSmartSensProfile(profile);
   cyperstereo::uvc::set_device_mode(
       *cyperstereo_device, profile.frame_width, profile.frame_height,
       static_cast<int>(cyperstereo::Format::YUYV), profile.fps,
@@ -144,22 +155,26 @@ int main(int argc, char *argv[]) {
   cv::Mat left_front_image(profile.frame_height, profile.cam_width, CV_8U);
   cv::Mat right_front_image(profile.frame_height, profile.cam_width, CV_8U);
 
-  while (true) {
-    cyperstereo::WaitForStream(frame_info);
+  std::signal(SIGINT, save_stop_handler);
+  std::signal(SIGTERM, save_stop_handler);
+  std::thread data_flow{DataFlow};
+  while (!stop_requested) {
+    if (!WaitForCameraFrame(frame_info, [] { return !stop_requested; })) break;
 
     double image_timestamp = 0.0;
+    RawTelemetrySnapshot raw_telemetry;
     uint32_t hardware_version = 0;
     uint32_t software_version = 0;
     std::array<double, 4> camera_gain{};
+    std::array<double, 2> c56_gain{};
     std::array<bool, 4> fpga_bayer_nr{};
-    bool image_valid = true;
     cyperstereo::IMUStreamData imu_data{};
     cyperstereo::GNSSStreamData gnss_data{};
 
     {
       std::lock_guard<std::mutex> lock(frame_info.mtx);
       image_timestamp = frame_info.framestream.image_timestamp;
-      image_valid = frame_info.framestream.image_valid;
+      raw_telemetry = frame_info.framestream.raw_telemetry;
       hardware_version = frame_info.framestream.hardware_version;
       software_version = frame_info.framestream.software_version;
       cv::swap(frame_info.framestream.left_image, left_image);
@@ -169,29 +184,29 @@ int main(int argc, char *argv[]) {
         cv::swap(frame_info.framestream.left_front_image, left_front_image);
         cv::swap(frame_info.framestream.right_front_image, right_front_image);
       }
-      if (is_smartsens) {
+      if (is_bayer) {
         for (int i = 0; i < process_cameras; ++i) {
-          camera_gain[i] = frame_info.framestream.camera_gain[i];
+          camera_gain[i] = frame_info.framestream.isp_camera_gain[i];
           fpga_bayer_nr[i] = frame_info.framestream.fpga_bayer_nr[i];
         }
+        for (int c = 0; c < 2; ++c)
+          c56_gain[c] = frame_info.framestream.c56_camera_gain[c];
       }
       imu_data = frame_info.framestream.imu;
       gnss_data = frame_info.framestream.gnss;
     }
 
-    if (image_valid) {
-      std::vector<cv::Mat> images;
-      images.push_back(left_image);
-      if (process_cameras >= 2)
-        images.push_back(right_image);
-      if (process_cameras >= 4) {
-        images.push_back(left_front_image);
-        images.push_back(right_front_image);
-      }
-      InputIMAGE(image_timestamp, hardware_version, software_version,
-                 camera_gain, fpga_bayer_nr, process_cameras,
-                 images);  // clones into the save queue
+    std::vector<cv::Mat> images;
+    images.push_back(left_image);
+    if (process_cameras >= 2)
+      images.push_back(right_image);
+    if (process_cameras >= 4) {
+      images.push_back(left_front_image);
+      images.push_back(right_front_image);
     }
+    InputIMAGE(image_timestamp, hardware_version, software_version,
+               camera_gain, c56_gain, fpga_bayer_nr, raw_telemetry, process_cameras,
+               images);  // clones into the save queue
     for (int i = 0; i < imu_data.imu_count; ++i) {
       InputIMU(imu_data.imu_timestamp[i], imu_data.gyro_x[i], imu_data.gyro_y[i],
                imu_data.gyro_z[i], imu_data.acc_x[i], imu_data.acc_y[i],
@@ -205,6 +220,12 @@ int main(int argc, char *argv[]) {
     }
   }
   cyperstereo::uvc::stop_streaming(*cyperstereo_device);
+  {
+    std::lock_guard<std::mutex> lock(m_buf);
+    capture_finished = true;
+  }
+  con.notify_one();
+  data_flow.join();  // drain queued images/IMU before exiting
   
   return 0;
 }
@@ -241,13 +262,15 @@ void InputGNSS(const cyperstereo::GNSSStreamData &gnss) {
 void InputIMAGE(const double timestamp, uint32_t hardware_version,
                  uint32_t software_version,
                  const std::array<double, 4> &camera_gain,
+                 const std::array<double, 2> &c56_gain,
                  const std::array<bool, 4> &fpga_bayer_nr,
+                 const RawTelemetrySnapshot &raw_telemetry,
                  int process_cameras,
                  const std::vector<cv::Mat>& images) {
     m_buf.lock();
     ImageRecord record{
         timestamp, hardware_version, software_version, camera_gain,
-        process_cameras, {}, fpga_bayer_nr};
+        c56_gain, process_cameras, {}, fpga_bayer_nr, raw_telemetry};
     record.images.reserve(images.size());
     for (const auto &img : images) {
       record.images.push_back(img.clone());
@@ -267,8 +290,14 @@ void DataFlow() {
   // reused every processed frame to avoid reallocating on the hot path. Sized
   // lazily on first use so the same binary works for either camera profile.
   cv::Mat left_color, right_color, left_front_color, right_front_color;
-  WhiteBalance fast_wb[4];
   const bool use_fast_balanced = FastBalancedIspEnabled();
+  IspProcessor isp(use_fast_balanced ? IspMode::kFastBalancedBgr888
+                                   : IspMode::kQualityReferenceBgr888);
+  // Six-image firmware (04/07, 05/07): the four half images of lanes 2/3 keep
+  // their own AWB/exposure state, separate from the full-width C1/C2.
+  IspProcessor half_isp(isp.mode());
+  cv::Mat half_raw[4], half_color[4];
+  bool half_res_announced = false;
   std::cout << "ISP mode: "
             << (use_fast_balanced ? "fast-balanced" : "quality-reference")
             << std::endl;
@@ -290,7 +319,8 @@ void DataFlow() {
       std::unique_lock<std::mutex> lk(m_buf);
       con.wait(lk, [&] {
         GetData(imu_data, image_data, gnss_data);
-        return imu_data.size() != 0 || image_data.size() != 0 || gnss_data.size() != 0;});
+        return capture_finished || !imu_data.empty() || !image_data.empty() || !gnss_data.empty();});
+      if (capture_finished && imu_data.empty() && image_data.empty() && gnss_data.empty()) break;
       lk.unlock();
       while (!imu_data.empty()) {
         double imu_timestamp = imu_data.front().first;
@@ -345,7 +375,7 @@ void DataFlow() {
         double image_timestamp = record.timestamp;
         const std::vector<cv::Mat> &imgs = record.images;
         const size_t n = imgs.size();
-        // SmartSens S0/S1/S2: RAW Bayer -> white balance + demosaic, save as
+        // SC136HGS S0/S1/S2 and AR0234: RAW Bayer -> white balance + demosaic, save as
         // colour. S1 processes and writes only C1. MT9V034 remains monochrome
         // and is saved as-is.
         const int process_n = record.process_cameras > 0
@@ -357,9 +387,27 @@ void DataFlow() {
         const bool two_ok =
             process_n >= 2 && n >= 2 && !imgs[0].empty() && !imgs[1].empty();
         const bool one_ok = process_n >= 1 && n >= 1 && !imgs[0].empty();
-        const bool is_smartsens =
-            record.hardware_version == kSmartSensHardwareVersion;
-        if (is_smartsens && one_ok) {
+        const bool is_bayer =
+            IsSmartSensFamilyHardware(static_cast<int>(record.hardware_version));
+        // Six-image: lanes 2/3 are NOT full-width C4/C3 but four horizontally
+        // binned images of C3..C6 (C3h|C4h, C5h|C6h).
+        const bool half_res_lanes = four_ok &&
+            IsSmartSensHalfResLaneLayout(
+                static_cast<int>(record.hardware_version),
+                static_cast<int>(record.software_version));
+        if (half_res_lanes && !half_res_announced) {
+          std::cout << "[half-res] " << record.hardware_version << "/"
+                    << record.software_version << " six-image "
+                    << (IsAr0234FamilyHardware(
+                            static_cast<int>(record.hardware_version))
+                            ? "AR0234" : "SC136HGS")
+                    << ": lanes 2/3 -> C3h/C4h/C5h/C6h "
+                    << SmartSensHalfResWidth(imgs[2].cols) << "x"
+                    << SmartSensHalfResHeight(imgs[2].rows)
+                    << " (saved to ./cam3..6)" << std::endl;
+          half_res_announced = true;
+        }
+        if (is_bayer && one_ok) {
           if (count % 2 == 0) {
             cv::Mat left_image = imgs[0];
             cv::Mat right_image = two_ok ? imgs[1] : cv::Mat{};
@@ -367,100 +415,74 @@ void DataFlow() {
             cv::Mat right_front_image = four_ok ? imgs[3] : cv::Mat{};
             
             // Run the selected ISP pipeline; fast-balanced is the default.
-            const std::string image_name = std::to_string(static_cast<int>(image_timestamp * 10000)) + ".png";
-            const BayerConversion image13_bayer = SelectBayerConversion(
-                record.hardware_version, record.software_version, 0);
-            if (use_fast_balanced) {
-              if (four_ok) {
-                ApplyFastBalancedISPParallel({
-                    {left_image, left_color, fast_wb[0], "fast-cam1",
-                     record.camera_gain[0], image13_bayer,
-                     record.fpga_bayer_nr[0]},
-                    {right_image, right_color, fast_wb[1], "fast-cam2",
-                     record.camera_gain[1], BayerConversion::kColorBayerRg2Bgr,
-                     record.fpga_bayer_nr[1]},
-                    {left_front_image, left_front_color, fast_wb[2], "fast-cam3",
-                     record.camera_gain[2], image13_bayer,
-                     record.fpga_bayer_nr[2]},
-                    {right_front_image, right_front_color, fast_wb[3], "fast-cam4",
-                     record.camera_gain[3], BayerConversion::kColorBayerRg2Bgr,
-                     record.fpga_bayer_nr[3]},
-                });
-              } else if (two_ok) {
-                // S2: process and save only C1/C2.
-                ApplyFastBalancedISPParallel({
-                    {left_image, left_color, fast_wb[0], "fast-cam1",
-                     record.camera_gain[0], image13_bayer,
-                     record.fpga_bayer_nr[0]},
-                    {right_image, right_color, fast_wb[1], "fast-cam2",
-                     record.camera_gain[1], BayerConversion::kColorBayerRg2Bgr,
-                     record.fpga_bayer_nr[1]},
-                });
-              } else {
-                // S1: process and save only C1.
-                ApplyFastBalancedISPParallel({
-                    {left_image, left_color, fast_wb[0], "fast-cam1",
-                     record.camera_gain[0], image13_bayer,
-                     record.fpga_bayer_nr[0]},
-                });
-              }
-            } else {
-              std::thread t2;
-              std::thread t3;
-              std::thread t4;
-              if (two_ok) {
-                t2 = std::thread([&] {
-                  ApplyHdrIsp(right_image, right_color, "cam2",
-                              BayerConversion::kColorBayerRg2Bgr,
-                              record.camera_gain[1]);
-                });
-              }
-              if (four_ok) {
-                t3 = std::thread([&] {
-                  ApplyHdrIsp(left_front_image, left_front_color, "cam3",
-                              image13_bayer, record.camera_gain[2]);
-                });
-                t4 = std::thread([&] {
-                  ApplyHdrIsp(right_front_image, right_front_color, "cam4",
-                              BayerConversion::kColorBayerRg2Bgr,
-                              record.camera_gain[3]);
-                });
-              }
-              ApplyHdrIsp(left_image, left_color, "cam1", image13_bayer,
-                          record.camera_gain[0]);
-              if (t2.joinable()) t2.join();
-              if (t3.joinable()) t3.join();
-              if (t4.joinable()) t4.join();
+            const std::string image_name = std::to_string(static_cast<int64_t>(image_timestamp * 10000)) + ".png";
+            cv::Mat *raws[4] = {&left_image, &right_image,
+                               &left_front_image, &right_front_image};
+            cv::Mat *colors[4] = {&left_color, &right_color,
+                                 &left_front_color, &right_front_color};
+            const int active =
+                half_res_lanes ? 2 : (four_ok ? 4 : (two_ok ? 2 : 1));
+            ApplyBayerCameraIsp(isp, raws, colors, active,
+                record.hardware_version, record.software_version,
+                record.camera_gain, record.fpga_bayer_nr, record.raw_telemetry);
+            if (half_res_lanes) {
+              SplitAndVBinHalfResLanes(imgs[2], imgs[3], half_raw);
+              // camera_gain[] is display-plane order C1,C2,C4,C3; C5/C6 come
+              // from their own metadata columns.
+              const double cam_gain[4] = {record.camera_gain[3], record.camera_gain[2],
+                                          record.c56_gain[0], record.c56_gain[1]};
+              const uint32_t hw = record.hardware_version;
+              const uint32_t sw = record.software_version;
+              half_isp.ApplyParallel({
+                  {half_raw[0], half_color[0], "half-cam3", cam_gain[0],
+                   SelectCameraBayerConversion(hw, sw, SixCamHalfImageCamera(0))},
+                  {half_raw[1], half_color[1], "half-cam4", cam_gain[1],
+                   SelectCameraBayerConversion(hw, sw, SixCamHalfImageCamera(1))},
+                  {half_raw[2], half_color[2], "half-cam5", cam_gain[2],
+                   SelectCameraBayerConversion(hw, sw, SixCamHalfImageCamera(2))},
+                  {half_raw[3], half_color[3], "half-cam6", cam_gain[3],
+                   SelectCameraBayerConversion(hw, sw, SixCamHalfImageCamera(3))},
+              });
             }
             std::thread t2;
-            std::thread t3;
-            std::thread t4;
             if (two_ok) {
               t2 = std::thread([&] {
-                cv::imwrite("./right/" + image_name, right_color);
+                cv::imwrite("./cam2/" + image_name, right_color);
               });
             }
-            if (four_ok) {
-              t3 = std::thread([&] {
-                cv::imwrite("./left_front/" + image_name, left_front_color);
+            std::thread th[4];
+            if (half_res_lanes) {
+              static const char *const kHalfDirs[4] = {
+                  "./cam3/", "./cam4/", "./cam5/", "./cam6/"};
+              for (int i = 0; i < 4; ++i) {
+                th[i] = std::thread([&, i] {
+                  cv::imwrite(kHalfDirs[i] + image_name, half_color[i]);
+                });
+              }
+            } else if (four_ok) {
+              // Full-resolution quad: lanes 2/3 are C3/C4, already ISP'd into
+              // left_front_color / right_front_color. Six-image firmware takes
+              // the half-res branch above instead.
+              th[0] = std::thread([&] {
+                cv::imwrite("./cam3/" + image_name, left_front_color);
               });
-              t4 = std::thread([&] {
-                cv::imwrite("./right_front/" + image_name, right_front_color);
+              th[1] = std::thread([&] {
+                cv::imwrite("./cam4/" + image_name, right_front_color);
               });
             }
-            cv::imwrite("./left/" + image_name, left_color);
+            cv::imwrite("./cam1/" + image_name, left_color);
             if (t2.joinable()) t2.join();
-            if (t3.joinable()) t3.join();
-            if (t4.joinable()) t4.join();
+            for (auto &t : th)
+              if (t.joinable()) t.join();
 
           }
           count++;
         } else if (two_ok) {
           if (count % 3 == 0) {
             // MT9V034 is monochrome: save the two raw planes directly.
-            const std::string image_name = std::to_string(static_cast<int>(image_timestamp * 10000)) + ".png";
-            cv::imwrite("./left/" + image_name, imgs[0]);
-            cv::imwrite("./right/" + image_name, imgs[1]);
+            const std::string image_name = std::to_string(static_cast<int64_t>(image_timestamp * 10000)) + ".png";
+            cv::imwrite("./cam1/" + image_name, imgs[0]);
+            cv::imwrite("./cam2/" + image_name, imgs[1]);
           }
           count++;
         }

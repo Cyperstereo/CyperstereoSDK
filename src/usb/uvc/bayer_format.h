@@ -18,10 +18,18 @@ enum class BayerConversion {
 // their red/blue Bayer phase; software 05 through 08 keep that orientation.
 // USB image order is C1,C2,C4,C3, so the opposite phase applies to display
 // images 1 and 3 (indices 0 and 2). Software 03 keeps the legacy conversion on
-// all four images.
+// all four images.  AR0234 (hardware 03) streams RGGB on every plane: its
+// window is already the full 1920 active columns (x 8..1927), so the column
+// phase cannot be moved to reach BGGR, and its mirror/flip keep the starting
+// Bayer colour.  All four AR0234 images use the RGGB conversion.
+// Six-image markers 04/05 use the phase of their sensor family (02/03).
 inline BayerConversion SelectBayerConversion(uint32_t hardware_version,
                                               uint32_t software_version,
                                               int image_index) {
+  hardware_version = static_cast<uint32_t>(
+      SensorFamilyHardwareVersion(static_cast<int>(hardware_version)));
+  if (hardware_version == static_cast<uint32_t>(kAr0234HardwareVersion))
+    return BayerConversion::kColorBayerBg2Bgr;
   const bool image_1_or_3 = image_index == 0 || image_index == 2;
   const bool mirrored_smartsens =
       hardware_version ==
@@ -39,6 +47,21 @@ inline BayerConversion SelectBayerConversion(uint32_t hardware_version,
   if (mirrored_smartsens && image_1_or_3)
     return BayerConversion::kColorBayerBg2Bgr;
   return BayerConversion::kColorBayerRg2Bgr;
+}
+
+// Bayer phase of a PHYSICAL camera (1-based C1..C6) rather than of a display
+// plane (plane order C1,C2,C4,C3).  Horizontal 2:1 same-colour binning (the
+// six-image half lanes) preserves the phase, so the half images use exactly
+// the conversion of their full-width parent camera.  Only C1/C4 are
+// mirror+flipped; C5/C6 keep the C2/C3 phase.
+inline BayerConversion SelectCameraBayerConversion(uint32_t hardware_version,
+                                                    uint32_t software_version,
+                                                    int camera_number) {
+  static const int kPlaneByCamera[6] = {0, 1, 3, 2, 1, 3};
+  const int plane =
+      (camera_number >= 1 && camera_number <= 6)
+          ? kPlaneByCamera[camera_number - 1] : 0;
+  return SelectBayerConversion(hardware_version, software_version, plane);
 }
 
 }  // namespace cyperstereo

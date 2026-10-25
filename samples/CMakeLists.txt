@@ -269,43 +269,8 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
 else()
   message(FATAL_ERROR "Unsupported OS.")
 endif()
-# ---- Fast-ISP quality pipeline (stored under src/ISP) ----------------------
-# Compile the pipeline objects directly into Cyperlib so the SDK has one
-# self-contained static archive. main.cpp and the JSON parser are excluded;
-# the SDK bridge supplies parameters directly in code.
-set(FAST_ISP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../src/ISP")
-if(NOT EXISTS "${FAST_ISP_ROOT}/srcs/include/common/pipeline.h")
-  message(FATAL_ERROR
-      "Fast-ISP sources were not found under '${FAST_ISP_ROOT}'")
-endif()
-file(GLOB FAST_ISP_MODULE_SOURCES
-  "${FAST_ISP_ROOT}/srcs/sources/modules/*.cpp")
-set(FAST_ISP_SOURCES
-  ${FAST_ISP_MODULE_SOURCES}
-  ${FAST_ISP_ROOT}/srcs/sources/common/common.cpp
-  ${FAST_ISP_ROOT}/srcs/sources/common/frame.cpp
-  ${FAST_ISP_ROOT}/srcs/sources/common/modules.cpp
-  ${FAST_ISP_ROOT}/srcs/sources/common/pipeline.cpp
-  ${FAST_ISP_ROOT}/thirdparty/easylog/easylogging++.cc
-  ../src/usb/uvc/fast_isp.cc)
-target_sources(Cyperlib PRIVATE ${FAST_ISP_SOURCES})
-target_include_directories(Cyperlib
-  PRIVATE
-    ${FAST_ISP_ROOT}/srcs/include
-    ${FAST_ISP_ROOT}/thirdparty/easylog
-  PUBLIC
-    ${OpenCV_INCLUDE_DIRS})
-# ELPP_THREAD_SAFE: 4 camera pipelines log from their own threads.
-# ELPP_NO_DEFAULT_LOG_FILE: don't litter myeasylog.log next to the binary.
-target_compile_definitions(Cyperlib PRIVATE
-  ELPP_THREAD_SAFE
-  ELPP_NO_DEFAULT_LOG_FILE)
-if (MSVC)
-  # cyperstereo_api.h is header-only and is compiled by Cyperlib consumers as
-  # well, so propagate the standard CRT opt-out to those translation units.
-  target_compile_definitions(Cyperlib PUBLIC _CRT_SECURE_NO_WARNINGS)
-endif()
-target_link_libraries(Cyperlib PUBLIC ${OpenCV_LIBRARIES})
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/CyperstereoIsp.cmake")
+cyperstereo_add_isp(Cyperlib "${CMAKE_CURRENT_SOURCE_DIR}/..")
 
 add_executable(capture_image_imu
   capture_image_imu.cc)

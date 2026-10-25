@@ -62,7 +62,7 @@ cmake -DTARGET_BOARD=generic ..        # portable ARMv8-A + NEON, no CPU-specifi
 make
 ```
 
-## SmartSens firmware 2/3, 2/4, 2/5 and 2/6
+## SmartSens firmware 2/3, 2/4, 2/5, 2/6, 2/7 and 2/8
 
 Windows, Linux/V4L2, ROS, ROS 2 and ARM builds all use the same versioned
 metadata description in `src/usb/uvc/smartsens_metadata.h`:
@@ -72,7 +72,18 @@ metadata description in `src/usb/uvc/smartsens_metadata.h`:
 - 2/5: 13 IMU slots, AE telemetry in columns 122..134 and an 80 ms image-gap
   threshold for the 16 Hz camera trigger;
 - 2/6: 7 IMU slots and the 2/4 AE columns, with HTS=452 exposure conversion
-  (`29.761316872 us/line`) for the 30 Hz camera trigger.
+  (`29.761316872 us/line`) for the 30 Hz camera trigger;
+- 2/7 (v0207): the 2/6 layout plus USB online upgrade and GNSS. IMU, AE
+  columns 68..80 and the HTS=452 line time stay the same. GNSS occupies
+  columns 81..105 and is parsed only for this version. The receiver is FPGA
+  pin L10, UART 115200 8N1. Column 81 is `0x4700` plus fresh flags for GGA,
+  GST and a valid RMC. `gnss.valid` requires all three fresh, a fix, a new
+  UTC time, and GST-derived hdop/vdop/pdop below 50. Image bytes resume at
+  column 106;
+- 2/8 (v0208): USB online upgrade added to 2/5, with no GNSS. It keeps the
+  2/5 13 IMU slots, AE columns 122..134, 16 Hz line time, 80 ms image-gap
+  threshold and Bayer phase. Columns after the AE block are not read as
+  GNSS.
 
 The public IMU arrays are now sized for 13 samples. This changes the C++ object
 layout, so Linux/ARM deployments must clean-rebuild the SDK and every consumer;

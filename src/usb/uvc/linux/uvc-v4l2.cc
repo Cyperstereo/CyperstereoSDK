@@ -37,7 +37,6 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -160,39 +159,6 @@ static std::string read_serial_number(const std::string &video_device) {
   return serial;
 }
 
-// The FX3 bulk stream has only ~1 ms of host-side headroom (5 uvcvideo URBs
-// plus a small FX3 DMA pool).  Deep package C-states exit in ~1 ms on
-// low-power laptops (Lunar Lake C3_ACPI: 1048 us), so an idle host can
-// complete an URB too late and the FX3 overruns, corrupting or dropping
-// frames.  A PM QoS request on /dev/cpu_dma_latency is held while streaming
-// and released when the fd closes.  Needs root; otherwise it only warns.
-// CYPERSTEREO_CPU_LATENCY_US overrides the bound, "off" disables it.
-static int acquire_cpu_latency_request() {
-  int32_t latency_us = 100;
-  if (const char *env = std::getenv("CYPERSTEREO_CPU_LATENCY_US")) {
-    if (strcmp(env, "off") == 0 || strcmp(env, "-1") == 0)
-      return -1;
-    char *end = nullptr;
-    const long parsed = std::strtol(env, &end, 10);
-    if (end != env && *end == '\0' && parsed >= 0 && parsed <= 100000)
-      latency_us = static_cast<int32_t>(parsed);
-  }
-  const int fd = open("/dev/cpu_dma_latency", O_WRONLY | O_CLOEXEC);
-  if (fd < 0 ||
-      write(fd, &latency_us, sizeof(latency_us)) !=
-          static_cast<ssize_t>(sizeof(latency_us))) {
-    std::cout << "[v4l2] cannot hold a CPU wake-latency bound ("
-              << strerror(errno) << "); deep C-states may cause occasional "
-                 "FX3 overruns. Run as root, or select the 'performance' "
-                 "power profile." << std::endl;
-    if (fd >= 0) close(fd);
-    return -1;
-  }
-  std::cout << "[v4l2] CPU wake latency bounded to " << latency_us
-            << " us while streaming" << std::endl;
-  return fd;
-}
-
 struct buffer {
   void *start;
   size_t length;
@@ -227,7 +193,6 @@ struct device {
 
   std::thread thread;
   std::mutex device_mutex; // 新增互斥锁
-  int cpu_latency_fd = -1;
   
   int no_data_count = 0;
   int living_count = 0;
@@ -1395,8 +1360,6 @@ struct device {
       stop_capture();
       throw;
     }
-    if (cpu_latency_fd < 0)
-      cpu_latency_fd = acquire_cpu_latency_request();
   }
 
   void stop_streaming() {
@@ -1408,10 +1371,6 @@ struct device {
     // Also covers the narrow case where STREAMON succeeded but constructing
     // the polling std::thread threw: the kernel queue must still be released.
     stop_capture();
-    if (cpu_latency_fd >= 0) {
-      close(cpu_latency_fd);
-      cpu_latency_fd = -1;
-    }
   }
 };
 

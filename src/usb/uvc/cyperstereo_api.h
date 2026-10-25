@@ -13,6 +13,7 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include <memory>
 #include <vector>
 #include <condition_variable>
 #include <iomanip>
@@ -29,6 +30,12 @@
 #include "uvc.h"
 #include "bayer_format.h"
 #include "smartsens_metadata.h"
+#include "ar0234_diagnostics.h"
+#include "ar0234_temperature.h"
+#include "ar0234_exposure_meter.h"
+#include "raw_telemetry.h"
+#include "sc136_aec_guard.h"
+#include "isp_black_level.h"
 #include "tic_toc.h"
 #include "thread_priority.h"
 
@@ -62,9 +69,9 @@ CYPERSTEREO_BEGIN_NAMESPACE
 // ISP output formats are intentionally separate from the USB transport
 // formats declared by uvc.h.  In particular, kUyvy422Bt601FullRange is the
 // processed ISP result, not the camera's packed input stream.  Its byte order
-// for every two horizontal pixels is Cb, Y0, Cr, Y1.  The filtered 4:2:0
-// chroma produced internally by the ISP is replicated vertically into the
-// 4:2:2 container; no limited-range remapping or RGB tone curve is applied.
+// for every two horizontal pixels is Cb, Y0, Cr, Y1. Digital exposure and
+// RGB clipping/tone match BGR. Full-range chroma is averaged horizontally
+// after tone; no limited-range remapping is applied.
 enum class IspPixelFormat : uint8_t {
   kBgr888,
   kUyvy422Bt601FullRange,
@@ -379,55 +386,6 @@ static inline void DeinterleaveTwoPlanes(
   }
 }
 
-// After an FX3 self-resync the next frame can arrive full-length with an
-// intact metadata row while alternate DMA buffers of its upper rows hold
-// foreign data. The byte lanes are interleaved, so those rows are vertical
-// discontinuities in all planes at once, though a flat dark region can hide
-// the seam in one of them. A natural horizontal edge rarely lines up across
-// three of four differently aimed sensors, but it does across a stereo pair
-// (e.g. lines of text on a screen), so two planes need every plane and
-// stricter thresholds. Rows r and r-2 share the Bayer colour, as do columns
-// 8 apart.
-inline bool DetectTornImage(const cv::Mat *const *planes, int n, int rows,
-                            int *seam_rows) {
-  *seam_rows = 0;
-  if (n <= 0 || rows < 8 || planes[0]->cols <= 0) return false;
-  const bool quad = n >= 4;
-  const int ratio = quad ? 3 : 4;
-  const int floor_level = quad ? 4 : 8;
-  const int min_rows = quad ? 4 : 8;
-  const int min_planes = quad ? n - 1 : n;
-  constexpr int kColStep = 8;
-  const int cols = planes[0]->cols;
-  const int samples = (cols + kColStep - 1) / kColStep;
-  const int count = rows - 2;
-  thread_local std::vector<int> sums, sorted;
-  thread_local std::vector<unsigned char> hits;
-  sums.resize(count);
-  hits.assign(count, 0);
-  for (int p = 0; p < n; ++p) {
-    const cv::Mat &plane = *planes[p];
-    for (int r = 2; r < rows; ++r) {
-      const uchar *cur = plane.ptr<uchar>(r);
-      const uchar *up = plane.ptr<uchar>(r - 2);
-      int sum = 0;
-      for (int x = 0; x < cols; x += kColStep)
-        sum += std::abs(static_cast<int>(cur[x]) - static_cast<int>(up[x]));
-      sums[r - 2] = sum;
-    }
-    sorted = sums;
-    std::nth_element(sorted.begin(), sorted.begin() + count / 2, sorted.end());
-    const int64_t limit = static_cast<int64_t>(ratio) * sorted[count / 2] +
-                          static_cast<int64_t>(floor_level) * samples;
-    for (int i = 0; i < count; ++i)
-      if (sums[i] > limit) ++hits[i];
-  }
-  int seams = 0;
-  for (const unsigned char h : hits) seams += h >= min_planes;
-  *seam_rows = seams;
-  return seams >= min_rows;
-}
-
 static constexpr int kSmartSensCamWidth = 1280;
 static constexpr int kFx3FrameWidthStereo = kSmartSensCamWidth;
 static constexpr int kFx3FrameWidth = kSmartSensCamWidth * 2;
@@ -436,6 +394,75 @@ static constexpr int kFx3FrameFps = 30;
 static constexpr int kFx3FramePixels = kFx3FrameWidth * kFx3FrameHeight;
 static constexpr int kFx3HalfFrameWidth = kSmartSensCamWidth;
 static constexpr int kFx3HalfFramePixels = kFx3HalfFrameWidth * kFx3FrameHeight;
+
+// AR0234 quad: four 1920x1080 RAW8 planes on the same four byte lanes, so the
+// YUY2 transport is 3840x1080.
+static constexpr int kAr0234CamWidth = 1920;
+static constexpr int kAr0234FrameWidth = kAr0234CamWidth * 2;
+static constexpr int kAr0234FrameHeight = 1080;
+
+// Six-image half lanes (04/07 SC136HGS, 05/07 AR0234; see
+// smartsens_metadata.h): split the two full-width "third/fourth" planes into
+// the four horizontally binned camera images, output order C3h, C4h, C5h, C6h.
+// The halves are COPIED into continuous Mats (allocated on first use / size
+// change) so the ISP kernels, which assume continuous rows, can run on them.
+inline void SplitHalfResLanes(const cv::Mat &lane2, const cv::Mat &lane3,
+                              cv::Mat half[4]) {
+  CV_Assert(lane2.type() == CV_8U && lane3.type() == CV_8U);
+  CV_Assert(lane2.size() == lane3.size() && (lane2.cols % 2) == 0);
+  const int w = SmartSensHalfResWidth(lane2.cols);
+  const cv::Rect left(0, 0, w, lane2.rows);
+  const cv::Rect right(w, 0, w, lane2.rows);
+  lane2(left).copyTo(half[0]);    // C3 half
+  lane2(right).copyTo(half[1]);   // C4 half
+  lane3(left).copyTo(half[2]);    // C5 half
+  lane3(right).copyTo(half[3]);   // C6 half
+}
+
+// Vertical 2:1 same-Bayer-colour average, matching FPGA bayer_hbin2:
+//   out[2n]   = (in[4n]   + in[4n+2] + 1) >> 1   // even rows stay BG / RG
+//   out[2n+1] = (in[4n+1] + in[4n+3] + 1) >> 1   // odd  rows stay GB / GR
+// Height must be a multiple of 4 (1024 -> 512, 1080 -> 540).  Phase is
+// preserved so the per-camera BayerConversion still applies.
+inline void BayerVBin2SameColor(const cv::Mat &src, cv::Mat &dst) {
+  CV_Assert(src.type() == CV_8U && src.rows >= 4 && (src.rows % 4) == 0);
+  const int out_rows = src.rows / 2;
+  const int cols = src.cols;
+  dst.create(out_rows, cols, CV_8U);
+  for (int oy = 0; oy < out_rows; ++oy) {
+    const int iy = ((oy >> 1) << 2) + (oy & 1);
+    const unsigned char *a = src.ptr<unsigned char>(iy);
+    const unsigned char *b = src.ptr<unsigned char>(iy + 2);
+    unsigned char *d = dst.ptr<unsigned char>(oy);
+    int x = 0;
+#if defined(CYPERSTEREO_HAVE_NEON)
+    for (; x + 16 <= cols; x += 16) {
+      const uint8x16_t va = vld1q_u8(a + x);
+      const uint8x16_t vb = vld1q_u8(b + x);
+      const uint16x8_t lo =
+          vaddq_u16(vaddl_u8(vget_low_u8(va), vget_low_u8(vb)),
+                    vdupq_n_u16(1));
+      const uint16x8_t hi =
+          vaddq_u16(vaddl_u8(vget_high_u8(va), vget_high_u8(vb)),
+                    vdupq_n_u16(1));
+      vst1q_u8(d + x, vcombine_u8(vshrn_n_u16(lo, 1), vshrn_n_u16(hi, 1)));
+    }
+#endif
+    for (; x < cols; ++x)
+      d[x] = static_cast<unsigned char>(
+          (static_cast<unsigned int>(a[x]) + b[x] + 1u) >> 1);
+  }
+}
+
+// Split the six-image half lanes, then vertically 2:1 bin so the ISP runs on
+// four (cam_width/2) x (frame_height/2) RAW images.
+inline void SplitAndVBinHalfResLanes(const cv::Mat &lane2, const cv::Mat &lane3,
+                                     cv::Mat quarter[4]) {
+  cv::Mat v2, v3;
+  BayerVBin2SameColor(lane2, v2);
+  BayerVBin2SameColor(lane3, v3);
+  SplitHalfResLanes(v2, v3, quarter);
+}
 
 static constexpr int kMt9FrameWidth = 752;
 static constexpr int kMt9FrameHeight = 480;
@@ -491,6 +518,18 @@ static constexpr CameraProfile kProfileSmartSensStereo{
 // the legacy four-camera SKU.
 static constexpr CameraProfile kProfileSmartSens = kProfileSmartSensQuad;
 
+static constexpr CameraProfile kProfileAr0234Quad{
+    "AR0234(quad)", kAr0234HardwareVersion, kAr0234SoftwareVersion7,
+    kAr0234FrameWidth, kAr0234FrameHeight, kFx3FrameFps, 4, kAr0234CamWidth,
+    kAr0234FrameHeight - 1, kSmartSensLegacyImuSamplesPerFrame, 72};
+
+// A6 units: same four-lane transport as the quad; num_cameras counts lanes.
+// C3..C6 arrive as half-resolution halves of lanes 2/3 (metadata 05).
+static constexpr CameraProfile kProfileAr0234Six{
+    "AR0234(six/A6)", kAr0234SixCamHardwareVersion, kAr0234SoftwareVersion7,
+    kAr0234FrameWidth, kAr0234FrameHeight, kFx3FrameFps, 4, kAr0234CamWidth,
+    kAr0234FrameHeight - 1, kSmartSensLegacyImuSamplesPerFrame, 72};
+
 static constexpr CameraProfile kProfileM150{
     "MT9V034(M150)", 0, 2, kMt9FrameWidth, kMt9FrameHeight, kMt9FrameFps,
     2, kMt9FrameWidth, kMt9FrameHeight - 1, 4, 48};
@@ -499,20 +538,28 @@ static constexpr CameraProfile kProfileM60{
     "MT9V034(M60)", 1, 2, kMt9FrameWidth, kMt9FrameHeight, kMt9FrameFps,
     2, kMt9FrameWidth, kMt9FrameHeight - 1, 4, 48};
 
+// True for every FX3 four-lane RAW Bayer unit (SC136HGS and AR0234); the
+// MT9V034 family is the only other transport.
 inline bool IsSmartSensProfile(const CameraProfile &profile) {
-  return profile.hardware_version == kSmartSensHardwareVersion;
+  return IsSmartSensFamilyHardware(profile.hardware_version);
 }
 
-// Trusted Cyperstereo USB serial prefixes: S=SmartSens, C=M150, M=M60.
+// Trusted Cyperstereo USB serial prefixes: S=SmartSens SC136HGS,
+// A=AR0234, C=MT9V034 M150, M=MT9V034 M60.
 inline bool IsValidCyperstereoSerial(const std::string &serial_num) {
   if (serial_num.empty()) return false;
   const char c = static_cast<char>(
       std::toupper(static_cast<unsigned char>(serial_num[0])));
-  return c == 'S' || c == 'C' || c == 'M';
+  return c == 'S' || c == 'A' || c == 'C' || c == 'M';
 }
 
 inline const CameraProfile &SelectSmartSensBySerial(
     const std::string &serial_num, const uvc::device *device = nullptr) {
+  // Older AR0234 units reuse the S-prefixed serials; only the advertised UVC
+  // size tells them apart from SC136HGS.
+  if (device &&
+      uvc::has_frame_size(*device, kAr0234FrameWidth, kAr0234FrameHeight))
+    return kProfileAr0234Quad;
   const int camera_count = SmartSensCameraCountFromSerial(serial_num);
   if (camera_count == 2) return kProfileSmartSensStereo;
   if (camera_count == 4) return kProfileSmartSensQuad;
@@ -530,11 +577,19 @@ inline const CameraProfile &SelectSmartSensBySerial(
   return kProfileSmartSensQuad;
 }
 
+// A0 = quad, A6 = six-camera; other A serials fall back to the quad profile.
+// Metadata column 0 (03 / 05) still decides the lane layout of each frame.
+inline const CameraProfile &SelectAr0234BySerial(const std::string &serial_num) {
+  if (Ar0234CameraCountFromSerial(serial_num) == 6) return kProfileAr0234Six;
+  return kProfileAr0234Quad;
+}
+
 inline const CameraProfile &SelectProfileBySerial(const std::string &serial_num) {
   if (IsValidCyperstereoSerial(serial_num)) {
     const char c = static_cast<char>(
         std::toupper(static_cast<unsigned char>(serial_num[0])));
     if (c == 'S') return SelectSmartSensBySerial(serial_num);
+    if (c == 'A') return SelectAr0234BySerial(serial_num);
     if (c == 'C') return kProfileM150;
     if (c == 'M') return kProfileM60;
   }
@@ -553,6 +608,7 @@ inline const CameraProfile &SelectProfile(const std::string &serial_num,
     const char c = static_cast<char>(
         std::toupper(static_cast<unsigned char>(serial_num[0])));
     if (c == 'S') return SelectSmartSensBySerial(serial_num, &device);
+    if (c == 'A') return SelectAr0234BySerial(serial_num);
     if (c == 'C') return kProfileM150;
     if (c == 'M') return kProfileM60;
   }
@@ -563,7 +619,15 @@ inline const CameraProfile &SelectProfile(const std::string &serial_num,
       uvc::has_frame_size(device, kFx3FrameWidthStereo, kFx3FrameHeight);
   const bool has_mt9 =
       uvc::has_frame_size(device, kMt9FrameWidth, kMt9FrameHeight);
+  const bool has_ar0234 =
+      uvc::has_frame_size(device, kAr0234FrameWidth, kAr0234FrameHeight);
 
+  if (has_ar0234) {
+    std::cout << "[api] no USB serial; UVC size " << kAr0234FrameWidth << "x"
+              << kAr0234FrameHeight << " -> " << kProfileAr0234Quad.name
+              << std::endl;
+    return kProfileAr0234Quad;
+  }
   if (has_stereo && !has_quad && !has_mt9) {
     std::cout << "[api] no USB serial; UVC size " << kFx3FrameWidthStereo
               << "x" << kFx3FrameHeight << " -> "
@@ -652,12 +716,6 @@ struct FrameStreamData {
   uint32_t software_version{0};
 	double image_timestamp;   // exposure END, common to all sensors (seconds)
 
-  // False when the pixel planes of this frame are corrupt (FX3 recovery
-  // burst: full-length transfer with a valid metadata row but torn image
-  // rows). The metadata, IMU and GNSS of such a frame are still valid and
-  // published; consumers must skip the image planes.
-  bool image_valid{true};
-
   // Per-display-plane AE telemetry, parsed from the SmartSens metadata row.
   // Index: 0=image1(left), 1=image2(right), 2=image3(left_front),
   // 3=image4(right_front). Unused SmartSens planes and all MT9V planes stay 0.
@@ -665,7 +723,14 @@ struct FrameStreamData {
   // These are the FPGA AEC targets sent to I2C, not sensor-register readback.
   uint16_t exposure_lines[4]{};          // target exposure, in rows
   double   exposure_time[4]{};           // seconds = exposure_lines * Tline
-  double   camera_temperature[4]{};      // Celsius, from sensor reg {0x4c10,0x4c11}
+  double   camera_temperature[4]{};      // Celsius; AR0234 unavailable = NaN
+  bool camera_temperature_valid[4]{};
+  double camera_temperature_age_s[4]{};  // AR0234 ADC age (host monotonic time)
+  uint16_t camera_temperature_adc[4]{}, camera_temperature_calibration[4]{};
+  // Kept separately: targets remain available for diagnostics and API users.
+  double isp_camera_gain[4]{};
+  std::array<Sc136AecTelemetry, 4> aec_diagnostics{};
+  RawTelemetrySnapshot raw_telemetry{};
   double   camera_gain[4]{};             // target real gain (x), code / 64
   // True when the FPGA already ran the fast-ISP BayerNR on this plane's RAW.
   // Pass it as raw_bayer_nr_done to the fast ISP so the filter is not doubled.
@@ -676,6 +741,16 @@ struct FrameStreamData {
   // All active cameras share the common exposure END (image_timestamp), but
   // each has its own exposure length, so each midpoint differs.
   double   image_midpoint_timestamp[4]{};
+
+  // SC136HGS six-camera (04/07): AE telemetry of the two cameras that exist
+  // only as half images, index 0 = C5, 1 = C6 (metadata columns 132..138).
+  // C3/C4 use the arrays above (display planes 3/2).  All zero otherwise.
+  bool     c56_telemetry_valid{false};
+  bool     c56_present[2]{};
+  uint16_t c56_exposure_lines[2]{};
+  double   c56_exposure_time[2]{};
+  double   c56_camera_temperature[2]{};
+  double   c56_camera_gain[2]{};
 };
 
 struct Frame {
@@ -714,6 +789,8 @@ struct FrameInfo {
   std::shared_ptr<Frame> frame{nullptr};
   CameraProfile profile{kProfileM60};
   FrameStreamData framestream{};
+  std::array<Sc136GainAlignment, 4> sc136_gain_alignment{};
+  Sc136AecTrace sc136_aec_trace;
   // Host-side (steady_clock) arrival time of the previous frame. Used to tell
   // a REAL transport drop (host gap ~= camera-timestamp gap) apart from a
   // camera/FPGA timestamp jump (host gap stays ~33ms while the embedded
@@ -731,6 +808,10 @@ struct FrameInfo {
   static constexpr int kDiagRingLen = 10;
   FrameDiagRec diag_ring[kDiagRingLen]{};
   uint64_t frame_seq{0};
+  std::array<uint16_t, 4> ar0234_read_sequence{};
+  std::array<Ar0234TemperatureState, 4> ar0234_temperature{};
+  std::array<Ar0234TemperatureState, 2> ar0234_c56_temperature{};
+  uint16_t ar0234_experiment_phase{0xFFFC};
   // When an anomaly fires we dump the ring (past frames) and keep dumping
   // this many FUTURE frames to see whether the jump persists or reverts.
   int dump_frames_left{0};
@@ -752,13 +833,6 @@ struct FrameInfo {
   int meta_bad_logged_in_window{0};
   std::chrono::steady_clock::time_point meta_bad_window_start{};
 
-  // Frames published with framestream.image_valid=false (torn pixel rows
-  // behind an intact metadata row).
-  uint64_t torn_image_count{0};
-  uint64_t torn_image_suppressed{0};
-  int torn_image_logged_in_window{0};
-  std::chrono::steady_clock::time_point torn_image_window_start{};
-
   void Init(const CameraProfile &p) {
     profile = p;
     framestream.left_image.create(p.frame_height, p.cam_width, CV_8U);
@@ -776,10 +850,8 @@ struct FrameInfo {
   explicit FrameInfo(const CameraProfile &p) { Init(p); }
 };
 
-// Sensor pedestal in the 8-bit domain (SC136HGS BLC target after the
-// FPGA's 10->8 bit truncation). Subtracted in the WB LUT; also used by
-// the WB gain estimator so the g/b, g/r ratios are pedestal-free.
-constexpr double kIspBlackLevel = 16.0;
+// Black-level subtraction uses the measured sensor-profile baseline from
+// isp_black_level.h. DATA_PEDESTAL alone is not a black-level calibration.
 
 // Output tone pipeline, folded into the WB LUT so it costs nothing per
 // pixel. Canonical ISP order (openISP, in-camera rendering tutorials):
@@ -948,14 +1020,14 @@ inline void ApplyCcmTone(cv::Mat &bgr) {
 }
 
 // Maps a value from the legacy linear LUT-output domain ((i-16)*gain,
-// full scale 255-16=239) to the final tone-mapped 0..255 output domain.
+// full scale 255 minus the measured black level) to the output domain.
 // Used both to build the WB LUT and to remap YUV-stage gate thresholds
 // that were tuned on the linear pipeline.
 inline double ToneEncode(double linear_val) {
   const double g = IspGamma();
   if (g == 1.0) return linear_val;  // bit-compatible legacy path
   if (linear_val <= 0.0) return 0.0;
-  double n = linear_val / (255.0 - kIspBlackLevel);
+  double n = linear_val / (255.0 - IspBlackLevel());
   if (n > 1.0) n = 1.0;
   double v;
   if (g == 0.0) {
@@ -1078,7 +1150,8 @@ struct FastBalancedToneLuts {
 //                                        128; 0 restores the hard clip
 //   CYPERSTEREO_FAST_EXPOSURE_CLIP       percent pushed past the linear
 //                                        range, default 10 (0.5 if KNEE=0)
-//   CYPERSTEREO_FAST_EXPOSURE_ANALOG_MAX FPGA GAIN_MAX_CODE / 64, default 12;
+//   CYPERSTEREO_FAST_EXPOSURE_ANALOG_MAX FPGA GAIN_MAX_CODE / 64, default 10
+//                                        (AR0234 AGC5: 4.923, its analog cap);
 //                                        0 disables the analog-gain gate
 struct FastExposureConfig {
   bool enabled;
@@ -1089,15 +1162,77 @@ struct FastExposureConfig {
   double clip_percent;
   double analog_max;
   double knee;
+  bool analog_max_from_env;
+  bool max_from_env;
+  bool knee_from_env;
 };
+
+// Sensor analog-gain ceiling reported by the stream, 0 = use the config.
+// Written by the metadata parser, read by the ISP workers.
+inline std::atomic<double> &FastExposureSensorAnalogMax() {
+  static std::atomic<double> value{0.0};
+  return value;
+}
+
+// AR0234 fisheye module (7761 lens, EFL 1.85 mm, F/2.0, 650 nm IR cut) seen
+// in the stream.  Set once by the metadata parser; the fast-balanced ISP
+// then applies the AR0234 tuning below:
+//   - isolated bright-defect suppression and radial lens shading disabled,
+//   - digital-exposure metering over the central 2/3 x 3/4 of the frame,
+//     combining the log mean and useful-signal p35 (32 DN target),
+//   - the same gamma-2.0 / 1.85x-cap base tone curve as SC136,
+//   - a 0.94 green-channel scale (CYPERSTEREO_FAST_AR0234_GREEN) for the
+//     CFA / 650 nm IR-cut residual, applied in the WB LUT after AWB,
+//   - digital exposure capped at 3x (including environment overrides),
+//     highlight knee 112 unless CYPERSTEREO_FAST_EXPOSURE_KNEE overrides it.
+
+inline bool FastAr0234LscEnabled() {
+  // Disabled for this profile, including legacy environment settings.
+  return false;
+}
+
+// Extra green-channel scale on top of AWB.  The AR0234 color CFA plus the
+// 7761 650 nm IR-cut leave a residual green that gray-world does not
+// remove (it treats the green-tinted wall as neutral).  1.0 disables.
+// Only used while FastIspAr0234Profile is set.
+inline double FastAr0234GreenGain() {
+  static const double g = [] {
+    if (const char *e = std::getenv("CYPERSTEREO_FAST_AR0234_GREEN")) {
+      const double v = std::atof(e);
+      if (v >= 0.70 && v <= 1.20) return v;
+    }
+    return 0.94;
+  }();
+  return FastIspAr0234Profile().load() ? g : 1.0;
+}
+
+constexpr double kFastAr0234ExposureMax = 3.0;
+constexpr double kFastAr0234ExposureKnee = 112.0;
+
+// AR0234-only lower-mid-tone target. Zero restores the former log-average
+// metering for A/B diagnostics; no setting can bypass the 3x gain cap.
+inline double FastAr0234ShadowKey() {
+  static const double key = [] {
+    if (const char *e = std::getenv("CYPERSTEREO_FAST_AR0234_SHADOW_KEY")) {
+      const double v = std::atof(e);
+      if (v == 0.0 || (v >= 4.0 && v <= 64.0)) return v;
+    }
+    return 32.0;
+  }();
+  return key;
+}
+
 
 inline const FastExposureConfig &GetFastExposureConfig() {
   static const FastExposureConfig cfg = [] {
-    FastExposureConfig c{!FastToneLegacy(), true, 1.0, 20.0, 3.0, 10.0, 12.0,
-                         128.0};
+    FastExposureConfig c{!FastToneLegacy(), true, 1.0, 20.0, 3.0, 10.0, 10.0,
+                         128.0, false, false, false};
     if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE_KNEE")) {
       const double v = std::atof(e);
-      if (v == 0.0 || (v >= 64.0 && v <= 224.0)) c.knee = v;
+      if (v == 0.0 || (v >= 64.0 && v <= 224.0)) {
+        c.knee = v;
+        c.knee_from_env = true;
+      }
       if (c.knee == 0.0) c.clip_percent = 0.5;
     }
     if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE")) {
@@ -1120,7 +1255,10 @@ inline const FastExposureConfig &GetFastExposureConfig() {
     }
     if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE_MAX")) {
       const double v = std::atof(e);
-      if (v >= 1.0 && v <= 8.0) c.max = v;
+      if (v >= 1.0 && v <= 8.0) {
+        c.max = v;
+        c.max_from_env = true;
+      }
     }
     if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE_CLIP")) {
       const double v = std::atof(e);
@@ -1128,15 +1266,32 @@ inline const FastExposureConfig &GetFastExposureConfig() {
     }
     if (const char *e = std::getenv("CYPERSTEREO_FAST_EXPOSURE_ANALOG_MAX")) {
       const double v = std::atof(e);
-      if (v == 0.0 || (v >= 1.0 && v <= 16.0)) c.analog_max = v;
+      if (v == 0.0 || (v >= 1.0 && v <= 16.0)) {
+        c.analog_max = v;
+        c.analog_max_from_env = true;
+      }
     }
     return c;
   }();
   return cfg;
 }
 
+// AR0234 exposure overrides may lower the limit, but cannot exceed its cap.
+inline double FastExposureMaxEffective(const FastExposureConfig &cfg) {
+  return FastIspAr0234Profile().load()
+             ? (std::min)(cfg.max, kFastAr0234ExposureMax)
+             : cfg.max;
+}
+
+inline double FastExposureKneeEffective(const FastExposureConfig &cfg) {
+  return (!cfg.knee_from_env && cfg.knee > 0.0 &&
+          FastIspAr0234Profile().load())
+             ? kFastAr0234ExposureKnee
+             : cfg.knee;
+}
+
 inline int FastLegacyToneOut(int y) {
-  constexpr double kLinearFullScale8 = 255.0 - kIspBlackLevel;  // 239
+  const double kLinearFullScale8 = 255.0 - IspBlackLevel();
   constexpr double kGamma = 2.00;
   constexpr double kMaxGain = 1.85;
   constexpr double kNoiseFloor8 = 4.0;
@@ -1156,7 +1311,7 @@ inline int FastLegacyToneOut(int y) {
 // linear level mapped to black. Peak gain is ~3.6x (near y=8), mid grey
 // (18%, y=43) maps to 132.
 inline int FastFilmicToneOut(int y) {
-  constexpr double kLinearFullScale8 = 255.0 - kIspBlackLevel;  // 239
+  const double kLinearFullScale8 = 255.0 - IspBlackLevel();
   constexpr double kFilmicScale = 0.75;
   constexpr double kBlackPoint8 = 4.0;
   const auto filmic = [](double t) {
@@ -1171,12 +1326,27 @@ inline int FastFilmicToneOut(int y) {
   return (std::max)(0, (std::min)(255, static_cast<int>(v * 255.0 + 0.5)));
 }
 
+// Use the same base tone curve as SC136 while retaining the AR0234 black
+// level for full-scale normalization. No extra black point or S-curve.
+inline int FastAr0234ToneOut(int y) {
+  return FastLegacyToneOut(y);
+}
+
+inline FastBalancedToneLuts BuildFastBalancedToneLuts(int (*tone_out)(int));
+
 inline const FastBalancedToneLuts &GetFastBalancedToneLuts() {
-  static const FastBalancedToneLuts luts = [] {
+  static const FastBalancedToneLuts base = BuildFastBalancedToneLuts(
+      FastToneFilmic() ? FastFilmicToneOut : FastLegacyToneOut);
+  static const FastBalancedToneLuts ar0234 = BuildFastBalancedToneLuts(
+      FastToneFilmic() ? FastFilmicToneOut : FastAr0234ToneOut);
+  return FastIspAr0234Profile().load() ? ar0234 : base;
+}
+
+inline FastBalancedToneLuts BuildFastBalancedToneLuts(int (*tone_out)(int)) {
+  FastBalancedToneLuts luts = [tone_out] {
     FastBalancedToneLuts v;
-    const bool filmic = FastToneFilmic();
     for (int y = 0; y < 256; ++y) {
-      const int out_y = filmic ? FastFilmicToneOut(y) : FastLegacyToneOut(y);
+      const int out_y = tone_out(y);
       v.gain_q12[y] = static_cast<uint16_t>(
           y > 0 ? (std::min)(32767, (out_y * 4096 + y / 2) / y) : 0);
       v.clip_q12[y] = static_cast<uint16_t>(
@@ -1878,8 +2048,14 @@ inline const char *FastBalancedDemosaicName() { return "ea"; }
 
 class WhiteBalance {
  public:
+  void PrepareRawMetadata(const cv::Mat &raw, RawMetadataRegion region) {
+    raw_rows_.Prepare(raw, region);
+  }
+  void RepairExistingRawCopy(const cv::Mat &raw, cv::Mat &copy) const {
+    raw_rows_.RepairExistingCopy(raw, copy);
+  }
   // Enables the display-path digital exposure for the following frames.
-  // The UYVY and quality paths keep the unscaled linear signal.
+  // BGR and UYVY share this exposure; the quality path remains separate.
   // `analog_gain` is the sensor's current analog gain from the metadata row.
   void SetDisplayExposure(bool enabled, double analog_gain = 0.0) {
     display_exposure_ = enabled;
@@ -1957,7 +2133,7 @@ class WhiteBalance {
     }
 #endif
     for (int y = 0; y < raw.rows; ++y) {
-      const uchar *src = raw.ptr<uchar>(y);
+      const uchar *src = raw_rows_.Row(raw, y);
       uchar *out = dst.ptr<uchar>(y);
       int x = 0;
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
@@ -1993,9 +2169,9 @@ class WhiteBalance {
           (y & 1) ? (rggb ? lut_b_i32_ : lut_r_i32_) : lut_g_i32_;
       const __m256i mask_u16 = _mm256_set1_epi32(0xffff);
       const __m256i black32 =
-          _mm256_set1_epi32(static_cast<int>(kBlackLevel));
+          _mm256_set1_epi32(static_cast<int>(BlackLevel()));
       const bool even_is_green = (y & 1) != 0;
-      const bool green_identity = lut_exposure_q7_ == 128;
+      const bool green_identity = lut_exposure_q7_ == 128 && !green_table_;
       const auto apply_luts16 = [&](const __m256i samples16) {
         const __m256i even_indices =
             _mm256_and_si256(samples16, mask_u16);
@@ -2065,7 +2241,7 @@ class WhiteBalance {
         return;
       }
 #endif
-      const uchar *src = raw.ptr<uchar>(y);
+      const uchar *src = raw_rows_.Row(raw, y);
       uchar *dst = raw_wb.ptr<uchar>(y);
       const uchar *even_col =
           (y & 1) ? lut_g_ : (rggb ? lut_r_ : lut_b_);
@@ -2083,8 +2259,8 @@ class WhiteBalance {
         return;
       }
 
-      const uchar *up = raw.ptr<uchar>(y - 2);
-      const uchar *down = raw.ptr<uchar>(y + 2);
+      const uchar *up = raw_rows_.Row(raw, y - 2);
+      const uchar *down = raw_rows_.Row(raw, y + 2);
       int x = 0;
       for (; x < (std::min)(2, width); ++x)
         dst[x] = (x & 1 ? odd_col : even_col)[src[x]];
@@ -2093,7 +2269,7 @@ class WhiteBalance {
       // alternating WB LUT is applied with AVX2 gathers, eliminating the
       // scalar 16-lane table loop from the SSE fallback below.
       const __m256i black16 =
-          _mm256_set1_epi16(static_cast<short>(kBlackLevel));
+          _mm256_set1_epi16(static_cast<short>(BlackLevel()));
       const __m256i base16 = _mm256_set1_epi16(threshold_base);
       const __m256i slope16 = _mm256_set1_epi16(threshold_signal_q8);
       const __m256i four16 = _mm256_set1_epi16(4);
@@ -2103,7 +2279,7 @@ class WhiteBalance {
       const __m256i zero16 = _mm256_setzero_si256();
       const __m256i mask_u16 = _mm256_set1_epi32(0xffff);
       const __m256i black32 =
-          _mm256_set1_epi32(static_cast<int>(kBlackLevel));
+          _mm256_set1_epi32(static_cast<int>(BlackLevel()));
       const bool even_is_green = (y & 1) != 0;
       const auto filter16 = [&](const __m256i center, const __m256i left,
                                 const __m256i right, const __m256i above,
@@ -2143,7 +2319,7 @@ class WhiteBalance {
       // so evaluate that half in lanes and gather only the gain-bearing R/B
       // half. This reduces the mapping to two gathers per 32 pixels. The
       // pack order restores e0,o0,... exactly.
-      const bool green_identity = lut_exposure_q7_ == 128;
+      const bool green_identity = lut_exposure_q7_ == 128 && !green_table_;
       const auto apply_luts16 = [&](const __m256i filtered16) {
         const __m256i even_indices =
             _mm256_and_si256(filtered16, mask_u16);
@@ -2201,7 +2377,7 @@ class WhiteBalance {
       // original scalar variable divide while still making an independent
       // edge decision for every same-colour neighbour.
       const cv::v_uint16x8 black = cv::v_setall_u16(
-          static_cast<unsigned short>(kBlackLevel));
+          static_cast<unsigned short>(BlackLevel()));
       const cv::v_uint16x8 base_u =
           cv::v_setall_u16(static_cast<unsigned short>(threshold_base));
       const cv::v_uint16x8 slope_u = cv::v_setall_u16(
@@ -2266,7 +2442,7 @@ class WhiteBalance {
 #endif
       FastBayerNrScalarTail(
           src, up, down, dst, x, width - 2, even_col, odd_col,
-          static_cast<int>(kBlackLevel), threshold_base,
+          static_cast<int>(BlackLevel()), threshold_base,
           threshold_signal_q8, strength_q8);
       x = (std::max)(x, width - 2);
       for (; x < width; ++x) {
@@ -2303,14 +2479,14 @@ class WhiteBalance {
   // strongly colored patches (blue dusk window, orange cloth) cannot skew
   // it. Gains are also clamped to a plausible illuminant range.
   void EstimateGains(const cv::Mat &raw, BayerConversion bayer) {
-    const int lo = static_cast<int>(kBlackLevel) + 24;
+    const int lo = static_cast<int>(BlackLevel()) + 24;
     const int hi = 250;
     ratios_bg_.clear();
     ratios_rg_.clear();
     int n_total = 0;
     for (int y = 0; y + 1 < raw.rows; y += kEstStep) {
-      const uchar *r0 = raw.ptr<uchar>(y);
-      const uchar *r1 = raw.ptr<uchar>(y + 1);
+      const uchar *r0 = raw_rows_.Row(raw, y);
+      const uchar *r1 = raw_rows_.Row(raw, y + 1);
       for (int x = 0; x + 1 < raw.cols; x += kEstStep) {
         const bool rggb = bayer == BayerConversion::kColorBayerBg2Bgr;
         int b = rggb ? r1[x + 1] : r0[x];
@@ -2327,9 +2503,9 @@ class WhiteBalance {
         if (b >= 250 || g0 >= 250 || g1 >= 250 || r >= 250) continue;
         int luma = (b + 2 * g + r) >> 2;
         if (luma < lo || luma > hi) continue;
-        double bb = b - kBlackLevel;
-        double gg = g - kBlackLevel;
-        double rr = r - kBlackLevel;
+        double bb = b - BlackLevel();
+        double gg = g - BlackLevel();
+        double rr = r - BlackLevel();
         // Reject samples where any channel is too close to the black level:
         // the ratio would be dominated by noise.
         if (bb < 4.0 || gg < 4.0 || rr < 4.0) continue;
@@ -2337,7 +2513,15 @@ class WhiteBalance {
         ratios_rg_.push_back(static_cast<float>(gg / rr));
       }
     }
-    if (static_cast<int>(ratios_bg_.size()) < n_total / 100) return;
+    if (static_cast<int>(ratios_bg_.size()) < n_total / 100) {
+      // In very dim AR0234 frames the bright-sample estimator can have no
+      // support. A newly started stream would then leave R/B at unity and
+      // amplify the resulting green cast with digital exposure. Average
+      // 16 samples per CFA colour before estimating low-light ratios;
+      // lowering the single-pixel threshold would mostly select noise.
+      if (!FastIspAr0234Profile().load() ||
+          !EstimateLowLightRatios(raw, bayer)) return;
+    }
 
     const auto median = [](std::vector<float> &v) {
       const size_t mid = v.size() / 2;
@@ -2355,19 +2539,67 @@ class WhiteBalance {
     }
   }
 
+  bool EstimateLowLightRatios(const cv::Mat &raw, BayerConversion bayer) {
+    ratios_bg_.clear();
+    ratios_rg_.clear();
+    const bool rggb = bayer == BayerConversion::kColorBayerBg2Bgr;
+    const int x0 = (raw.cols / 6) & ~1;
+    const int y0 = (raw.rows / 8) & ~1;
+    const int x1 = raw.cols - x0, y1 = raw.rows - y0;
+    int tiles = 0;
+    for (int y = y0; y + 7 < y1; y += 8) {
+      for (int x = x0; x + 7 < x1; x += 8) {
+        int sum_r = 0, sum_b = 0, sum_g = 0;
+        bool clipped = false;
+        ++tiles;
+        for (int dy = 0; dy < 8; dy += 2) {
+          const uchar *a = raw_rows_.Row(raw, y + dy);
+          const uchar *b = raw_rows_.Row(raw, y + dy + 1);
+          for (int dx = 0; dx < 8; dx += 2) {
+            const int xx = x + dx;
+            sum_r += rggb ? a[xx] : b[xx + 1];
+            sum_b += rggb ? b[xx + 1] : a[xx];
+            sum_g += a[xx + 1] + b[xx];
+            clipped |= a[xx] >= 250 || a[xx + 1] >= 250 ||
+                       b[xx] >= 250 || b[xx + 1] >= 250;
+          }
+        }
+        const double rr = sum_r / 16.0 - BlackLevel();
+        const double bb = sum_b / 16.0 - BlackLevel();
+        const double gg = sum_g / 32.0 - BlackLevel();
+        // Still require real signal in every channel. All-black frames
+        // and clipped lights must not invent a white-balance estimate.
+        if (clipped || (std::min)({rr, bb, gg}) < 1.5 ||
+            (rr + 2.0 * gg + bb) / 4.0 < 4.0) continue;
+        ratios_bg_.push_back(static_cast<float>(gg / bb));
+        ratios_rg_.push_back(static_cast<float>(gg / rr));
+      }
+    }
+    return static_cast<int>(ratios_bg_.size()) >= (std::max)(32, tiles / 100);
+  }
+
   // RAW luma histogram over the white-balance sample grid.
   void MeterExposure(const cv::Mat &raw, BayerConversion bayer) {
     const bool rggb = bayer == BayerConversion::kColorBayerBg2Bgr;
     int n_total = 0;
     uint32_t hist[kMeterBins] = {};
-    for (int y = 0; y + 1 < raw.rows; y += kEstStep) {
-      const uchar *r0 = raw.ptr<uchar>(y);
-      const uchar *r1 = raw.ptr<uchar>(y + 1);
-      for (int x = 0; x + 1 < raw.cols; x += kEstStep) {
+    // AR0234 fisheye: meter the central 2/3 x 3/4 (1280x812 of 1920x1080),
+    // the part inside the image circle with relative illumination above
+    // ~0.6, like the sensor AE ROI.  The black corners otherwise pull the
+    // log-average down and the dark face is metered against them.
+    const bool roi = FastIspAr0234Profile().load();
+    const int y0 = roi ? (raw.rows / 8) & ~1 : 0;
+    const int y1 = roi ? raw.rows - y0 : raw.rows;
+    const int x0 = roi ? (raw.cols / 6) & ~1 : 0;
+    const int x1 = roi ? raw.cols - x0 : raw.cols;
+    for (int y = y0; y + 1 < y1; y += kEstStep) {
+      const uchar *r0 = raw_rows_.Row(raw, y);
+      const uchar *r1 = raw_rows_.Row(raw, y + 1);
+      for (int x = x0; x + 1 < x1; x += kEstStep) {
         const int b = rggb ? r1[x + 1] : r0[x];
         const int r = rggb ? r0[x] : r1[x + 1];
         const int meter = ((b + r0[x + 1] + r1[x] + r + 2) >> 2) -
-                          static_cast<int>(kBlackLevel);
+                          static_cast<int>(BlackLevel());
         ++hist[(std::max)(0, (std::min)(meter, kMeterBins - 1))];
         ++n_total;
       }
@@ -2378,7 +2610,9 @@ class WhiteBalance {
   void UpdateExposure(const uint32_t *hist, int n_total) {
     const FastExposureConfig &cfg = GetFastExposureConfig();
     if (!cfg.automatic) {
-      exposure_ = cfg.fixed;
+      exposure_ = FastIspAr0234Profile().load()
+                      ? (std::min)(cfg.fixed, kFastAr0234ExposureMax)
+                      : cfg.fixed;
       return;
     }
     if (n_total <= 0) return;
@@ -2386,6 +2620,16 @@ class WhiteBalance {
     for (int i = 2; i < kMeterBins; ++i)
       if (hist[i]) log_sum += hist[i] * std::log(static_cast<double>(i));
     double target = std::log(cfg.key) - log_sum / n_total;
+    if (FastIspAr0234Profile().load() && FastAr0234ShadowKey() > 0.0) {
+      // Bright walls/desk surfaces can push the log mean above 20 DN even
+      // while a substantial part of the ROI remains underexposed. Meter
+      // useful lower midtones as well, then retain the existing highlight,
+      // analog-gain and maximum-gain constraints below.
+      const auto shadows = MeterAr0234Shadows(
+          hist, kMeterBins, n_total, FastAr0234ShadowKey());
+      target = shadows.valid
+          ? (std::max)(target, std::log(shadows.requested_gain)) : 0.0;
+    }
     const uint32_t allowed =
         static_cast<uint32_t>(n_total * cfg.clip_percent / 100.0);
     // Samples already at full scale in RAW (a window, a lamp) are clipped at
@@ -2399,14 +2643,27 @@ class WhiteBalance {
         break;
       }
     }
-    double limit = cfg.max;
-    if (cfg.analog_max > 0.0) {
-      const double t = (analog_gain_ / cfg.analog_max - 0.9) / 0.1;
-      limit = 1.0 + (cfg.max - 1.0) * (std::max)(0.0, (std::min)(t, 1.0));
+    const double cfg_max = FastExposureMaxEffective(cfg);
+    double limit = cfg_max;
+    const double sensor_analog_max = FastExposureSensorAnalogMax().load();
+    const double analog_max = (!cfg.analog_max_from_env &&
+                               sensor_analog_max > 0.0)
+                                  ? sensor_analog_max
+                                  : cfg.analog_max;
+    if (analog_max > 0.0) {
+      const double t = (analog_gain_ / analog_max - 0.9) / 0.1;
+      limit = 1.0 + (cfg_max - 1.0) * (std::max)(0.0, (std::min)(t, 1.0));
     }
     target = (std::max)(0.0, (std::min)(target, std::log(limit)));
+    const bool sc136 = !FastIspAr0234Profile().load();
+    if (sc136 && !(analog_gain_ >= 1.0)) {
+      // Unconfirmed correspondence or FPGA fallback: no extra digital lift.
+      exposure_log_ = 0.0; exposure_ = 1.0; exposure_init_ = true;
+      return;
+    }
     exposure_log_ = exposure_init_
-        ? exposure_log_ + kExposureSmooth * (target - exposure_log_)
+        ? (sc136 ? Sc136LimitedLogExposure(exposure_log_, target)
+                 : exposure_log_ + kExposureSmooth * (target - exposure_log_))
         : target;
     exposure_init_ = true;
     exposure_ = std::exp(exposure_log_);
@@ -2463,25 +2720,33 @@ class WhiteBalance {
         ? (std::max)(128, (std::min)(1024, static_cast<int>(
               std::lround(exposure_ * 128.0))))
         : 128;
-    if (built_ && bg == lut_bg_ && rg == lut_rg_ && e_q7 == lut_exposure_q7_)
+    const double g_scale = FastAr0234GreenGain();
+    const double black = BlackLevel();
+    if (built_ && bg == lut_bg_ && rg == lut_rg_ && e_q7 == lut_exposure_q7_ &&
+        g_scale == lut_g_scale_ && black == lut_black_)
       return;
     built_ = true;
     lut_bg_ = bg;
     lut_rg_ = rg;
     lut_exposure_q7_ = e_q7;
+    lut_g_scale_ = g_scale;
+    lut_black_ = black;
     const double e = e_q7 / 128.0;
+    const double e_g = e * g_scale;
+    const int e_g_q7 = (std::max)(
+        1, (std::min)(1024, static_cast<int>(std::lround(e_q7 * g_scale))));
     // Green reaches only (255 - black) * E at sensor full scale while R/B
     // with WB gains above 1 would still reach 255.
     const int white = FastHighlightEnabled()
-        ? ExposeGreen(255 - static_cast<int>(kBlackLevel), e_q7)
+        ? ExposeGreen(255 - static_cast<int>(BlackLevel()), e_q7)
         : 255;
     // Highlight roll-off: identity up to the knee, then the rational curve
     //   y = k + (255 - k) * s t / (1 + (s - 1) t),  t = (x - k) / (xm - k)
     // with s = (xm - k) / (255 - k), which leaves the knee with slope 1 and
     // maps green's sensor full scale xm to 255. R/B past xm are clipped
     // there, as `white` does without the roll-off.
-    const double knee = GetFastExposureConfig().knee;
-    const double xm = (255.0 - kBlackLevel) * e;
+    const double knee = FastExposureKneeEffective(GetFastExposureConfig());
+    const double xm = (255.0 - BlackLevel()) * e;
     const bool roll_off = knee > 0.0 && xm > 255.0;
     const double roll_s = roll_off ? (xm - knee) / (255.0 - knee) : 1.0;
     const auto roll = [&](double x, int linear) {
@@ -2491,18 +2756,19 @@ class WhiteBalance {
           knee + (255.0 - knee) * t * roll_s / (1.0 + (roll_s - 1.0) * t) +
           0.5);
     };
-    green_table_ = roll_off;
+    green_table_ = roll_off || black != std::floor(black) || g_scale != 1.0;
     // The WB LUT stays LINEAR (pedestal subtraction + WB gain + digital
     // exposure only): the canonical pipeline needs linear data for demosaic
     // and the CCM, so the encode/tone curve now runs post-CCM in
     // ApplyCcmTone(). (The NEON TBL path reads these same tables.)
     for (int i = 0; i < 256; ++i) {
-      const double signal = i - kBlackLevel;
+      const double signal = i - BlackLevel();
       lut_b_[i] = static_cast<uchar>(roll(signal * bg * e, (std::min)(
           white, static_cast<int>(
                      cv::saturate_cast<uchar>(signal * bg * e)))));
-      lut_g_[i] = static_cast<uchar>(roll(signal * e, ExposeGreen(
-          (std::max)(0, i - static_cast<int>(kBlackLevel)), e_q7)));
+      lut_g_[i] = static_cast<uchar>(roll(signal * e_g,
+          green_table_ ? static_cast<int>(cv::saturate_cast<uchar>(signal * e_g))
+                       : ExposeGreen((std::max)(0, i - static_cast<int>(black)), e_g_q7)));
       lut_r_[i] = static_cast<uchar>(roll(signal * rg * e, (std::min)(
           white, static_cast<int>(
                      cv::saturate_cast<uchar>(signal * rg * e)))));
@@ -2646,7 +2912,7 @@ class WhiteBalance {
   static __attribute__((noinline)) void WbPlanarRowAsm(
       const uchar *src, int64_t blocks, uchar *dst_color, uchar *dst_green,
       const uint8_t *color_lut, const uint8_t *green_lut, bool color_odd) {
-    const uint32_t black = static_cast<uint32_t>(kBlackLevel);
+    const uint32_t black = static_cast<uint32_t>(BlackLevel());
     if (!green_lut) {
       const uchar *s = src;
       int64_t n = blocks;
@@ -2697,7 +2963,7 @@ class WhiteBalance {
       const NeonWbRowPlan &plan) const {
     const int width = raw.cols;
     const int height = raw.rows;
-    const uchar *src = raw.ptr<uchar>(y);
+    const uchar *src = raw_rows_.Row(raw, y);
     const uchar *even_col =
         (y & 1) ? lut_g_ : (plan.rggb ? lut_r_ : lut_b_);
     const uchar *odd_col =
@@ -2708,7 +2974,7 @@ class WhiteBalance {
         (y & 1) ? (plan.rggb ? plan.neon_b : plan.neon_r)
                 : (plan.rggb ? plan.neon_r : plan.neon_b);
     const uint8x16_t black8 =
-        vdupq_n_u8(static_cast<unsigned char>(kBlackLevel));
+        vdupq_n_u8(static_cast<unsigned char>(BlackLevel()));
     const uint16x8_t green_q7 = vdupq_n_u16(plan.green_q7);
     const uint8x16_t green_clamp8 = vdupq_n_u8(plan.green_clamp);
     const auto map_green = [&](uint8x16_t values)
@@ -2781,8 +3047,8 @@ class WhiteBalance {
       return;
     }
 
-    const uchar *up = raw.ptr<uchar>(y - 2);
-    const uchar *down = raw.ptr<uchar>(y + 2);
+    const uchar *up = raw_rows_.Row(raw, y - 2);
+    const uchar *down = raw_rows_.Row(raw, y + 2);
     map_unfiltered(0, (std::min)(2, width));
     int x = 2;
     if (use_neon_lut) {
@@ -2890,7 +3156,7 @@ class WhiteBalance {
     if (!kPlanar) {
       FastBayerNrScalarTail(
           src, up, down, dst_even, x, width - 2, even_col, odd_col,
-          static_cast<int>(kBlackLevel), plan.nr.threshold_base,
+          static_cast<int>(BlackLevel()), plan.nr.threshold_base,
           plan.nr.threshold_signal_q8, plan.nr.strength_q8);
     }
     // Planar streaming is entered only for even W>=36 with the NEON LUT,
@@ -2957,11 +3223,9 @@ class WhiteBalance {
   }
 #endif
 
-  // Restored to the sensor pedestal: the kBlackLevel=0 experiment showed a
-  // green cast (the estimator's g/b, g/r ratios get pulled toward 1 by the
-  // common pedestal, under-driving the B/R gains). Shadow detail now comes
-  // from the encode gamma instead of from keeping the pedestal.
-  static constexpr double kBlackLevel = kIspBlackLevel;
+  // Subtract the same measured baseline in the WB estimator, pixel LUTs,
+  // noise signal model, exposure meter and output normalization.
+  static double BlackLevel() { return IspBlackLevel(); }
   static constexpr double kSmooth = 0.05;
   static constexpr int kEstStep = 8;
   static constexpr double kGainMin = 0.6;
@@ -2975,6 +3239,9 @@ class WhiteBalance {
   double lut_bg_ = -1.0;
   double lut_rg_ = -1.0;
   int lut_exposure_q7_ = 128;
+  double lut_g_scale_ = 1.0;
+  double lut_black_ = -1.0;
+  IspRawRows raw_rows_;
   bool green_table_ = false;  // lut_g_ is not ExposeGreen() (roll-off)
   bool display_exposure_ = false;
   double analog_gain_ = 0.0;
@@ -3987,7 +4254,7 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontAvx2(
       width, raw.rows, rggb,
       [&](int last) {
         for (; produced <= last; ++produced)
-          LutRowTo(raw.ptr<uchar>(produced),
+          LutRowTo(raw_rows_.Row(raw, produced),
                    ring.ptr<uchar>(produced & (kRingRows - 1)), 0, width,
                    produced, rggb);
       },
@@ -8766,6 +9033,167 @@ inline void FusedOutputUyvy422(
   FusedOutputUyvy422Portable(y8, a_q16, b_q16, cr_h, cb_h, uyvy);
 }
 
+// Shared BGR rendering backend. Both public output formats must select the
+// same SIMD tone implementation, including the default YCC approximation.
+inline void FusedOutputDisplayBgr(
+    const cv::Mat &y8, const cv::Mat &a_q16, const cv::Mat &b_q16,
+    const cv::Mat &cr_h, const cv::Mat &cb_h, cv::Mat &color,
+    const FastBalancedToneLuts *tone_luts) {
+  color.create(y8.size(), CV_8UC3);
+  const cv::Size full = y8.size(), half = cr_h.size(), quarter = a_q16.size();
+#if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
+  if (CpuHasAvx2Output()) {
+    FusedOutputAvx2Paired(y8, a_q16, b_q16, cr_h, cb_h, color, tone_luts);
+    return;
+  }
+#endif
+#if defined(CYPERSTEREO_HAVE_NEON)
+  if (UseNeonOutput()) {
+    FusedOutputNeon(y8, a_q16, b_q16, cr_h, cb_h, color, tone_luts);
+    return;
+  }
+#endif
+  for (int y = 0; y < full.height; ++y) {
+    const int yh = (y >> 1) < half.height ? (y >> 1) : half.height - 1;
+    const int yq = (y >> 2) < quarter.height ? (y >> 2) : quarter.height - 1;
+    const uchar *py = y8.ptr<uchar>(y);
+    const ushort *pa = a_q16.ptr<ushort>(yq);
+    const ushort *pb = b_q16.ptr<ushort>(yq);
+    const uchar *pcr = cr_h.ptr<uchar>(yh);
+    const uchar *pcb = cb_h.ptr<uchar>(yh);
+    uchar *pc = color.ptr<uchar>(y);
+    int xh = 0;
+#if CV_SIMD128
+    // 8 half-grid samples -> 16 output pixels per iteration.
+    for (; xh + 8 <= half.width; xh += 8) {
+      const int x0 = 2 * xh;
+      const int xq = xh >> 1;
+      // 4 quarter coeffs -> 8 half lanes -> (below) 16 full lanes.
+      cv::v_uint16x8 a4 = cv::v_load_low(pa + xq);
+      cv::v_uint16x8 b4 = cv::v_load_low(pb + xq);
+      cv::v_uint16x8 a8, b8, zip_hi;
+      cv::v_zip(a4, a4, a8, zip_hi);
+      cv::v_zip(b4, b4, b8, zip_hi);
+      cv::v_uint16x8 a_lo, a_hi, b_lo, b_hi;
+      cv::v_zip(a8, a8, a_lo, a_hi);
+      cv::v_zip(b8, b8, b_lo, b_hi);
+
+      cv::v_uint16x8 y_lo, y_hi;
+      cv::v_expand(cv::v_load(py + x0), y_lo, y_hi);
+
+      cv::v_uint32x4 ay0, ay1, ay2, ay3;
+      cv::v_mul_expand(a_lo, y_lo, ay0, ay1);
+      cv::v_mul_expand(a_hi, y_hi, ay2, ay3);
+      cv::v_uint32x4 b0, b1, b2, b3;
+      cv::v_expand(b_lo, b0, b1);
+      cv::v_expand(b_hi, b2, b3);
+      const cv::v_uint32x4 rnd = cv::v_setall_u32(2048);
+      ay0 = (ay0 + (b0 << 8) + rnd) >> 12;
+      ay1 = (ay1 + (b1 << 8) + rnd) >> 12;
+      ay2 = (ay2 + (b2 << 8) + rnd) >> 12;
+      ay3 = (ay3 + (b3 << 8) + rnd) >> 12;
+      cv::v_int16x8 yn_lo = cv::v_reinterpret_as_s16(cv::v_pack(ay0, ay1));
+      cv::v_int16x8 yn_hi = cv::v_reinterpret_as_s16(cv::v_pack(ay2, ay3));
+
+      const cv::v_int16x8 c128 = cv::v_setall_s16(128);
+      cv::v_int16x8 dcr =
+          cv::v_reinterpret_as_s16(cv::v_load_expand(pcr + xh)) - c128;
+      cv::v_int16x8 dcb =
+          cv::v_reinterpret_as_s16(cv::v_load_expand(pcb + xh)) - c128;
+
+      // BT.601: B += (454*dCb)>>8; G -= (183*dCr + 88*dCb)>>8;
+      //         R += (359*dCr)>>8   (i32 to avoid i16 overflow).
+      cv::v_int32x4 dcr0, dcr1, dcb0, dcb1;
+      cv::v_expand(dcr, dcr0, dcr1);
+      cv::v_expand(dcb, dcb0, dcb1);
+      const cv::v_int32x4 k454 = cv::v_setall_s32(454);
+      const cv::v_int32x4 k183 = cv::v_setall_s32(183);
+      const cv::v_int32x4 k88 = cv::v_setall_s32(88);
+      const cv::v_int32x4 k359 = cv::v_setall_s32(359);
+      cv::v_int16x8 tb = cv::v_pack((dcb0 * k454) >> 8, (dcb1 * k454) >> 8);
+      cv::v_int16x8 tg = cv::v_pack((dcr0 * k183 + dcb0 * k88) >> 8,
+                                    (dcr1 * k183 + dcb1 * k88) >> 8);
+      cv::v_int16x8 tr = cv::v_pack((dcr0 * k359) >> 8, (dcr1 * k359) >> 8);
+
+      cv::v_int16x8 tb_lo, tb_hi, tg_lo, tg_hi, tr_lo, tr_hi;
+      cv::v_zip(tb, tb, tb_lo, tb_hi);
+      cv::v_zip(tg, tg, tg_lo, tg_hi);
+      cv::v_zip(tr, tr, tr_lo, tr_hi);
+
+      cv::v_uint8x16 outb = cv::v_pack_u(yn_lo + tb_lo, yn_hi + tb_hi);
+      cv::v_uint8x16 outg = cv::v_pack_u(yn_lo - tg_lo, yn_hi - tg_hi);
+      cv::v_uint8x16 outr = cv::v_pack_u(yn_lo + tr_lo, yn_hi + tr_hi);
+      if (tone_luts)
+        ApplyFastBalancedTone16(outb, outg, outr, *tone_luts);
+      cv::v_store_interleave(pc + 3 * x0, outb, outg, outr);
+    }
+#endif
+    for (; xh < half.width; ++xh) {
+      const int a = pa[xh >> 1];
+      const int b256 = pb[xh >> 1] << 8;
+      const int dcr = static_cast<int>(pcr[xh]) - 128;
+      const int dcb = static_cast<int>(pcb[xh]) - 128;
+      const int tb = (454 * dcb) >> 8;
+      const int tg = (183 * dcr + 88 * dcb) >> 8;
+      const int tr = (359 * dcr) >> 8;
+      const int x0 = 2 * xh;
+      for (int k = 0; k < 2; ++k) {
+        const int yn = (a * py[x0 + k] + b256 + 2048) >> 12;
+        uchar *o = pc + 3 * (x0 + k);
+        const int vb = yn + tb, vg = yn - tg, vr = yn + tr;
+        o[0] = static_cast<uchar>(vb < 0 ? 0 : (vb > 255 ? 255 : vb));
+        o[1] = static_cast<uchar>(vg < 0 ? 0 : (vg > 255 ? 255 : vg));
+        o[2] = static_cast<uchar>(vr < 0 ? 0 : (vr > 255 ? 255 : vr));
+        if (tone_luts)
+          ApplyFastBalancedTonePixel(o[0], o[1], o[2], *tone_luts);
+      }
+    }
+  }
+}
+
+// Render through the exact BGR backend, then encode full-range BT.601 with
+// post-tone horizontal chroma averaging. 64-row tiles preserve the 2x2 and
+// 4x4 kernel phase and avoid allocating a full-frame BGR/YCrCb intermediate.
+inline void FusedOutputDisplayUyvy422(
+    const cv::Mat &y8, const cv::Mat &a_q16, const cv::Mat &b_q16,
+    const cv::Mat &cr_h, const cv::Mat &cb_h, cv::Mat &uyvy,
+    const FastBalancedToneLuts *tone_luts) {
+  CV_Assert(y8.type() == CV_8UC1 && a_q16.type() == CV_16UC1 &&
+            b_q16.type() == CV_16UC1 && cr_h.type() == CV_8UC1 &&
+            cb_h.type() == CV_8UC1 && y8.cols >= 2 && !(y8.cols & 1));
+  CV_Assert(a_q16.size() == b_q16.size() && cr_h.size() == cb_h.size() &&
+            a_q16.cols >= (y8.cols + 3) / 4 && a_q16.rows > 0 &&
+            cr_h.cols >= y8.cols / 2 && cr_h.rows > 0);
+  uyvy.create(y8.size(), CV_8UC2);
+  static thread_local cv::Mat bgr_storage, ycc_storage;
+  const int tile_rows = std::min(64, y8.rows);
+  bgr_storage.create(tile_rows, y8.cols, CV_8UC3);
+  ycc_storage.create(tile_rows, y8.cols, CV_8UC3);
+  for (int y = 0; y < y8.rows; y += tile_rows) {
+    const int end = std::min(y + tile_rows, y8.rows);
+    cv::Mat bgr = bgr_storage.rowRange(0, end - y);
+    cv::Mat ycc = ycc_storage.rowRange(0, end - y);
+    const int q0 = std::min(y >> 2, a_q16.rows - 1);
+    const int q1 = std::min((end + 3) >> 2, a_q16.rows);
+    const int h0 = std::min(y >> 1, cr_h.rows - 1);
+    const int h1 = std::min((end + 1) >> 1, cr_h.rows);
+    FusedOutputDisplayBgr(y8.rowRange(y, end), a_q16.rowRange(q0, q1),
+        b_q16.rowRange(q0, q1), cr_h.rowRange(h0, h1), cb_h.rowRange(h0, h1),
+        bgr, tone_luts);
+    cv::cvtColor(bgr, ycc, cv::COLOR_BGR2YCrCb);
+    for (int row = 0; row < end - y; ++row) {
+      const uchar *src = ycc.ptr<uchar>(row);
+      uchar *dst = uyvy.ptr<uchar>(y + row);
+      for (int x = 0; x < y8.cols; x += 2, src += 6, dst += 4) {
+        dst[0] = static_cast<uchar>((int(src[2]) + src[5] + 1) >> 1);
+        dst[1] = src[0];
+        dst[2] = static_cast<uchar>((int(src[1]) + src[4] + 1) >> 1);
+        dst[3] = src[3];
+      }
+    }
+  }
+}
+
 // raw_wb: white-balanced Bayer plane, or nullptr. When given (ARM fused
 // demosaic path) the EA demosaic runs fused with the front-end and the
 // interleaved BGR frame is never materialized; `color` is only written by
@@ -10011,10 +10439,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
             output_format == IspPixelFormat::kUyvy422Bt601FullRange);
   const bool output_uyvy =
       output_format == IspPixelFormat::kUyvy422Bt601FullRange;
-  // RGB tone is defined after YCrCb->BGR and therefore has no silent YUV
-  // interpretation.  Callers requesting UYVY must explicitly take the
-  // filtered full-range ISP planes before that display-oriented curve.
-  CV_Assert(!output_uyvy || !apply_tone);
+  // Both outputs use the same RGB-domain clipping/tone semantics.
+  // UYVY is encoded from those display-matched pixels in its fused tail.
   static thread_local SuppressFalseColorScratch scratch;
   cv::Mat &y8 = scratch.y8, &y_bl = scratch.y_bl,
           &colsum = scratch.colsum;                           // u8 full res
@@ -11035,7 +11461,7 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   float hd_lo = 0.0f, hd_scale = 0.0f;
   if (highlight_nr) {
     const float white = static_cast<float>(
-        (std::min)(255.0, (255.0 - kIspBlackLevel) * gate_exposure));
+        (std::min)(255.0, (255.0 - IspBlackLevel()) * gate_exposure));
     hd_lo = white * 0.80f;
     hd_scale = 256.0f / (white * (0.95f - 0.80f));
   }
@@ -11254,124 +11680,11 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
                               ms(detail_t6 - detail_t5)});
   };
   if (output_uyvy) {
-    // The final guided luma and filtered chroma are already the desired
-    // full-range BT.601 components.  Pack them directly, avoiding both the
-    // YCrCb->BGR arithmetic/tone lookup and the 3-byte RGB store.
-    color.create(full, CV_8UC2);
-    FusedOutputUyvy422(y8, a_q16, b_q16, cr_h, cb_h, color);
+    FusedOutputDisplayUyvy422(y8, a_q16, b_q16, cr_h, cb_h, color, tone_luts);
     report_detail();
     return;
   }
-#if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
-  if (CpuHasAvx2Output()) {
-    FusedOutputAvx2Paired(y8, a_q16, b_q16, cr_h, cb_h, color, tone_luts);
-    report_detail();
-    return;
-  }
-#endif
-#if defined(CYPERSTEREO_HAVE_NEON)
-  if (UseNeonOutput()) {
-    FusedOutputNeon(y8, a_q16, b_q16, cr_h, cb_h, color, tone_luts);
-    report_detail();
-    return;
-  }
-#endif
-  for (int y = 0; y < full.height; ++y) {
-    const int yh = (y >> 1) < half.height ? (y >> 1) : half.height - 1;
-    const int yq = (y >> 2) < quarter.height ? (y >> 2) : quarter.height - 1;
-    const uchar *py = y8.ptr<uchar>(y);
-    const ushort *pa = a_q16.ptr<ushort>(yq);
-    const ushort *pb = b_q16.ptr<ushort>(yq);
-    const uchar *pcr = cr_h.ptr<uchar>(yh);
-    const uchar *pcb = cb_h.ptr<uchar>(yh);
-    uchar *pc = color.ptr<uchar>(y);
-    int xh = 0;
-#if CV_SIMD128
-    // 8 half-grid samples -> 16 output pixels per iteration.
-    for (; xh + 8 <= half.width; xh += 8) {
-      const int x0 = 2 * xh;
-      const int xq = xh >> 1;
-      // 4 quarter coeffs -> 8 half lanes -> (below) 16 full lanes.
-      cv::v_uint16x8 a4 = cv::v_load_low(pa + xq);
-      cv::v_uint16x8 b4 = cv::v_load_low(pb + xq);
-      cv::v_uint16x8 a8, b8, zip_hi;
-      cv::v_zip(a4, a4, a8, zip_hi);
-      cv::v_zip(b4, b4, b8, zip_hi);
-      cv::v_uint16x8 a_lo, a_hi, b_lo, b_hi;
-      cv::v_zip(a8, a8, a_lo, a_hi);
-      cv::v_zip(b8, b8, b_lo, b_hi);
-
-      cv::v_uint16x8 y_lo, y_hi;
-      cv::v_expand(cv::v_load(py + x0), y_lo, y_hi);
-
-      cv::v_uint32x4 ay0, ay1, ay2, ay3;
-      cv::v_mul_expand(a_lo, y_lo, ay0, ay1);
-      cv::v_mul_expand(a_hi, y_hi, ay2, ay3);
-      cv::v_uint32x4 b0, b1, b2, b3;
-      cv::v_expand(b_lo, b0, b1);
-      cv::v_expand(b_hi, b2, b3);
-      const cv::v_uint32x4 rnd = cv::v_setall_u32(2048);
-      ay0 = (ay0 + (b0 << 8) + rnd) >> 12;
-      ay1 = (ay1 + (b1 << 8) + rnd) >> 12;
-      ay2 = (ay2 + (b2 << 8) + rnd) >> 12;
-      ay3 = (ay3 + (b3 << 8) + rnd) >> 12;
-      cv::v_int16x8 yn_lo = cv::v_reinterpret_as_s16(cv::v_pack(ay0, ay1));
-      cv::v_int16x8 yn_hi = cv::v_reinterpret_as_s16(cv::v_pack(ay2, ay3));
-
-      const cv::v_int16x8 c128 = cv::v_setall_s16(128);
-      cv::v_int16x8 dcr =
-          cv::v_reinterpret_as_s16(cv::v_load_expand(pcr + xh)) - c128;
-      cv::v_int16x8 dcb =
-          cv::v_reinterpret_as_s16(cv::v_load_expand(pcb + xh)) - c128;
-
-      // BT.601: B += (454*dCb)>>8; G -= (183*dCr + 88*dCb)>>8;
-      //         R += (359*dCr)>>8   (i32 to avoid i16 overflow).
-      cv::v_int32x4 dcr0, dcr1, dcb0, dcb1;
-      cv::v_expand(dcr, dcr0, dcr1);
-      cv::v_expand(dcb, dcb0, dcb1);
-      const cv::v_int32x4 k454 = cv::v_setall_s32(454);
-      const cv::v_int32x4 k183 = cv::v_setall_s32(183);
-      const cv::v_int32x4 k88 = cv::v_setall_s32(88);
-      const cv::v_int32x4 k359 = cv::v_setall_s32(359);
-      cv::v_int16x8 tb = cv::v_pack((dcb0 * k454) >> 8, (dcb1 * k454) >> 8);
-      cv::v_int16x8 tg = cv::v_pack((dcr0 * k183 + dcb0 * k88) >> 8,
-                                    (dcr1 * k183 + dcb1 * k88) >> 8);
-      cv::v_int16x8 tr = cv::v_pack((dcr0 * k359) >> 8, (dcr1 * k359) >> 8);
-
-      cv::v_int16x8 tb_lo, tb_hi, tg_lo, tg_hi, tr_lo, tr_hi;
-      cv::v_zip(tb, tb, tb_lo, tb_hi);
-      cv::v_zip(tg, tg, tg_lo, tg_hi);
-      cv::v_zip(tr, tr, tr_lo, tr_hi);
-
-      cv::v_uint8x16 outb = cv::v_pack_u(yn_lo + tb_lo, yn_hi + tb_hi);
-      cv::v_uint8x16 outg = cv::v_pack_u(yn_lo - tg_lo, yn_hi - tg_hi);
-      cv::v_uint8x16 outr = cv::v_pack_u(yn_lo + tr_lo, yn_hi + tr_hi);
-      if (tone_luts)
-        ApplyFastBalancedTone16(outb, outg, outr, *tone_luts);
-      cv::v_store_interleave(pc + 3 * x0, outb, outg, outr);
-    }
-#endif
-    for (; xh < half.width; ++xh) {
-      const int a = pa[xh >> 1];
-      const int b256 = pb[xh >> 1] << 8;
-      const int dcr = static_cast<int>(pcr[xh]) - 128;
-      const int dcb = static_cast<int>(pcb[xh]) - 128;
-      const int tb = (454 * dcb) >> 8;
-      const int tg = (183 * dcr + 88 * dcb) >> 8;
-      const int tr = (359 * dcr) >> 8;
-      const int x0 = 2 * xh;
-      for (int k = 0; k < 2; ++k) {
-        const int yn = (a * py[x0 + k] + b256 + 2048) >> 12;
-        uchar *o = pc + 3 * (x0 + k);
-        const int vb = yn + tb, vg = yn - tg, vr = yn + tr;
-        o[0] = static_cast<uchar>(vb < 0 ? 0 : (vb > 255 ? 255 : vb));
-        o[1] = static_cast<uchar>(vg < 0 ? 0 : (vg > 255 ? 255 : vg));
-        o[2] = static_cast<uchar>(vr < 0 ? 0 : (vr > 255 ? 255 : vr));
-        if (tone_luts)
-          ApplyFastBalancedTonePixel(o[0], o[1], o[2], *tone_luts);
-      }
-    }
-  }
+  FusedOutputDisplayBgr(y8, a_q16, b_q16, cr_h, cb_h, color, tone_luts);
   report_detail();
 }
 
@@ -11499,10 +11812,98 @@ inline void ApplyISP(cv::Mat &raw, cv::Mat &color, WhiteBalance &wb,
 // colour vectors control a joint Cr/Cb blend, preventing the blanket shadow
 // desaturation that previously made the fast result grey/dark. The caller's
 // RAW frame is left untouched.
+inline void ApplyFastBalancedISPImplCore(
+    cv::Mat &raw, cv::Mat &color, WhiteBalance &wb, const char *name,
+    double sensor_gain, BayerConversion bayer,
+    IspPixelFormat output_format, bool raw_bayer_nr_done);
+
+// Radial lens-shading gain for the AR0234 + 7761 fisheye module, measured on
+// three cameras from flat-wall RAW frames (relative illumination vs image
+// height at 3.0 um pixels, optical centre at the frame centre):
+//   r (mm)  1.0   1.2   1.4   1.6   1.8   2.0   2.2   2.4   2.6   2.8  >=3.0
+//   RI      0.89  0.85  0.79  0.70  0.61  0.50  0.39  0.31  0.19  0.11  ~0
+// The gain is 1/RI capped at 3x (r >= 2.4 mm) and tapers back to 1x past
+// the 3.0 mm image circle so the black corners are not lifted into noise.
+// It is applied to the RAW above the pedestal before the ISP, so WB,
+// digital exposure metering and NR all see the flattened frame.
+inline double Ar0234LscGainAtMm(double r_mm) {
+  static const double kTable[] = {
+      1.00, 1.00, 1.00, 1.00, 1.03, 1.12, 1.18, 1.27, 1.43,   // 0.0 .. 1.6
+      1.64, 2.00, 2.56, 3.00, 3.00, 3.00, 2.00, 1.00, 1.00};  // 1.8 .. 3.4
+  constexpr int kN = static_cast<int>(sizeof(kTable) / sizeof(kTable[0]));
+  const double f = (std::max)(0.0, r_mm / 0.2);
+  const int i = static_cast<int>(f);
+  if (i >= kN - 1) return kTable[kN - 1];
+  const double t = f - i;
+  return kTable[i] + (kTable[i + 1] - kTable[i]) * t;
+}
+
+struct Ar0234LscPlane {
+  int rows = 0;
+  int cols = 0;
+  std::vector<uint16_t> gain_q8;  // per pixel, 256 = 1x
+};
+
+inline const Ar0234LscPlane &GetAr0234LscPlane(int rows, int cols) {
+  static std::mutex mutex;
+  static std::vector<std::unique_ptr<Ar0234LscPlane>> planes;
+  std::lock_guard<std::mutex> lock(mutex);
+  for (const auto &p : planes)
+    if (p->rows == rows && p->cols == cols) return *p;
+  auto plane = std::make_unique<Ar0234LscPlane>();
+  plane->rows = rows;
+  plane->cols = cols;
+  plane->gain_q8.resize(static_cast<size_t>(rows) * cols);
+  constexpr double kPixelMm = 0.003;
+  const double cx = (cols - 1) * 0.5;
+  const double cy = (rows - 1) * 0.5;
+  for (int y = 0; y < rows; ++y) {
+    uint16_t *g = plane->gain_q8.data() + static_cast<size_t>(y) * cols;
+    const double dy = (y - cy) * kPixelMm;
+    for (int x = 0; x < cols; ++x) {
+      const double dx = (x - cx) * kPixelMm;
+      const double gain = Ar0234LscGainAtMm(std::sqrt(dx * dx + dy * dy));
+      g[x] = static_cast<uint16_t>(std::lround(gain * 256.0));
+    }
+  }
+  planes.push_back(std::move(plane));
+  return *planes.back();
+}
+
+inline void ApplyAr0234Lsc(const cv::Mat &raw, cv::Mat &out) {
+  CV_Assert(raw.type() == CV_8UC1);
+  const Ar0234LscPlane &plane = GetAr0234LscPlane(raw.rows, raw.cols);
+  out.create(raw.rows, raw.cols, CV_8UC1);
+  const int kBlackQ8 = static_cast<int>(std::lround(IspBlackLevel() * 256.0));
+  const int cols = raw.cols;
+  for (int y = 0; y < raw.rows; ++y) {
+    const uchar *s = raw.ptr<uchar>(y);
+    uchar *d = out.ptr<uchar>(y);
+    const uint16_t *g = plane.gain_q8.data() + static_cast<size_t>(y) * cols;
+    for (int x = 0; x < cols; ++x) {
+      int v = (static_cast<int>(s[x]) << 8) - kBlackQ8;
+      v = v < 0 ? 0 : v;
+      v = (((v * g[x] + 128) >> 8) + kBlackQ8) >> 8;
+      d[x] = static_cast<uchar>(v > 255 ? 255 : v);
+    }
+  }
+}
+
 inline void ApplyFastBalancedISPImpl(
     cv::Mat &raw, cv::Mat &color, WhiteBalance &wb, const char *name,
     double sensor_gain, BayerConversion bayer,
-    IspPixelFormat output_format, bool raw_bayer_nr_done = false) {
+    IspPixelFormat output_format, bool raw_bayer_nr_done = false,
+    RawMetadataRegion metadata_region = {}) {
+  // All front ends share one repaired row; the original RAW stays immutable.
+  wb.PrepareRawMetadata(raw, metadata_region);
+  ApplyFastBalancedISPImplCore(raw, color, wb, name, sensor_gain, bayer,
+                               output_format, raw_bayer_nr_done);
+}
+
+inline void ApplyFastBalancedISPImplCore(
+    cv::Mat &raw, cv::Mat &color, WhiteBalance &wb, const char *name,
+    double sensor_gain, BayerConversion bayer,
+    IspPixelFormat output_format, bool raw_bayer_nr_done) {
   CV_Assert(output_format == IspPixelFormat::kBgr888 ||
             output_format == IspPixelFormat::kUyvy422Bt601FullRange);
   if (output_format == IspPixelFormat::kUyvy422Bt601FullRange)
@@ -11541,9 +11942,7 @@ inline void ApplyFastBalancedISPImpl(
       : cv::COLOR_BayerRG2BGR_EA;
   const bool use_bayer_nr = FastBalancedBayerNrEnabled() &&
                             sensor_gain >= 3.0 && !raw_bayer_nr_done;
-  const bool apply_tone =
-      output_format == IspPixelFormat::kBgr888 &&
-      FastBalancedGammaEnabled();
+  const bool apply_tone = FastBalancedGammaEnabled();
   wb.SetDisplayExposure(apply_tone && GetFastExposureConfig().enabled,
                         sensor_gain);
   const bool streamed_wb_front =
@@ -11567,6 +11966,7 @@ inline void ApplyFastBalancedISPImpl(
       wb.ApplyTo(raw, raw_wb, bayer);
     } else {
       raw.copyTo(raw_wb);
+      wb.RepairExistingRawCopy(raw, raw_wb);
       wb.Apply(raw_wb, bayer);
     }
     if (fused_demosaic)
@@ -11602,6 +12002,7 @@ inline void ApplyFastBalancedISPImpl(
     wb.ApplyTo(raw, raw_wb, bayer);
   } else {
     raw.copyTo(raw_wb);
+    wb.RepairExistingRawCopy(raw, raw_wb);
     wb.Apply(raw_wb, bayer);
   }
   const auto t1 = std::chrono::steady_clock::now();
@@ -11635,7 +12036,7 @@ inline void ApplyFastBalancedISP(
 
 // Direct processed UYVY422 output.  `uyvy` is created as CV_8UC2 with the
 // same width/height as raw.  Bytes are Cb,Y0,Cr,Y1, using BT.601 full-range
-// values from the ISP before the RGB-only display tone curve.  Width must be
+// values after the same digital exposure and RGB tone as BGR. Width must be
 // even; arbitrary row strides are supported by the output kernels.
 inline void ApplyFastBalancedISPUyvy422(
     cv::Mat &raw, cv::Mat &uyvy, WhiteBalance &wb, const char *name,
@@ -11749,11 +12150,11 @@ class FastBalancedIspWorker {
               const char *name, double sensor_gain,
               BayerConversion bayer, int big_little_lane = -1,
               IspPixelFormat output_format = IspPixelFormat::kBgr888,
-              bool raw_bayer_nr_done = false) {
+              bool raw_bayer_nr_done = false, RawMetadataRegion metadata_region = {}) {
     std::unique_lock<std::mutex> lock(mutex_);
     done_.wait(lock, [this] { return !has_job_; });
     job_ = Job{&raw, &color, &wb, name, sensor_gain, bayer,
-               big_little_lane, output_format, raw_bayer_nr_done};
+               big_little_lane, output_format, raw_bayer_nr_done, metadata_region};
     error_ = nullptr;
     has_job_ = true;
     lock.unlock();
@@ -11779,6 +12180,7 @@ class FastBalancedIspWorker {
     int big_little_lane;
     IspPixelFormat output_format;
     bool raw_bayer_nr_done;
+    RawMetadataRegion metadata_region;
   };
 
   void Run() {
@@ -11794,7 +12196,7 @@ class FastBalancedIspWorker {
         FastIspBigLittleLaneGuard lane_guard(job.big_little_lane);
         ApplyFastBalancedISPImpl(*job.raw, *job.color, *job.wb, job.name,
                                  job.sensor_gain, job.bayer,
-                                 job.output_format, job.raw_bayer_nr_done);
+                                 job.output_format, job.raw_bayer_nr_done, job.metadata_region);
       } catch (...) {
         error = std::current_exception();
       }
@@ -11862,6 +12264,7 @@ struct FastBalancedIspDispatchJob {
   BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr;
   IspPixelFormat output_format = IspPixelFormat::kBgr888;
   bool raw_bayer_nr_done = false;
+  RawMetadataRegion metadata_region;
 };
 
 inline void ApplyFastBalancedISPParallelImpl(
@@ -11904,14 +12307,14 @@ inline void ApplyFastBalancedISPParallelImpl(
                            jobs[i].name, jobs[i].sensor_gain, jobs[i].bayer,
                            big_little_batch ? i : -1,
                            jobs[i].output_format,
-                           jobs[i].raw_bayer_nr_done);
+                           jobs[i].raw_bayer_nr_done, jobs[i].metadata_region);
   std::exception_ptr caller_error;
   try {
     FastIspBigLittleLaneGuard lane_guard(big_little_batch ? 0 : -1);
     ApplyFastBalancedISPImpl(
         *jobs[0].raw, *jobs[0].output, *jobs[0].wb, jobs[0].name,
         jobs[0].sensor_gain, jobs[0].bayer, jobs[0].output_format,
-        jobs[0].raw_bayer_nr_done);
+        jobs[0].raw_bayer_nr_done, jobs[0].metadata_region);
   } catch (...) {
     caller_error = std::current_exception();
   }
@@ -12008,13 +12411,14 @@ struct IspFrameJob {
   BayerConversion bayer;
   // Fast modes only: the RAW already carries the FPGA BayerNR.
   bool raw_bayer_nr_done;
+  RawMetadataRegion metadata_region;
 
   IspFrameJob(
       cv::Mat &r, cv::Mat &o, const char *n, double gain = 1.0,
       BayerConversion b = BayerConversion::kColorBayerRg2Bgr,
-      bool nr_done = false)
+      bool nr_done = false, RawMetadataRegion region = {})
       : raw(&r), output(&o), name(n), sensor_gain(gain), bayer(b),
-        raw_bayer_nr_done(nr_done) {}
+        raw_bayer_nr_done(nr_done), metadata_region(region) {}
 };
 
 namespace detail {
@@ -12023,7 +12427,8 @@ namespace detail {
 void ApplyQualityReferenceISPParallel(
     const cv::Mat *const *raws, cv::Mat *const *outputs,
     const char *const *names, const double *sensor_gains,
-    const BayerConversion *bayers, int n);
+    const BayerConversion *bayers, int n,
+    const RawMetadataRegion *regions = nullptr);
 }  // namespace detail
 
 class IspProcessor {
@@ -12042,6 +12447,8 @@ class IspProcessor {
     if (n <= 0) return;
     CV_Assert(jobs != nullptr);
     n = std::min(n, 4);
+    for (int i = 0; i < n; ++i)
+      CV_Assert(jobs[i].raw && jobs[i].output && jobs[i].name);
 
     if (UsesFastBalanced()) {
       std::array<detail::FastBalancedIspDispatchJob, 4> dispatch{};
@@ -12058,6 +12465,7 @@ class IspProcessor {
         dispatch[i].bayer = jobs[i].bayer;
         dispatch[i].output_format = output_format;
         dispatch[i].raw_bayer_nr_done = jobs[i].raw_bayer_nr_done;
+        dispatch[i].metadata_region = jobs[i].metadata_region;
       }
       detail::ApplyFastBalancedISPParallelImpl(dispatch.data(), n);
       return;
@@ -12068,25 +12476,27 @@ class IspProcessor {
     const char *names[4]{};
     double sensor_gains[4]{};
     BayerConversion bayers[4]{};
+    RawMetadataRegion regions[4]{};
     for (int i = 0; i < n; ++i) {
       CV_Assert(jobs[i].raw != nullptr && jobs[i].output != nullptr &&
                 jobs[i].name != nullptr);
       raws[i] = jobs[i].raw;
+      regions[i] = jobs[i].metadata_region;
       outputs[i] = jobs[i].output;
       names[i] = jobs[i].name;
       sensor_gains[i] = jobs[i].sensor_gain;
       bayers[i] = jobs[i].bayer;
     }
     detail::ApplyQualityReferenceISPParallel(
-        raws, outputs, names, sensor_gains, bayers, n);
+        raws, outputs, names, sensor_gains, bayers, n, regions);
   }
   void ApplyParallel(std::initializer_list<IspFrameJob> jobs) {
     ApplyParallel(jobs.begin(), static_cast<int>(jobs.size()));
   }
 
   // Digital exposure the fast-balanced path applied to job slot `i` in the
-  // last ApplyParallel call; 1 when it is disabled (UYVY output, quality
-  // path, CYPERSTEREO_FAST_EXPOSURE=off). Read it between calls only.
+  // last ApplyParallel call (BGR or UYVY); 1 when disabled (quality path,
+  // Gamma off, CYPERSTEREO_FAST_EXPOSURE=off). Read it between calls only.
   double DigitalGain(int i) const {
     if (!UsesFastBalanced() || i < 0 || i >= 4) return 1.0;
     return fast_wb_[i].DisplayExposure();
@@ -12234,6 +12644,15 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
 
         const CameraProfile &prof = frame_info.profile;
         FrameStreamData &fs = frame_info.framestream;
+        fs.raw_telemetry = RawTelemetrySnapshot{};
+        for (int p = 0; p < 4; ++p) {
+          if (IsAr0234FamilyHardware(static_cast<int>(fs.hardware_version)))
+            fs.camera_temperature[p] = Ar0234TemperatureState::Unavailable();
+          fs.camera_temperature_valid[p] = false;
+          fs.camera_temperature_age_s[p] = Ar0234TemperatureState::Unavailable();
+          fs.camera_temperature_adc[p] = 0;
+          fs.camera_temperature_calibration[p] = 0;
+        }
 
         cv::Mat img(prof.frame_height, prof.frame_width, CV_8UC2,
                     const_cast<void *>(data));
@@ -12273,7 +12692,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           lo_plane = &fs.right_image;
           hi_plane = &fs.left_image;
         }
-        fs.image_valid = true;
+
         const int imu_end_col =
             kMetaImuBaseCol + prof.imu_samples_per_frame * kImuWordsPerSample;
         const int gnss_end_col = prof.gnss_base_col + 23;
@@ -12306,14 +12725,35 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           // Version 03 uses the legacy Bayer phase; versions 04/05/06 use the
           // mirror+flip phase for C1/C4. Accept the marker, then latch both the
           // live version and its matching slot count for all parsing below.
+          // The hardware family fixes the plane size negotiated at open, so
+          // only the software version and the quad/six-image marker of the
+          // same sensor family (02<->04, 03<->05) may change at run time.
           if (IsSmartSensProfile(prof) &&
+              SensorFamilyHardwareVersion(ver0) ==
+                  SensorFamilyHardwareVersion(prof.hardware_version) &&
               IsSupportedSmartSensFirmware(ver0, ver1)) {
             if (ver0 != frame_info.profile.hardware_version ||
                 ver1 != frame_info.profile.software_version) {
               frame_info.profile.hardware_version = ver0;
               frame_info.profile.software_version = ver1;
               std::cout << "[api] SmartSens firmware from metadata: "
-                        << ver0 << "/" << ver1 << std::endl;
+                        << ver0 << "/" << ver1;
+              if (IsSmartSensHalfResLaneLayout(ver0, ver1))
+                std::cout << (IsAr0234FamilyHardware(ver0)
+                                  ? " (six-image AR0234)"
+                                  : " (six-image SC136HGS)");
+              std::cout << std::endl;
+              const int serial_cameras =
+                  Ar0234CameraCountFromSerial(fs.serial_num);
+              if (IsAr0234FamilyHardware(ver0) && serial_cameras != 0 &&
+                  (serial_cameras == 6) != IsSixCamHardware(ver0)) {
+                std::cout << "[api] WARNING: serial " << fs.serial_num
+                          << " is a " << serial_cameras
+                          << "-camera AR0234 SKU but the FPGA reports "
+                          << (IsSixCamHardware(ver0) ? "six" : "four")
+                          << "-camera firmware (" << ver0 << "/" << ver1
+                          << "); following the metadata" << std::endl;
+              }
             }
             frame_info.profile.imu_samples_per_frame =
                 smartsens_layout.imu_samples_per_frame;
@@ -12411,50 +12851,13 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             return;
           }
 
-          {
-            const cv::Mat *planes[4] = {lo_plane, hi_plane, nullptr, nullptr};
-            int n_planes = 2;
-            if (prof.num_cameras >= 4) {
-              planes[0] = &fs.left_image;
-              planes[1] = &fs.right_image;
-              planes[2] = &fs.left_front_image;
-              planes[3] = &fs.right_front_image;
-              n_planes = 4;
-            }
-            int seam_rows = 0;
-            if (DetectTornImage(planes, n_planes, prof.meta_row, &seam_rows)) {
-              fs.image_valid = false;
-              ++frame_info.torn_image_count;
-              const auto now = std::chrono::steady_clock::now();
-              if (frame_info.torn_image_window_start.time_since_epoch()
-                          .count() == 0 ||
-                  now - frame_info.torn_image_window_start >
-                      std::chrono::seconds(5)) {
-                if (frame_info.torn_image_suppressed > 0) {
-                  std::cout << "[api] torn-image burst: "
-                            << frame_info.torn_image_suppressed
-                            << " further torn images suppressed from logging"
-                            << "  (total=" << frame_info.torn_image_count
-                            << ")" << std::endl;
-                }
-                frame_info.torn_image_window_start = now;
-                frame_info.torn_image_logged_in_window = 0;
-                frame_info.torn_image_suppressed = 0;
-              }
-              if (frame_info.torn_image_logged_in_window < 3) {
-                ++frame_info.torn_image_logged_in_window;
-                std::cout << "[api] TORN IMAGE (" << seam_rows
-                          << " seam rows across planes, metadata intact): "
-                             "image_valid=false, IMU/GNSS still published"
-                          << "  total=" << frame_info.torn_image_count
-                          << std::endl;
-              } else {
-                ++frame_info.torn_image_suppressed;
-              }
-            }
-          }
           fs.hardware_version = static_cast<uint32_t>(ver0);
           fs.software_version = static_cast<uint32_t>(ver1);
+          // Capture original telemetry after marker validation and before any
+          // consumer can create an ISP copy. Never edit the transport planes.
+          fs.raw_telemetry = DecodeRawTelemetrySnapshot(
+              lo, hi, lo_plane->cols, prof.meta_row, ver0, ver1);
+
           double image_count_hour = meta_u(2);
           double image_count_ms = meta_u(3);
           double image_count_s = meta_u(4);
@@ -12504,6 +12907,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
                   meta_u(smartsens_layout.temperature_base_col + sensor);
               fs.camera_temperature[p] =
                   ((traw >> 8) * 8 + (traw & 0x7)) / 4.0 - 273.15;
+              fs.camera_temperature_valid[p] = ae_marker_ok && traw != 0 && traw != 0xFFFF;
               fs.camera_gain[p] =
                   meta_u(smartsens_layout.gain_base_col + sensor) / 64.0;
               // Estimated capture midpoint from the target exposure.
@@ -12512,8 +12916,9 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             }
           } else if (IsSmartSensProfile(prof)) {
             // Software 03 resumes image pixels immediately after its seven IMU
-            // slots. Do not reinterpret those pixels as telemetry, and clear
-            // any values retained if a FrameInfo is reused across firmware.
+            // slots, and AR0234 03/07 carries no FPGA AEC values. Do not
+            // reinterpret those columns as telemetry, and clear any values
+            // retained if a FrameInfo is reused across firmware.
             for (int p = 0; p < 4; ++p) {
               fs.exposure_lines[p] = 0;
               fs.exposure_time[p] = 0.0;
@@ -12522,6 +12927,144 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
               fs.fpga_bayer_nr[p] = false;
               fs.image_midpoint_timestamp[p] = fs.image_timestamp;
             }
+            if (IsAr0234FamilyHardware(static_cast<int>(fs.hardware_version))) {
+              FastExposureSensorAnalogMax().store(kAr0234AnalogGainMax);
+              if (!FastIspAr0234Profile().exchange(true)) {
+                std::cout << "[api] AR0234 ISP on: isolated bright DPC off, LSC off, meter "
+                             "1280x812, tone SC136 base (gamma 2.0 / lift cap 1.85x), "
+                             "green 0.94, digital exposure ceiling 3, knee 112"
+                          << " RAW8_BLC=" << IspBlackLevel()
+                          << std::endl;
+              }
+              const int active_cameras = std::min(prof.num_cameras, 4);
+              const int flash_us = meta_u(kAr0234FlashWidthUsCol);
+              if (lo_plane->cols >= 101 && meta_u(81) == 0xB1C1 &&
+                  (meta_u(82) == 0x1002 || meta_u(82) == 0x1003) &&
+                  meta_u(99) != frame_info.ar0234_experiment_phase) {
+                frame_info.ar0234_experiment_phase = meta_u(99);
+                std::cout << "[ar0234-phase] step=" << meta_u(99)
+                          << " status=" << meta_u(100)
+                          << " ts=" << fs.image_timestamp << std::endl;
+              }
+              const double temperature_now = std::chrono::duration<double>(
+                  t_cb_start.time_since_epoch()).count();
+              for (int p = 0; p < active_cameras; ++p) {
+                Ar0234Readback rb;
+                auto &temperature = frame_info.ar0234_temperature[p];
+                if (DecodeAr0234Readback(lo, hi, lo_plane->cols, p, rb))
+                  temperature.Observe(rb, temperature_now);
+                fs.camera_temperature[p] = temperature.Celsius(temperature_now);
+                fs.camera_temperature_valid[p] = temperature.Valid(temperature_now);
+                fs.camera_temperature_age_s[p] = temperature.AgeSeconds(temperature_now);
+                fs.camera_temperature_adc[p] = temperature.Adc();
+                fs.camera_temperature_calibration[p] = temperature.Calibration();
+              }
+              for (int p = 0; p < active_cameras; ++p) {
+                const int lines = meta_u(kAr0234AeExpBaseCol + p);
+                const double exposure_s =
+                    (lines >= 2 && lines <= 4000)
+                        ? lines * kAr0234LineTimeSec
+                        : ((flash_us >= 100 && flash_us <= 20000)
+                               ? flash_us * 1e-6
+                               : kAr0234FixedExposureLines * kAr0234LineTimeSec);
+                fs.exposure_lines[p] = static_cast<uint16_t>(
+                    exposure_s / kAr0234LineTimeSec + 0.5);
+                fs.exposure_time[p] = exposure_s;
+                const int gain_raw = meta_u(kAr0234AeGainBaseCol + p);
+                fs.camera_gain[p] = Ar0234AnalogGainFromReadback(gain_raw);
+                fs.image_midpoint_timestamp[p] =
+                    fs.image_timestamp - fs.exposure_time[p] / 2.0;
+              }
+              if (frame_info.frame_seq % 60 == 0) {
+                const int period_us = meta_u(kAr0234FlashPeriod16UsCol) * 16;
+                std::cout << "[api] AR0234 FLASH high=" << flash_us
+                          << " us period=" << period_us << " us C2 302A=0x"
+                          << std::hex << meta_u(kAr0234C2PixDivCol) << " 300A=0x"
+                          << meta_u(kAr0234C2FllCol) << std::dec << std::endl;
+                std::cout << "[api] AR0234 AE";
+                for (int p = 0; p < active_cameras; ++p) {
+                  std::cout << " cam" << (p + 1) << " lines=0x" << std::hex
+                            << meta_u(kAr0234AeExpBaseCol + p) << " gain=0x"
+                            << meta_u(kAr0234AeGainBaseCol + p) << std::dec;
+                }
+                std::cout << std::endl;
+              }
+            }
+          }
+
+          fs.c56_telemetry_valid = false;
+          for (int c = 0; c < 2; ++c) {
+            fs.c56_present[c] = false;
+            fs.c56_exposure_lines[c] = 0;
+            fs.c56_exposure_time[c] = 0.0;
+            fs.c56_camera_temperature[c] = 0.0;
+            fs.c56_camera_gain[c] = 0.0;
+          }
+          if (ver0 == kSc136SixCamHardwareVersion &&
+              smartsens_layout.has_ae_telemetry &&
+              lo_plane->cols >= kSixCamC56EndCol &&
+              (meta_u(kSixCamC56MarkerCol) >> 8) == kSixCamC56MarkerHigh) {
+            const int marker = meta_u(kSixCamC56MarkerCol);
+            fs.c56_telemetry_valid = true;
+            for (int c = 0; c < 2; ++c) {
+              fs.c56_present[c] = ((marker >> c) & 1) != 0;
+              const int lines = meta_u(kSixCamC56ExposureCol + c);
+              fs.c56_exposure_lines[c] = static_cast<uint16_t>(lines);
+              fs.c56_exposure_time[c] = lines * smartsens_layout.line_time_sec;
+              const int traw = meta_u(kSixCamC56TemperatureCol + c);
+              fs.c56_camera_temperature[c] =
+                  ((traw >> 8) * 8 + (traw & 0x7)) / 4.0 - 273.15;
+              fs.c56_camera_gain[c] = meta_u(kSixCamC56GainCol + c) / 64.0;
+            }
+          } else if (ver0 == kAr0234SixCamHardwareVersion &&
+                     lo_plane->cols >= kAr0234SixCamC56EndCol &&
+                     (meta_u(kSixCamC56MarkerCol) >> 8) == kSixCamC56MarkerHigh) {
+            const int marker = meta_u(kSixCamC56MarkerCol);
+            const double temperature_now = std::chrono::duration<double>(
+                t_cb_start.time_since_epoch()).count();
+            fs.c56_telemetry_valid = true;
+            for (int c = 0; c < 2; ++c) {
+              fs.c56_present[c] = ((marker >> c) & 1) != 0;
+              const int lines = meta_u(kSixCamC56ExposureCol + c);
+              const bool lines_ok = lines >= 2 && lines <= 4000;
+              fs.c56_exposure_lines[c] =
+                  static_cast<uint16_t>(lines_ok ? lines : 0);
+              fs.c56_exposure_time[c] = lines_ok ? lines * kAr0234LineTimeSec : 0.0;
+              fs.c56_camera_gain[c] =
+                  Ar0234AnalogGainFromReadback(meta_u(kSixCamC56GainCol + c));
+              Ar0234Readback rb;
+              auto &temperature = frame_info.ar0234_c56_temperature[c];
+              if (DecodeAr0234C56Readback(lo, hi, lo_plane->cols, c, rb))
+                temperature.Observe(rb, temperature_now);
+              fs.c56_camera_temperature[c] = temperature.Celsius(temperature_now);
+            }
+          }
+
+          fs.aec_diagnostics = DecodeSc136Aec(ver0, ver1, meta_u);
+          for (int p = 0; p < 4; ++p) {
+            fs.isp_camera_gain[p] = fs.camera_gain[p];
+            if (IsSc136FamilyHardware(ver0))
+              fs.isp_camera_gain[p] = frame_info.sc136_gain_alignment[p].Update(
+                  fs.camera_gain[p], fs.aec_diagnostics[p]);
+            else frame_info.sc136_gain_alignment[p].Reset();
+          }
+          if (fs.aec_diagnostics[0].valid) {
+            double raw_mean[4]{};
+            const cv::Mat *planes[4] = {&fs.left_image, &fs.right_image,
+                &fs.left_front_image, &fs.right_front_image};
+            for (int p = 0; p < prof.num_cameras && p < 4; ++p) {
+              uint64_t sum = 0; unsigned samples = 0;
+              for (int y = 0; y < planes[p]->rows; y += 16) {
+                const uchar *row = planes[p]->ptr<uchar>(y);
+                for (int x = 0; x < planes[p]->cols; x += 16) {
+                  sum += row[x]; ++samples;
+                }
+              }
+              raw_mean[p] = samples ? double(sum) / samples : 0.0;
+            }
+            frame_info.sc136_aec_trace.Record(fs.image_timestamp,
+                fs.aec_diagnostics.data(), fs.exposure_lines, fs.camera_gain,
+                fs.isp_camera_gain, raw_mean, (std::min)(4, prof.num_cameras));
           }
 
           // Record this frame's raw metadata into the replay ring (image
@@ -12694,6 +13237,27 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             prev_temp = temp;
             ++valid_samples;
           }
+          if (valid_samples == 0 && imu_slots > 0) {
+            static int imu_empty_logs = 0;
+            if (imu_empty_logs < 5 || imu_empty_logs % 300 == 0) {
+              double t0 = meta_s(kMetaImuBaseCol + 8);
+              if (t0 > 1023) t0 -= 2048;
+              const double ts0 = wrap_fix(image_count_hour * 12 * 3600 +
+                                          meta_u(kMetaImuBaseCol + 1) +
+                                          meta_u(kMetaImuBaseCol + 0) / 10000.0);
+              std::ostringstream os;
+              os << "[imu] empty frame #" << imu_empty_logs << std::fixed
+                 << std::setprecision(4) << " image_ts=" << fs.image_timestamp
+                 << " slot0_ts=" << ts0 << " dt=" << ts0 - fs.image_timestamp
+                 << " slot0_temp=" << t0 * 0.125 + 23 << " last_temp="
+                 << frame_info.last_imu_temperature << " raw:" << std::hex;
+              for (int w = 0; w < 2 * kImuWordsPerSample; ++w)
+                os << ' ' << std::setw(4) << std::setfill('0')
+                   << meta_u(kMetaImuBaseCol + w);
+              std::cout << os.str() << std::endl;
+            }
+            ++imu_empty_logs;
+          }
           fs.imu.imu_count = valid_samples;
           if (valid_samples > 0) frame_info.last_imu_temperature = prev_temp;
           rec.imu_n = valid_samples;
@@ -12745,7 +13309,11 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
 
           // SmartSens v7 appends GNSS after IMU/AE. Older versions keep
           // their original layouts and must never interpret pixels as GNSS.
+          // AR0234 03/07 and 05/07 use the same columns 81..105; firmware
+          // with the 1004 readback layout sends 0xB1C1 in column 81, which
+          // never matches the 0x47xx GNSS status below.
           const bool gnss_v7 = IsSmartSensProfile(prof) &&
+              (IsSc136FamilyHardware(ver0) || IsAr0234FamilyHardware(ver0)) &&
               ver1 == kSmartSensSoftwareVersion7;
           const int gnss_status = gnss_v7 ? meta_u(81) : 0;
           if (IsSmartSensProfile(prof) &&

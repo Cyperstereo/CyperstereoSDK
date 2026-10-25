@@ -207,6 +207,9 @@ else()
   message(FATAL_ERROR "Unsupported OS.")
 endif()
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/CyperstereoIsp.cmake")
+cyperstereo_add_isp(Cyperlib "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
+
 include_directories(${OpenCV_INCLUDE_DIRS})
 
 add_executable(capture_image_imu src/capture_image_imu.cpp)

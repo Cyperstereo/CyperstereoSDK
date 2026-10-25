@@ -33,6 +33,7 @@
 #include <opencv2/core/core.hpp>
 
 #include "bayer_format.h"
+#include "raw_telemetry.h"
 
 namespace cyperstereo {
 
@@ -43,6 +44,8 @@ struct HdrIspJob {
   const char *name;    // stable per-camera key, e.g. "cam1".."cam4"
   BayerConversion bayer;
   double sensor_gain;  // per-camera analogue/AEC target gain, nominally 1..8x
+
+  RawMetadataRegion metadata_region;
 
   HdrIspJob()
       : raw(nullptr), color(nullptr), name(nullptr),
@@ -65,7 +68,7 @@ struct HdrIspJob {
 void ApplyHdrIsp(
     const cv::Mat &raw, cv::Mat &color, const char *name,
     BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr,
-    double sensor_gain = 1.0);
+    double sensor_gain = 1.0, RawMetadataRegion metadata_region = {});
 
 // jobs[0] runs on the calling thread, the rest on their own threads.
 void ApplyHdrIspParallel(const HdrIspJob *jobs, int n);

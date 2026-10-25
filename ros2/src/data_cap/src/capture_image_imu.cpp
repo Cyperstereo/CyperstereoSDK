@@ -21,8 +21,9 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "sensor_msgs/msg/imu.hpp"
+#include "sensor_msgs/msg/temperature.hpp"
 
-#include "../../../../src/usb/uvc/cyperstereo_api.h"
+#include "../../../../src/usb/uvc/camera_output.h"
 
 const double g = 9.7887;
 CYPERSTEREO_USE_NAMESPACE
@@ -40,7 +41,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr cam3_image_pub;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub;
 
-    rclcpp::TimerBase::SharedPtr timer_;
+    std::array<rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr, 4> temperature_pub;
 
     std::thread worker_thread_;
     std::atomic<bool> is_running_;
@@ -56,6 +57,9 @@ public:
         cam2_image_pub = this->create_publisher<sensor_msgs::msg::Image>("/cam2/image_raw", 10);
         cam3_image_pub = this->create_publisher<sensor_msgs::msg::Image>("/cam3/image_raw", 10);
         imu_pub = this->create_publisher<sensor_msgs::msg::Imu>("/imu0", 1000);
+        for (int i = 0; i < 4; ++i)
+            temperature_pub[i] = this->create_publisher<sensor_msgs::msg::Temperature>(
+                "/cam" + std::to_string(i) + "/temperature", 10);
         is_running_ = true;
         worker_thread_ = std::thread(&CameraImuPublisher::publish_data, this);
 
@@ -82,7 +86,7 @@ public:
             return;
         }
         cyperstereo::FrameInfo frame_info{};
-        // Auto-select the camera profile (MT9V034 vs SmartSens) from the USB
+        // Auto-select the camera profile (MT9V034, SC136HGS or AR0234) from the USB
         // serial prefix, or from UVC frame size when no SN is burned.
         const std::string serial_num =
             cyperstereo::uvc::get_serial_number(*cyperstereo_device);
@@ -93,7 +97,7 @@ public:
         const int num_cameras = profile.num_cameras;
         const int process_cameras =
             cyperstereo::SmartSensProcessedCameraCount(serial_num, num_cameras);
-        const bool is_smartsens = cyperstereo::IsSmartSensProfile(profile);
+        const bool is_bayer = cyperstereo::IsSmartSensProfile(profile);
         RCLCPP_INFO(this->get_logger(),
                     "camera: %s  serial: %s  %dx%d@%d  cameras: %d%s",
                     profile.name,
@@ -103,6 +107,8 @@ public:
                     (process_cameras == 1 && num_cameras > 1)
                         ? "  process: C1 only (S1 color SKU)"
                         : "");
+        RCLCPP_INFO(this->get_logger(), "ISP mode: %s",
+                    FastBalancedIspEnabled() ? "fast-balanced" : "quality-reference");
         cyperstereo::uvc::set_device_mode(
             *cyperstereo_device, profile.frame_width, profile.frame_height,
             static_cast<int>(cyperstereo::Format::YUYV), profile.fps,
@@ -116,7 +122,7 @@ public:
         // Persistent per-camera buffers, swapped with the framestream planes
         // under the lock (O(1), like capture_image_imu) so the USB poll thread
         // is never blocked while we copy pixels. The *_color buffers hold the
-        // demosaiced BGR output for the 4-camera (SmartSens) profile and stay
+        // demosaiced BGR output for the Bayer camera profiles and stay
         // unused for MT9V034.
         cv::Mat left_image(profile.frame_height, profile.cam_width, CV_8U);
         cv::Mat right_image(profile.frame_height, profile.cam_width, CV_8U);
@@ -124,22 +130,24 @@ public:
         cv::Mat right_front_image(profile.frame_height, profile.cam_width, CV_8U);
         cv::Mat left_color, right_color, left_front_color, right_front_color;
 
-        while (is_running_)
+        while (is_running_ && rclcpp::ok())
         {
-            cyperstereo::WaitForStream(frame_info);
+            if (!WaitForCameraFrame(frame_info, [this] { return is_running_ && rclcpp::ok(); })) break;
 
             double image_timestamp = 0.0;
+            RawTelemetrySnapshot raw_telemetry;
+            CameraSensorSnapshot sensors;
             uint32_t hardware_version = 0;
             uint32_t software_version = 0;
             std::array<double, 4> camera_gain{{1.0, 1.0, 1.0, 1.0}};
             std::array<bool, 4> fpga_bayer_nr{};
-            bool image_valid = true;
             cyperstereo::IMUStreamData imu_data{};
 
             {
                 std::lock_guard<std::mutex> lock(frame_info.mtx);
                 image_timestamp = frame_info.framestream.image_timestamp;
-                image_valid = frame_info.framestream.image_valid;
+                raw_telemetry = frame_info.framestream.raw_telemetry;
+                sensors = CameraSensorSnapshot::FromFrame(frame_info.framestream);
                 hardware_version = frame_info.framestream.hardware_version;
                 software_version = frame_info.framestream.software_version;
                 cv::swap(frame_info.framestream.left_image, left_image);
@@ -149,9 +157,9 @@ public:
                     cv::swap(frame_info.framestream.left_front_image, left_front_image);
                     cv::swap(frame_info.framestream.right_front_image, right_front_image);
                 }
-                if (is_smartsens) {
+                if (is_bayer) {
                     for (int i = 0; i < process_cameras; ++i) {
-                        camera_gain[i] = frame_info.framestream.camera_gain[i];
+                        camera_gain[i] = frame_info.framestream.isp_camera_gain[i];
                         fpga_bayer_nr[i] = frame_info.framestream.fpga_bayer_nr[i];
                     }
                 }
@@ -161,49 +169,18 @@ public:
             cv_bridge::CvImage msg0, msg1, msg2, msg3;
             rclcpp::Time custom_time(image_timestamp*1e9); // seconds -> ns
 
-            if (!image_valid)
+            if (is_bayer)
             {
-                // Torn pixel planes: publish only the IMU samples of this frame.
-            }
-            else if (is_smartsens)
-            {
-                // SmartSens: use the SDK's persistent fast-balanced worker
+                // SC136HGS / AR0234: use the SDK's persistent fast-balanced worker
                 // pool instead of constructing three threads every frame.
                 // Keep independent AWB state for every sensor. Cameras 1 and
                 // 3 use the hardware-dependent Bayer phase, while 2 and 4
-                // retain the default RG2BGR mapping.
-                static WhiteBalance wb[4];
-                const BayerConversion image13_bayer =
-                    SelectBayerConversion(hardware_version, software_version, 0);
-                if (process_cameras <= 1) {
-                    // S1: C1-only color SKU. Unused FX3 lanes are not ISP'd
-                    // or published.
-                    ApplyFastBalancedISPParallel({
-                        {left_image, left_color, wb[0], "fast-cam1",
-                         camera_gain[0], image13_bayer, fpga_bayer_nr[0]},
-                    });
-                } else if (process_cameras >= 4) {
-                    ApplyFastBalancedISPParallel({
-                        {left_image, left_color, wb[0], "fast-cam1",
-                         camera_gain[0], image13_bayer, fpga_bayer_nr[0]},
-                        {right_image, right_color, wb[1], "fast-cam2",
-                         camera_gain[1], BayerConversion::kColorBayerRg2Bgr,
-                         fpga_bayer_nr[1]},
-                        {left_front_image, left_front_color, wb[2], "fast-cam3",
-                         camera_gain[2], image13_bayer, fpga_bayer_nr[2]},
-                        {right_front_image, right_front_color, wb[3], "fast-cam4",
-                         camera_gain[3], BayerConversion::kColorBayerRg2Bgr,
-                         fpga_bayer_nr[3]},
-                    });
-                } else {
-                    ApplyFastBalancedISPParallel({
-                        {left_image, left_color, wb[0], "fast-cam1",
-                         camera_gain[0], image13_bayer, fpga_bayer_nr[0]},
-                        {right_image, right_color, wb[1], "fast-cam2",
-                         camera_gain[1], BayerConversion::kColorBayerRg2Bgr,
-                         fpga_bayer_nr[1]},
-                    });
-                }
+                // also use the phase selected for their sensor family.
+                static IspProcessor isp(CameraBgrIspMode());
+                cv::Mat *raws[4] = {&left_image, &right_image, &left_front_image, &right_front_image};
+                cv::Mat *colors[4] = {&left_color, &right_color, &left_front_color, &right_front_color};
+                ApplyBayerCameraIsp(isp, raws, colors, process_cameras,
+                    hardware_version, software_version, camera_gain, fpga_bayer_nr, raw_telemetry);
 
                 msg0.encoding = "bgr8";
                 msg0.image = left_color;
@@ -240,7 +217,7 @@ public:
                 msg1.header.frame_id = "cam1";
             }
 
-            std::cout << "image_timestamp " << image_timestamp << std::endl;
+            RCLCPP_DEBUG(this->get_logger(), "image_timestamp %.6f", image_timestamp);
             
             for (int i = 0; i < imu_data.imu_count; ++i)
             {
@@ -253,7 +230,7 @@ public:
                 double acc_z = imu_data.acc_z[i] * g;
                 std::cout.setf(std::ios::fixed, std::ios::floatfield);
                 std::cout.precision(6);
-                std::cout << "imu_timestamp " << imu_timestamp << " " << gyro_x << " " << gyro_y << " " << gyro_z << " " << acc_x << " " << acc_y << " " << acc_z << std::endl;
+                RCLCPP_DEBUG(this->get_logger(), "imu_timestamp %.6f", imu_timestamp);
 
                 sensor_msgs::msg::Imu imu_msg;
                 imu_msg.header.stamp = rclcpp::Time(imu_timestamp*1e9);
@@ -272,16 +249,23 @@ public:
                 imu_pub->publish(imu_msg);
             }
 
-            if (image_valid)
+            for (int i = 0; i < process_cameras; ++i) {
+                // Invalid/expired temperature is unavailable, never a false 0 C.
+                if (!sensors.temperature_valid[i]) continue;
+                sensor_msgs::msg::Temperature temperature;
+                temperature.header.stamp = custom_time;
+                temperature.header.frame_id = "cam" + std::to_string(i);
+                temperature.temperature = sensors.temperature[i];
+                temperature.variance = 0.0;  // unknown uncertainty
+                temperature_pub[i]->publish(temperature);
+            }
+            cam0_image_pub->publish(*msg0.toImageMsg());
+            if (process_cameras >= 2)
+                cam1_image_pub->publish(*msg1.toImageMsg());
+            if (process_cameras >= 4)
             {
-                cam0_image_pub->publish(*msg0.toImageMsg());
-                if (process_cameras >= 2)
-                    cam1_image_pub->publish(*msg1.toImageMsg());
-                if (process_cameras >= 4)
-                {
-                    cam2_image_pub->publish(*msg2.toImageMsg());
-                    cam3_image_pub->publish(*msg3.toImageMsg());
-                }
+                cam2_image_pub->publish(*msg2.toImageMsg());
+                cam3_image_pub->publish(*msg3.toImageMsg());
             }
             
         }

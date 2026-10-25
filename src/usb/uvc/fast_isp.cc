@@ -2,9 +2,8 @@
 // environment knobs.
 //
 // Parameter provenance:
-//   BLC  = 16 DN (8-bit domain)      -- kIspBlackLevel of the old pipeline
-//                                       (SC136HGS pedestal after the FPGA's
-//                                       10->8 bit truncation).
+//   BLC  = shared IspBlackLevel() in the transported RAW8 domain. The
+//          current AR0234 auto AE/AGC table measures ~3.5, not 42/4.
 //   CCM  = calibrated R-major matrix -- same default as the old ApplyCcmTone
 //                                       (ColorChecker capture 741.png,
 //                                       tools/ccm_calibrate.py).
@@ -16,6 +15,7 @@
 // Sensor analogue gain is passed to gain-adaptive BayerNR and LumaNR. Exposure
 // time remains camera metadata; the bridge is a renderer, not an AE stage.
 #include "hdr_isp.h"
+#include "isp_black_level.h"
 
 #include <algorithm>
 #include <array>
@@ -48,16 +48,16 @@ namespace {
 // Fixed sensor / pipeline constants.
 
 // Sensor pedestal in the 8-bit domain (== kIspBlackLevel of the old ISP).
-constexpr int kBlackLevel8 = 16;
+// The fast and quality paths share the same measured RAW8 baseline.
 
 // The 8-bit Bayer input is expanded by <<kBitShift into HDR-ISP's int32 raw
 // domain so the integer modules (WB, CCM) keep 2 extra fraction bits.
 constexpr int kBitShift = 2;
 constexpr int kMaxVal = (256 << kBitShift) - 1;  // 1023
-// Post-BLC full scale: a saturated pixel is (255<<2) - blc = 956, not 1023.
+// Post-BLC full scale is (255<<2) minus the profile's measured black level.
 // The rgbgamma curve is built against this so white stays at 255 out.
-constexpr int kBlc = kBlackLevel8 << kBitShift;
-constexpr int kLinearFullScale = (255 << kBitShift) - kBlc;
+inline int IspBlc() { return static_cast<int>(std::lround(IspBlackLevel() * (1 << kBitShift))); }
+inline int IspLinearFullScale() { return (255 << kBitShift) - IspBlc(); }
 
 // Default CCM, R-major rows applied to [R,G,B] -- identical convention in
 // the old CcmMatrixBgr() and in HDR-ISP's ccm module. From the 741.png
@@ -208,6 +208,7 @@ bool ProfileEnabled() {
 // Per-camera context.
 
 struct CamCtx {
+  IspRawRows raw_rows;
   IspPrms prms{};
   std::unique_ptr<Frame> frame;
   IspPipeline pipeline;
@@ -242,7 +243,7 @@ void InitPrms(IspPrms &prms, int width, int height, CfaTypes cfa) {
   prms.info.dt = RawDataTypes::RAW8;
   prms.info.domain = ColorDomains::RAW;
 
-  prms.blc = kBlc;
+  prms.blc = IspBlc();
 
   FillCcm(prms.ccm_prms.ccm);
 
@@ -268,13 +269,13 @@ void InitPrms(IspPrms &prms, int width, int height, CfaTypes cfa) {
     for (int k = 0; k < MAX_GAMMA_NUMS; ++k) {
       const double linear = k * ((1 << 10) / double(MAX_GAMMA_NUMS - 1));
       prms.rgb_gamma.curve[k] =
-          static_cast<float>(ToneCurve01(linear / kLinearFullScale));
+          static_cast<float>(ToneCurve01(linear / IspLinearFullScale()));
     }
   } else {
     prms.rgb_gamma.nums = MAX_GAMMA_NUMS;
     for (int k = 0; k < MAX_GAMMA_NUMS; ++k) {
       const double linear = k * ((1 << 10) / double(MAX_GAMMA_NUMS - 1));
-      double n = linear / kLinearFullScale;
+      double n = linear / IspLinearFullScale();
       if (n > 1.0) n = 1.0;
       double tone = std::pow(n, 1.0 / kDefaultRgbGamma);
       if (n > 0.0)
@@ -338,15 +339,15 @@ void EstimateWbGains(CamCtx &ctx, const cv::Mat &raw) {
   constexpr int kEstStep = 8;
   constexpr double kSmooth = 0.05;
   constexpr double kGainMin = 0.6, kGainMax = 2.6;
-  const int lo = kBlackLevel8 + 24;
+  const int lo = static_cast<int>(IspBlackLevel()) + 24;
   const int hi = 250;
 
   ctx.ratios_bg.clear();
   ctx.ratios_rg.clear();
   int n_total = 0;
   for (int y = 0; y + 1 < raw.rows; y += kEstStep) {
-    const uchar *r0 = raw.ptr<uchar>(y);
-    const uchar *r1 = raw.ptr<uchar>(y + 1);
+    const uchar *r0 = ctx.raw_rows.Row(raw, y);
+    const uchar *r1 = ctx.raw_rows.Row(raw, y + 1);
     for (int x = 0; x + 1 < raw.cols; x += kEstStep) {
       const bool rggb = ctx.prms.info.cfa == CfaTypes::RGGB;
       const int b = rggb ? r1[x + 1] : r0[x];
@@ -359,9 +360,9 @@ void EstimateWbGains(CamCtx &ctx, const cv::Mat &raw) {
       if (b >= 250 || g0 >= 250 || g1 >= 250 || r >= 250) continue;
       const int luma = (b + 2 * g + r) >> 2;
       if (luma < lo || luma > hi) continue;
-      const double bb = b - kBlackLevel8;
-      const double gg = g - kBlackLevel8;
-      const double rr = r - kBlackLevel8;
+      const double bb = b - IspBlackLevel();
+      const double gg = g - IspBlackLevel();
+      const double rr = r - IspBlackLevel();
       if (bb < 4.0 || gg < 4.0 || rr < 4.0) continue;  // noise-dominated
       ctx.ratios_bg.push_back(static_cast<float>(gg / bb));
       ctx.ratios_rg.push_back(static_cast<float>(gg / rr));
@@ -530,7 +531,7 @@ class HdrIspWorkerPool {
   static constexpr int kLaneCount = kWorkerCount + 1;
 
   static void RunJob(const HdrIspJob &job) {
-    ApplyHdrIsp(*job.raw, *job.color, job.name, job.bayer, job.sensor_gain);
+    ApplyHdrIsp(*job.raw, *job.color, job.name, job.bayer, job.sensor_gain, job.metadata_region);
   }
 
   void WorkerLoop(int lane) {
@@ -592,9 +593,10 @@ HdrIspWorkerPool &WorkerPool() {
 }  // namespace
 
 void ApplyHdrIsp(const cv::Mat &raw, cv::Mat &color, const char *name,
-                 BayerConversion bayer, double sensor_gain) {
+                 BayerConversion bayer, double sensor_gain, RawMetadataRegion metadata_region) {
   CV_Assert(raw.type() == CV_8UC1);
   CamCtx *ctx = GetCtx(name, raw.cols, raw.rows, bayer);
+  ctx->raw_rows.Prepare(raw, metadata_region);
 
   UpdateGainAdaptiveBayerNr(ctx->prms, sensor_gain);
 
@@ -615,7 +617,7 @@ void ApplyHdrIsp(const cv::Mat &raw, cv::Mat &color, const char *name,
   {
     int32_t *dst = reinterpret_cast<int32_t *>(ctx->frame->data.raw_s32_i);
     for (int y = 0; y < raw.rows; ++y) {
-      const uchar *src = raw.ptr<uchar>(y);
+      const uchar *src = ctx->raw_rows.Row(raw, y);
       int32_t *d = dst + static_cast<size_t>(y) * raw.cols;
       for (int x = 0; x < raw.cols; ++x) d[x] = src[x] << kBitShift;
     }
@@ -652,7 +654,7 @@ void ApplyHdrIsp(const cv::Mat &raw, cv::Mat &color, const char *name,
     // [|ccm]). Directly quantize it to BGR8: no gamma or tone mapping.
     const int32_t *src =
         reinterpret_cast<int32_t *>(ctx->frame->data.bgr_s32_i);
-    constexpr float kLinearToU8 = 255.0f / kLinearFullScale;
+    const float kLinearToU8 = 255.0f / IspLinearFullScale();
     for (int y = 0; y < raw.rows; ++y) {
       uchar *d = color.ptr<uchar>(y);
       const int32_t *s = src + static_cast<size_t>(y) * raw.cols * 3;
@@ -685,7 +687,7 @@ void ApplyHdrIspParallel(const HdrIspJob *jobs, int n) {
   CV_Assert(jobs != nullptr);
   if (n == 1) {
     ApplyHdrIsp(*jobs[0].raw, *jobs[0].color, jobs[0].name, jobs[0].bayer,
-                jobs[0].sensor_gain);
+                jobs[0].sensor_gain, jobs[0].metadata_region);
     return;
   }
   WorkerPool().Run(jobs, n);
@@ -699,7 +701,7 @@ namespace detail {
 void ApplyQualityReferenceISPParallel(
     const cv::Mat *const *raws, cv::Mat *const *outputs,
     const char *const *names, const double *sensor_gains,
-    const BayerConversion *bayers, int n) {
+    const BayerConversion *bayers, int n, const RawMetadataRegion *regions) {
   if (n <= 0) return;
   CV_Assert(raws != nullptr && outputs != nullptr && names != nullptr &&
             sensor_gains != nullptr && bayers != nullptr);
@@ -715,6 +717,7 @@ void ApplyQualityReferenceISPParallel(
     jobs[i].name = names[i];
     jobs[i].sensor_gain = sensor_gains[i];
     jobs[i].bayer = bayers[i];
+    if (regions) jobs[i].metadata_region = regions[i];
   }
   ApplyHdrIspParallel(jobs.data(), n);
 }
