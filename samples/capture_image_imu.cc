@@ -354,6 +354,7 @@ static void LogRawStats(int count, int every, const cv::Mat *const raw[4],
         << " p90=" << pct(0.90) << " p99=" << pct(0.99)
         << " sat=" << std::setprecision(2) << 100.0 * sat / n << "%";
   }
+  out << "  isp_blc=" << std::setprecision(3) << cyperstereo::IspBlackLevel();
   std::cout << out.str() << std::endl;
 }
 

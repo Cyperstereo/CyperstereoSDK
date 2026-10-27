@@ -1181,8 +1181,8 @@ inline std::atomic<double> &FastExposureSensorAnalogMax() {
 //   - digital-exposure metering over the central 2/3 x 3/4 of the frame,
 //     combining the log mean and useful-signal p35 (32 DN target),
 //   - the same gamma-2.0 / 1.85x-cap base tone curve as SC136,
-//   - a 0.94 green-channel scale (CYPERSTEREO_FAST_AR0234_GREEN) for the
-//     CFA / 650 nm IR-cut residual, applied in the WB LUT after AWB,
+//   - an optional green-channel scale (CYPERSTEREO_FAST_AR0234_GREEN,
+//     default 1.0), applied in the WB LUT after AWB,
 //   - digital exposure capped at 3x (including environment overrides),
 //     highlight knee 112 unless CYPERSTEREO_FAST_EXPOSURE_KNEE overrides it.
 
@@ -1191,9 +1191,10 @@ inline bool FastAr0234LscEnabled() {
   return false;
 }
 
-// Extra green-channel scale on top of AWB.  The AR0234 color CFA plus the
-// 7761 650 nm IR-cut leave a residual green that gray-world does not
-// remove (it treats the green-tinted wall as neutral).  1.0 disables.
+// Extra green-channel scale on top of AWB.  1.0 disables.  Gray-world AWB
+// already makes neutrals R = G = B, so any other value tints neutrals, and
+// the CCM (rows sum to 1, but large off-diagonals) amplifies the tint about
+// 2x: 0.94 turned white walls blue-magenta (R 1.04, G 0.90, B 1.05).
 // Only used while FastIspAr0234Profile is set.
 inline double FastAr0234GreenGain() {
   static const double g = [] {
@@ -1201,7 +1202,7 @@ inline double FastAr0234GreenGain() {
       const double v = std::atof(e);
       if (v >= 0.70 && v <= 1.20) return v;
     }
-    return 0.94;
+    return 1.0;
   }();
   return FastIspAr0234Profile().load() ? g : 1.0;
 }
@@ -2677,7 +2678,46 @@ class WhiteBalance {
 
   // White balance is estimated on every 2nd frame (see Apply); the digital
   // exposure is metered on every frame so it follows the AE without lag.
+  // AR0234 7761 fisheye: the frame corners lie outside the image circle and
+  // read the sensor black after its ABLC.  Flare only adds light, so the
+  // darkest corner is used.  Patches stay clear of the edge rows, which can
+  // carry metadata.  Readings above 12 DN (beyond DATA_PEDESTAL/4 = 10.5)
+  // mean a lit corner and are ignored.  Each camera keeps its own value:
+  // the darkest corners differ by ~1 DN between sensors, and a shared
+  // average over-subtracts on some, crushing shadows and tinting them
+  // yellow.  Published in 1/8 DN steps with 0.25 DN hysteresis so noise
+  // does not rebuild the LUTs every frame.
+  void MeasureAr0234Black(const cv::Mat &raw) {
+    if (!FastIspAr0234Profile().load() || Ar0234BlackLevelOverride() >= 0.0)
+      return;
+    const int sz = (std::min)(32, (std::min)(raw.cols, raw.rows) / 16) & ~1;
+    constexpr int kInset = 8;
+    if (sz < 8 || raw.cols < 2 * (sz + kInset) || raw.rows < 2 * (sz + kInset))
+      return;
+    const int xs[2] = {kInset, (raw.cols - kInset - sz) & ~1};
+    const int ys[2] = {kInset, (raw.rows - kInset - sz) & ~1};
+    double darkest = 1e9;
+    for (int yc : ys) {
+      for (int xc : xs) {
+        int sum = 0;
+        for (int y = yc; y < yc + sz; ++y) {
+          const uchar *row = raw_rows_.Row(raw, y);
+          for (int x = xc; x < xc + sz; ++x) sum += row[x];
+        }
+        darkest = (std::min)(darkest, sum / static_cast<double>(sz * sz));
+      }
+    }
+    if (!(darkest >= 1.0 && darkest <= 12.0)) return;
+    black_avg_ = black_avg_ > 0.0
+                     ? black_avg_ + 0.1 * (darkest - black_avg_)
+                     : darkest;
+    const double q = std::round(black_avg_ * 8.0) / 8.0;
+    if (black_ <= 0.0 || std::fabs(q - black_) >= 0.25) black_ = q;
+    Ar0234UpdateMeasuredBlackLevel(darkest);
+  }
+
   void UpdateFrameStats(const cv::Mat &raw, BayerConversion bayer) {
+    MeasureAr0234Black(raw);
     if ((frame_idx_++ & 1) == 0 || b_gain_ <= 0.0)
       EstimateGains(raw, bayer);
     if (display_exposure_ && GetFastExposureConfig().enabled)
@@ -2756,7 +2796,8 @@ class WhiteBalance {
           knee + (255.0 - knee) * t * roll_s / (1.0 + (roll_s - 1.0) * t) +
           0.5);
     };
-    green_table_ = roll_off || black != std::floor(black) || g_scale != 1.0;
+    green_table_ = roll_off || black != std::floor(black) || g_scale != 1.0 ||
+                   black_ > 0.0;
     // The WB LUT stays LINEAR (pedestal subtraction + WB gain + digital
     // exposure only): the canonical pipeline needs linear data for demosaic
     // and the CCM, so the encode/tone curve now runs post-CCM in
@@ -2912,7 +2953,9 @@ class WhiteBalance {
   static __attribute__((noinline)) void WbPlanarRowAsm(
       const uchar *src, int64_t blocks, uchar *dst_color, uchar *dst_green,
       const uint8_t *color_lut, const uint8_t *green_lut, bool color_odd) {
-    const uint32_t black = static_cast<uint32_t>(BlackLevel());
+    // Only the identity green path reads the black; AR0234 (per-camera
+    // black) always runs with a green table.
+    const uint32_t black = static_cast<uint32_t>(IspBlackLevel());
     if (!green_lut) {
       const uchar *s = src;
       int64_t n = blocks;
@@ -3225,7 +3268,9 @@ class WhiteBalance {
 
   // Subtract the same measured baseline in the WB estimator, pixel LUTs,
   // noise signal model, exposure meter and output normalization.
-  static double BlackLevel() { return IspBlackLevel(); }
+  double BlackLevel() const { return black_ > 0.0 ? black_ : IspBlackLevel(); }
+  double black_ = 0.0;      // this camera's AR0234 corner black, 0 = none
+  double black_avg_ = 0.0;
   static constexpr double kSmooth = 0.05;
   static constexpr int kEstStep = 8;
   static constexpr double kGainMin = 0.6;
@@ -12932,8 +12977,11 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
               if (!FastIspAr0234Profile().exchange(true)) {
                 std::cout << "[api] AR0234 ISP on: isolated bright DPC off, LSC off, meter "
                              "1280x812, tone SC136 base (gamma 2.0 / lift cap 1.85x), "
-                             "green 0.94, digital exposure ceiling 3, knee 112"
-                          << " RAW8_BLC=" << IspBlackLevel()
+                             "green " << FastAr0234GreenGain()
+                          << ", digital exposure ceiling 3, knee 112 RAW8_BLC="
+                          << (Ar0234BlackLevelOverride() >= 0.0
+                                  ? std::to_string(Ar0234BlackLevelOverride())
+                                  : std::string("fisheye corners"))
                           << std::endl;
               }
               const int active_cameras = std::min(prof.num_cameras, 4);
