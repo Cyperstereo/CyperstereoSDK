@@ -20,10 +20,14 @@ struct RawMetadataRegion {
 // words[c] preserves both original wire bytes: low=C1, high=C2.
 struct RawTelemetrySnapshot {
   bool valid = false;
+  // Set after AR0234 image1/image2 have had their metadata row replaced and
+  // the planes rotated. Those planes no longer contain the metadata bytes.
+  bool image12_metadata_baked = false;
   int hardware = 0, software = 0, row = -1, word_count = 0;
   std::array<uint16_t, kSmartSensMaxMetadataCols> words{};
   RawMetadataRegion RegionForPlane(int plane) const {
     RawMetadataRegion region;
+    if (image12_metadata_baked && (plane == 0 || plane == 1)) return region;
     if (valid && (plane == 0 || plane == 1)) {
       region.row = row;
       region.end_col = word_count;

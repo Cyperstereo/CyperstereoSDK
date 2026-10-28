@@ -49,6 +49,24 @@ inline BayerConversion SelectBayerConversion(uint32_t hardware_version,
   return BayerConversion::kColorBayerRg2Bgr;
 }
 
+// AR0234 image1/image2 are rotated 180 degrees after telemetry is captured.
+// Both dimensions are even, so that rotation swaps RGGB and BGGR. image3,
+// image4, and the six-image half cameras are not rotated and keep
+// SelectBayerConversion.
+inline BayerConversion SelectDeliveredPlaneBayer(uint32_t hardware_version,
+                                                 uint32_t software_version,
+                                                 int image_index) {
+  const BayerConversion native =
+      SelectBayerConversion(hardware_version, software_version, image_index);
+  if ((image_index == 0 || image_index == 1) &&
+      IsAr0234FamilyHardware(static_cast<int>(hardware_version))) {
+    return native == BayerConversion::kColorBayerBg2Bgr
+               ? BayerConversion::kColorBayerRg2Bgr
+               : BayerConversion::kColorBayerBg2Bgr;
+  }
+  return native;
+}
+
 // Bayer phase of a PHYSICAL camera (1-based C1..C6) rather than of a display
 // plane (plane order C1,C2,C4,C3).  Horizontal 2:1 same-colour binning (the
 // six-image half lanes) preserves the phase, so the half images use exactly

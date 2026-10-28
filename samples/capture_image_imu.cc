@@ -689,10 +689,16 @@ static int run(int argc, char *argv[]) {
       // Run the selected ISP pipeline. Fast-balanced is the default; the
       // HDR-ISP quality reference remains available through --isp-quality.
       // Each camera uses its own live AEC gain from the metadata row.
-      const BayerConversion image13_bayer =
-          SelectBayerConversion(hardware_version, software_version, 0);
-      const BayerConversion image24_bayer =
-          SelectBayerConversion(hardware_version, software_version, 1);
+      // image1/image2 use the delivered phase: AR0234 rotates those two RAW
+      // planes 180 degrees. image3/image4 stay in transport orientation.
+      const BayerConversion image1_bayer =
+          SelectDeliveredPlaneBayer(hardware_version, software_version, 0);
+      const BayerConversion image2_bayer =
+          SelectDeliveredPlaneBayer(hardware_version, software_version, 1);
+      const BayerConversion image3_bayer =
+          SelectBayerConversion(hardware_version, software_version, 2);
+      const BayerConversion image4_bayer =
+          SelectBayerConversion(hardware_version, software_version, 3);
       const bool half_res_lanes =
           process_cameras >= 4 &&
           IsSmartSensHalfResLaneLayout(static_cast<int>(hardware_version),
@@ -700,7 +706,7 @@ static int run(int argc, char *argv[]) {
       if (process_cameras <= 1) {
         // S1: C1-only color SKU. Unused FX3 lanes are not ISP'd.
         isp.ApplyParallel({
-            {left_image, left_color, "cam1", isp_camera_gain[0], image13_bayer,
+            {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
              fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
         });
       } else if (half_res_lanes) {
@@ -731,10 +737,10 @@ static int run(int argc, char *argv[]) {
           }
         }
         isp.ApplyParallel({
-            {left_image, left_color, "cam1", isp_camera_gain[0], image13_bayer,
+            {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
              fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
             {right_image, right_color, "cam2", isp_camera_gain[1],
-             image24_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
+             image2_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
         });
         SplitAndVBinHalfResLanes(left_front_image, right_front_image, half_raw);
         BayerConversion cam_bayer[4];
@@ -753,27 +759,28 @@ static int run(int argc, char *argv[]) {
             {half_raw[2], half_color[2], "half-cam5", cam_gain[2], cam_bayer[2]},
             {half_raw[3], half_color[3], "half-cam6", cam_gain[3], cam_bayer[3]},
         });
+        MirrorImage5Vertical(half_raw[2], half_color[2]);
         // half_isp slots 2/3 are physical C5/C6, same digital exposure as image1.
         c56.digital_gain[0] = half_isp.DigitalGain(2);
         c56.digital_gain[1] = half_isp.DigitalGain(3);
       } else if (process_cameras >= 4) {
         isp.ApplyParallel({
-            {left_image, left_color, "cam1", isp_camera_gain[0], image13_bayer,
+            {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
              fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
             {right_image, right_color, "cam2", isp_camera_gain[1],
-             image24_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
+             image2_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
             {left_front_image, left_front_color, "cam3", isp_camera_gain[2],
-             image13_bayer, fpga_bayer_nr[2], raw_telemetry.RegionForPlane(2)},
+             image3_bayer, fpga_bayer_nr[2], raw_telemetry.RegionForPlane(2)},
             {right_front_image, right_front_color, "cam4", isp_camera_gain[3],
-             image24_bayer, fpga_bayer_nr[3], raw_telemetry.RegionForPlane(3)},
+             image4_bayer, fpga_bayer_nr[3], raw_telemetry.RegionForPlane(3)},
         });
       } else {
         // S2 exposes only the C1/C2 Bayer planes.
         isp.ApplyParallel({
-            {left_image, left_color, "cam1", isp_camera_gain[0], image13_bayer,
+            {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
              fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
             {right_image, right_color, "cam2", isp_camera_gain[1],
-             image24_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
+             image2_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
         });
       }
       //std::cout << "proc(wb+cvt) " << proc.toc() << std::endl;
@@ -787,10 +794,17 @@ static int run(int argc, char *argv[]) {
       const cv::Mat *raw_images[6] = {
           &left_image, &right_image, &left_front_image, &right_front_image,
           nullptr, nullptr};
+      // Display/save slot -> camera tag.  In six-image mode slots 4/5 show
+      // C5h/C4h.  Processing above is unchanged.
+      std::string image_tags[6] = {"image1", "image2", "image3",
+                                   "image4", "image5", "image6"};
       if (half_res_lanes) {
+        static const int kHalfOrder[4] = {0, 2, 1, 3};
+        static const char *const kHalfTags[4] = {"C3h", "C4h", "C5h", "C6h"};
         for (int i = 0; i < 4; ++i) {
-          color_images[2 + i] = &half_color[i];
-          raw_images[2 + i] = &half_raw[i];
+          color_images[2 + i] = &half_color[kHalfOrder[i]];
+          raw_images[2 + i] = &half_raw[kHalfOrder[i]];
+          image_tags[2 + i] = std::string("image_") + kHalfTags[kHalfOrder[i]];
         }
       }
       if (show_preview && count % kShowEvery == 0) {
@@ -814,7 +828,6 @@ static int run(int argc, char *argv[]) {
       if (preview_key == 's' || preview_key == 'S' ||
           (save_at >= 0 && (count == save_at || count == save_at + 1)) ||
           (save_every > 0 && count > 0 && count % save_every == 0)) {
-          static const char *const kHalfTags[4] = {"C3h", "C4h", "C5h", "C6h"};
           const cv::Mat *display_images[6];
           for (int i = 0; i < n_images; ++i) {
             display_images[i] = color_images[i];
@@ -824,11 +837,7 @@ static int run(int argc, char *argv[]) {
             }
           }
           for (int i = 0; i < n_images; ++i) {
-            const std::string tag =
-                (half_res_lanes && i >= 2
-                     ? std::string("image_") + kHalfTags[i - 2]
-                     : "image" + std::to_string(i + 1)) +
-                "_" + std::to_string(count);
+            const std::string tag = image_tags[i] + "_" + std::to_string(count);
             cv::imwrite("raw_" + tag + ".png", *raw_images[i]);
             cv::imwrite("color_" + tag + ".png", *display_images[i]);
           }

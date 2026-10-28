@@ -464,6 +464,14 @@ inline void SplitAndVBinHalfResLanes(const cv::Mat &lane2, const cv::Mat &lane3,
   SplitHalfResLanes(v2, v3, quarter);
 }
 
+// image5 is half-camera C5 (quarter[2]). Flip it vertically after demosaic:
+// doing it on the RAW would turn RGGB/BGGR into a phase this ISP does not
+// demosaic. The RAW copy is flipped only so preview and saved RAW match.
+inline void MirrorImage5Vertical(cv::Mat &raw, cv::Mat &color) {
+  if (!raw.empty()) cv::flip(raw, raw, 0);
+  if (!color.empty()) cv::flip(color, color, 0);
+}
+
 static constexpr int kMt9FrameWidth = 752;
 static constexpr int kMt9FrameHeight = 480;
 static constexpr int kMt9FrameFps = 60;
@@ -12658,6 +12666,31 @@ inline bool FindCyperstereoDevices(
   return true;
 }
 
+// Replace the metadata span with the same-phase donor row, then rotate
+// image1 and image2 by 180 degrees. Telemetry words are already copied.
+// image3/image4 are left in transport orientation.
+inline void OrientAr0234Image12(FrameStreamData &fs) {
+  auto repair = [](cv::Mat &raw, int row, int end_col) {
+    if (raw.empty() || row < 2 || row >= raw.rows || end_col <= 0) return;
+    end_col = (std::min)(end_col, raw.cols);
+    raw.row(row - 2).colRange(0, end_col)
+        .copyTo(raw.row(row).colRange(0, end_col));
+  };
+  if (fs.raw_telemetry.valid) {
+    repair(fs.left_image, fs.raw_telemetry.row, fs.raw_telemetry.word_count);
+    repair(fs.right_image, fs.raw_telemetry.row, fs.raw_telemetry.word_count);
+    fs.raw_telemetry.image12_metadata_baked = true;
+  }
+  if (!fs.left_image.empty()) cv::flip(fs.left_image, fs.left_image, -1);
+  if (!fs.right_image.empty()) cv::flip(fs.right_image, fs.right_image, -1);
+  static int announced = 0;
+  if (announced == 0) {
+    announced = 1;
+    std::cout << "[api] AR0234 image1/image2 mirrored up-down and left-right"
+              << std::endl;
+  }
+}
+
 inline void WaitForStream(FrameInfo& frame_info) {
   std::unique_lock<std::mutex> lock(frame_info.mtx);
   const auto frame_ready = [&frame_info]() { return frame_info.frame != nullptr; };
@@ -12899,7 +12932,8 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           fs.hardware_version = static_cast<uint32_t>(ver0);
           fs.software_version = static_cast<uint32_t>(ver1);
           // Capture original telemetry after marker validation and before any
-          // consumer can create an ISP copy. Never edit the transport planes.
+          // consumer can create an ISP copy. AR0234 image1/image2 are oriented
+          // only after this snapshot; image3/image4 stay untouched.
           fs.raw_telemetry = DecodeRawTelemetrySnapshot(
               lo, hi, lo_plane->cols, prof.meta_row, ver0, ver1);
 
@@ -13461,6 +13495,14 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
               fs.gnss.heading = gps_angle;
             }
           }
+        }
+
+        {
+          const int orient_hw = fs.hardware_version != 0
+                                    ? static_cast<int>(fs.hardware_version)
+                                    : prof.hardware_version;
+          if (IsAr0234FamilyHardware(orient_hw))
+            OrientAr0234Image12(fs);
         }
 
         // Publish only after validation: marker-mismatch frames returned

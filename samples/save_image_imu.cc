@@ -443,6 +443,7 @@ void DataFlow() {
                   {half_raw[3], half_color[3], "half-cam6", cam_gain[3],
                    SelectCameraBayerConversion(hw, sw, SixCamHalfImageCamera(3))},
               });
+              MirrorImage5Vertical(half_raw[2], half_color[2]);
             }
             std::thread t2;
             if (two_ok) {

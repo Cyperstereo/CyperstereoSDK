@@ -45,8 +45,8 @@ inline void ApplyBayerCameraIsp(
     const std::array<bool, 4> &nr_done, const RawTelemetrySnapshot &telemetry) {
   CV_Assert(count >= 1 && count <= 4);
   IspFrameJob jobs[] = {
-      {*raw[0], *color[0], "cam1", gain[0], SelectBayerConversion(hardware, software, 0), nr_done[0], telemetry.RegionForPlane(0)},
-      {*raw[1], *color[1], "cam2", gain[1], SelectBayerConversion(hardware, software, 1), nr_done[1], telemetry.RegionForPlane(1)},
+      {*raw[0], *color[0], "cam1", gain[0], SelectDeliveredPlaneBayer(hardware, software, 0), nr_done[0], telemetry.RegionForPlane(0)},
+      {*raw[1], *color[1], "cam2", gain[1], SelectDeliveredPlaneBayer(hardware, software, 1), nr_done[1], telemetry.RegionForPlane(1)},
       {*raw[2], *color[2], "cam3", gain[2], SelectBayerConversion(hardware, software, 2), nr_done[2], telemetry.RegionForPlane(2)},
       {*raw[3], *color[3], "cam4", gain[3], SelectBayerConversion(hardware, software, 3), nr_done[3], telemetry.RegionForPlane(3)}};
   isp.ApplyParallel(jobs, count);
