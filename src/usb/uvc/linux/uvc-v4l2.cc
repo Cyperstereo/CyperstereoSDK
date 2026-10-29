@@ -1348,7 +1348,8 @@ struct device {
     try {
       thread = std::thread([this]() {
         // Highest priority: a late dequeue means a permanently dropped frame.
-        ApplyThreadPriority(ThreadRole::kPoll, "uvc-poll");
+        // CYPERSTEREO_UVC_POLL_CPU moves only this thread (RK3576: CPU6).
+        ApplyPollThreadPlacement("uvc-poll");
         while (!stop) {
           poll();
           poll_fx3_link_stats();

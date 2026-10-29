@@ -29,6 +29,7 @@
 // processing far above every other thread. If you truly want them equal, set
 // kPollPriority == kWorkerPriority below.
 
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 
@@ -207,6 +208,36 @@ inline void ApplyThreadPriority(ThreadRole role, const char* name = "") {
 #else
   (void)role;
   (void)name;
+#endif
+}
+
+// Pin the UVC poll thread to CYPERSTEREO_UVC_POLL_CPU. The process may already
+// be restricted to CPU0-5; this call replaces that mask for the poll thread
+// only, so capture can sit on its own core (RK3576: CPU6, xHCI IRQ on CPU7).
+inline void ApplyPollThreadPlacement(const char* name = "uvc-poll") {
+  ApplyThreadPriority(ThreadRole::kPoll, name);
+#if defined(__linux__)
+#if defined(_GNU_SOURCE)
+  if (name && name[0])
+    pthread_setname_np(pthread_self(), name);
+#endif
+  const char* env = std::getenv("CYPERSTEREO_UVC_POLL_CPU");
+  if (!env || !env[0])
+    return;
+  char* end = nullptr;
+  const long cpu = std::strtol(env, &end, 10);
+  if (end == env || cpu < 0 || cpu >= CPU_SETSIZE)
+    return;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(static_cast<int>(cpu), &set);
+  const int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+  if (rc != 0) {
+    std::cerr << "[uvc] failed to pin " << (name ? name : "poll") << " to cpu" << cpu
+              << " (" << std::strerror(rc) << ")\n";
+    return;
+  }
+  std::cout << "[uvc] " << (name ? name : "poll") << " pinned to cpu" << cpu << "\n";
 #endif
 }
 
