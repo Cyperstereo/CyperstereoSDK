@@ -21,6 +21,7 @@
 #include <mutex>
 #include <opencv2/opencv.hpp>
 #include "../../src/usb/uvc/camera_output.h"
+#include "../../src/usb/uvc/six_camera_isp.h"
 using namespace std;
 
 const double g = 9.7887;
@@ -67,16 +68,14 @@ int main(int argc, char *argv[]) {
   // camera job oversubscribes the CPU and increases frame latency.
   cv::setNumThreads(1);
   image_transport::ImageTransport it(nh);
-  image_transport::Publisher cam0_image_pub = it.advertise("/cam0/image_raw", 1000);
-  image_transport::Publisher cam1_image_pub = it.advertise("/cam1/image_raw", 1000);
-  image_transport::Publisher cam2_image_pub = it.advertise("/cam2/image_raw", 1000);
-  image_transport::Publisher cam3_image_pub = it.advertise("/cam3/image_raw", 1000);
-  ros::Publisher IMU_pub = nh.advertise<sensor_msgs::Imu>("imu0", 1000); 
-
-  std::array<ros::Publisher, 4> temperature_pub;
-  for (int i = 0; i < 4; ++i)
+  std::array<image_transport::Publisher, 6> image_pub;
+  std::array<ros::Publisher, 6> temperature_pub;
+  for (int i = 0; i < 6; ++i) {
+    image_pub[i] = it.advertise("/cam" + std::to_string(i) + "/image_raw", 1000);
     temperature_pub[i] = nh.advertise<sensor_msgs::Temperature>(
         "/cam" + std::to_string(i) + "/temperature", 10);
+  }
+  ros::Publisher IMU_pub = nh.advertise<sensor_msgs::Imu>("imu0", 1000);
   int imu_seq = 1;
   std::shared_ptr<cyperstereo::uvc::device> cyperstereo_device{nullptr};
   if (!cyperstereo::FindCyperstereoDevices(cyperstereo_device)) {
@@ -119,7 +118,13 @@ int main(int argc, char *argv[]) {
   cv::Mat right_image(profile.frame_height, profile.cam_width, CV_8U);
   cv::Mat left_front_image(profile.frame_height, profile.cam_width, CV_8U);
   cv::Mat right_front_image(profile.frame_height, profile.cam_width, CV_8U);
-  Bgr8MessagePool color_pool[4];
+  Bgr8MessagePool color_pool[6];
+  IspProcessor isp(CameraBgrIspMode()), half_isp(isp.mode());
+  std::unique_ptr<SixCameraIspProcessor> six_isp;
+  const bool use_six_scheduler = isp.UsesFastBalanced() &&
+      !FastEnvTruthy("CYPERSTEREO_DISABLE_SIX_CAMERA_ISP");
+  cv::Mat half_raw[4];
+  bool six_announced = false;
 
   while (ros::ok()) {
     if (!WaitForCameraFrame(frame_info, [] { return ros::ok(); })) break;
@@ -131,6 +136,8 @@ int main(int argc, char *argv[]) {
     uint32_t software_version = 0;
     std::array<double, 4> camera_gain{{1.0, 1.0, 1.0, 1.0}};
     std::array<bool, 4> fpga_bayer_nr{};
+    std::array<double, 2> c56_gain{{1.0, 1.0}}, c56_temperature{};
+    bool c56_valid = false;
     cyperstereo::IMUStreamData imu_data{};
 
     {
@@ -153,47 +160,72 @@ int main(int argc, char *argv[]) {
           fpga_bayer_nr[i] = frame_info.framestream.fpga_bayer_nr[i];
         }
       }
+      c56_valid = frame_info.framestream.c56_telemetry_valid;
+      for (int i = 0; i < 2; ++i) {
+        c56_gain[i] = frame_info.framestream.c56_camera_gain[i];
+        c56_temperature[i] = frame_info.framestream.c56_camera_temperature[i];
+      }
       imu_data = frame_info.framestream.imu;
     }
 
-    sensor_msgs::ImagePtr msg0, msg1, msg2, msg3;
+    const bool half_res_lanes = is_bayer && process_cameras >= 4 &&
+        IsAr0234FamilyHardware(static_cast<int>(hardware_version)) &&
+        IsSmartSensHalfResLaneLayout(static_cast<int>(hardware_version),
+                                    static_cast<int>(software_version));
+    const int output_cameras = half_res_lanes ? 6 : process_cameras;
+    sensor_msgs::ImagePtr messages[6];
     if (is_bayer) {
-      // SC136HGS / AR0234: each plane is RAW Bayer with no on-chip AWB.  The SDK's
-      // fast-balanced path owns three persistent workers and runs the fourth
-      // camera on this thread, avoiding three thread creations every frame.
-      // Each camera keeps independent AWB history.  Cameras 1 and 3 share the
-      // hardware-version-dependent Bayer phase; all phases come from the profile.
-      static IspProcessor isp(CameraBgrIspMode());
-      sensor_msgs::ImagePtr *const color_msg[4] = {&msg0, &msg1, &msg2, &msg3};
-      cv::Mat color[4];
-      for (int i = 0; i < process_cameras && i < 4; ++i) {
-        *color_msg[i] =
-            color_pool[i].Acquire(profile.frame_height, profile.cam_width);
-        color[i] = WrapBgr8(*color_msg[i]);
+      cv::Mat color[6];
+      for (int i = 0; i < output_cameras; ++i) {
+        const bool half = half_res_lanes && i >= 2;
+        messages[i] = color_pool[i].Acquire(
+            half ? SmartSensHalfResHeight(profile.frame_height) : profile.frame_height,
+            half ? SmartSensHalfResWidth(profile.cam_width) : profile.cam_width);
+        color[i] = WrapBgr8(messages[i]);
       }
-      cv::Mat *raws[4] = {&left_image, &right_image, &left_front_image, &right_front_image};
-      cv::Mat *colors[4] = {&color[0], &color[1], &color[2], &color[3]};
-      ApplyBayerCameraIsp(isp, raws, colors, process_cameras,
-          hardware_version, software_version, camera_gain, fpga_bayer_nr, raw_telemetry);
-      for (int i = 0; i < process_cameras && i < 4; ++i) {
-        // The ISP keeps the wrapped buffer when size/type match; if it ever
-        // had to reallocate, publish a copy of what it produced instead.
-        if (color[i].data != (*color_msg[i])->data.data())
-          *color_msg[i] = cv_bridge::CvImage(std_msgs::Header(), "bgr8",
-                                             color[i]).toImageMsg();
+      if (half_res_lanes) {
+        if (!six_announced) {
+          ROS_INFO("AR0234 six-camera output: /cam0..5/image_raw = C1..6; C3..6 are half-width/half-height");
+          six_announced = true;
+        }
+        SplitAndVBinHalfResLanes(left_front_image, right_front_image, half_raw);
+        const double gains[4] = {camera_gain[3], camera_gain[2], c56_gain[0], c56_gain[1]};
+        const IspFrameJob jobs[] = {
+            {left_image, color[0], "cam1", camera_gain[0], SelectDeliveredPlaneBayer(hardware_version, software_version, 0), fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
+            {right_image, color[1], "cam2", camera_gain[1], SelectDeliveredPlaneBayer(hardware_version, software_version, 1), fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
+            {half_raw[0], color[2], "half-cam3", gains[0], SelectCameraBayerConversion(hardware_version, software_version, SixCamHalfImageCamera(0))},
+            {half_raw[1], color[3], "half-cam4", gains[1], SelectCameraBayerConversion(hardware_version, software_version, SixCamHalfImageCamera(1))},
+            {half_raw[2], color[4], "half-cam5", gains[2], SelectCameraBayerConversion(hardware_version, software_version, SixCamHalfImageCamera(2))},
+            {half_raw[3], color[5], "half-cam6", gains[3], SelectCameraBayerConversion(hardware_version, software_version, SixCamHalfImageCamera(3))}};
+        if (use_six_scheduler) {
+          if (!six_isp) six_isp.reset(new SixCameraIspProcessor());
+          six_isp->Apply(jobs);
+        } else {
+          isp.ApplyParallel(jobs, 2);
+          half_isp.ApplyParallel(jobs + 2, 4);
+        }
+        MirrorImage5Vertical(half_raw[2], color[4]);
+      } else {
+        cv::Mat *raws[4] = {&left_image, &right_image, &left_front_image, &right_front_image};
+        cv::Mat *colors[4] = {&color[0], &color[1], &color[2], &color[3]};
+        ApplyBayerCameraIsp(isp, raws, colors, process_cameras,
+            hardware_version, software_version, camera_gain, fpga_bayer_nr, raw_telemetry);
       }
-      if (process_cameras >= 4) {
-        msg2->header.stamp = ros::Time(image_timestamp);
-        msg3->header.stamp = ros::Time(image_timestamp);
+      for (int i = 0; i < output_cameras; ++i) {
+        // Preserve the message-owned destination; copy only if an ISP backend
+        // unexpectedly reallocates it. Subscribers may still own older frames.
+        if (color[i].data != messages[i]->data.data())
+          messages[i] = cv_bridge::CvImage(std_msgs::Header(), "bgr8", color[i]).toImageMsg();
       }
     } else {
-      // MT9V034 is monochrome: publish the two raw planes as mono8.
-      msg0 = cv_bridge::CvImage(std_msgs::Header(), "mono8", left_image).toImageMsg();
-      msg1 = cv_bridge::CvImage(std_msgs::Header(), "mono8", right_image).toImageMsg();
+      messages[0] = cv_bridge::CvImage(std_msgs::Header(), "mono8", left_image).toImageMsg();
+      messages[1] = cv_bridge::CvImage(std_msgs::Header(), "mono8", right_image).toImageMsg();
     }
-    msg0->header.stamp = ros::Time(image_timestamp);
-    if (msg1)
-      msg1->header.stamp = ros::Time(image_timestamp);
+    for (int i = 0; i < output_cameras; ++i) {
+      if (!messages[i]) continue;
+      messages[i]->header.stamp = ros::Time(image_timestamp);
+      messages[i]->header.frame_id = "cam" + std::to_string(i);
+    }
 
     ROS_DEBUG("image_timestamp %.6f", image_timestamp);
     for (int i = 0; i < imu_data.imu_count; ++i) {
@@ -224,23 +256,20 @@ int main(int argc, char *argv[]) {
 
         IMU_pub.publish(imu_msg);
     }
-    sensor_msgs::ImagePtr messages[4] = {msg0, msg1, msg2, msg3};
-    for (int i = 0; i < process_cameras; ++i) {
-      if (messages[i]) messages[i]->header.frame_id = "cam" + std::to_string(i);
-      if (!sensors.temperature_valid[i]) continue;
-      sensor_msgs::Temperature temperature;
-      temperature.header.stamp = ros::Time(image_timestamp);
-      temperature.header.frame_id = "cam" + std::to_string(i);
-      temperature.temperature = sensors.temperature[i];
-      temperature.variance = 0.0;  // unknown uncertainty
-      temperature_pub[i].publish(temperature);
-    }
-    cam0_image_pub.publish(msg0);
-    if (process_cameras >= 2)
-      cam1_image_pub.publish(msg1);
-    if (process_cameras >= 4) {
-      cam2_image_pub.publish(msg2);
-      cam3_image_pub.publish(msg3);
+    for (int i = 0; i < output_cameras; ++i) {
+      const int sensor_index = half_res_lanes && i >= 2 && i < 4 ? 5 - i : i;
+      const bool valid = i < 4 ? sensors.temperature_valid[sensor_index]
+                              : c56_valid && std::isfinite(c56_temperature[i - 4]);
+      if (valid) {
+        sensor_msgs::Temperature temperature;
+        temperature.header.stamp = ros::Time(image_timestamp);
+        temperature.header.frame_id = "cam" + std::to_string(i);
+        temperature.temperature = i < 4 ? sensors.temperature[sensor_index]
+                                       : c56_temperature[i - 4];
+        temperature.variance = 0.0;
+        temperature_pub[i].publish(temperature);
+      }
+      if (messages[i]) image_pub[i].publish(messages[i]);
     }
     ros::spinOnce();
   }

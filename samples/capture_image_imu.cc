@@ -25,7 +25,7 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <mutex>
-#include "../src/usb/uvc/cyperstereo_api.h"
+#include "../src/usb/uvc/six_camera_isp.h"
 #include "../src/usb/uvc/tic_toc.h"
 #include "../src/usb/uvc/thread_priority.h"
 
@@ -557,6 +557,9 @@ static int run(int argc, char *argv[]) {
   // into image3/image4.  A second processor keeps those halves on their own
   // AWB/exposure state so C1/C2's full-width state is not overwritten.
   IspProcessor half_isp(isp_mode);
+  std::unique_ptr<SixCameraIspProcessor> six_isp;
+  const bool use_six_scheduler = use_fast_balanced &&
+      !FastEnvTruthy("CYPERSTEREO_DISABLE_SIX_CAMERA_ISP");
   cv::Mat half_raw[4];
   cv::Mat half_color[4];
   for (int i = 0; i < 4; ++i) {
@@ -683,6 +686,7 @@ static int run(int argc, char *argv[]) {
       break;
     }
 
+    bool six_this_frame = false;
     if (is_smartsens)
     {
       TicToc proc;
@@ -736,12 +740,16 @@ static int run(int argc, char *argv[]) {
             }
           }
         }
-        isp.ApplyParallel({
-            {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
-             fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
-            {right_image, right_color, "cam2", isp_camera_gain[1],
-             image2_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
-        });
+        six_this_frame = use_six_scheduler &&
+            IsAr0234FamilyHardware(static_cast<int>(hardware_version));
+        if (!six_this_frame) {
+          isp.ApplyParallel({
+              {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
+               fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
+              {right_image, right_color, "cam2", isp_camera_gain[1],
+               image2_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
+          });
+        }
         SplitAndVBinHalfResLanes(left_front_image, right_front_image, half_raw);
         BayerConversion cam_bayer[4];
         for (int h = 0; h < 4; ++h)
@@ -753,16 +761,32 @@ static int run(int argc, char *argv[]) {
                                     c56.camera_gain[0], c56.camera_gain[1]};
         // The FPGA leaves the half lanes unfiltered (nr_active = 0), and they
         // carry no metadata row, so the host NR runs and no region is masked.
-        half_isp.ApplyParallel({
-            {half_raw[0], half_color[0], "half-cam3", cam_gain[0], cam_bayer[0]},
-            {half_raw[1], half_color[1], "half-cam4", cam_gain[1], cam_bayer[1]},
-            {half_raw[2], half_color[2], "half-cam5", cam_gain[2], cam_bayer[2]},
-            {half_raw[3], half_color[3], "half-cam6", cam_gain[3], cam_bayer[3]},
-        });
+        if (six_this_frame) {
+          if (!six_isp) six_isp.reset(new SixCameraIspProcessor(
+              use_uyvy422 ? IspPixelFormat::kUyvy422Bt601FullRange
+                          : IspPixelFormat::kBgr888));
+          const IspFrameJob jobs[] = {
+              {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
+               fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
+              {right_image, right_color, "cam2", isp_camera_gain[1], image2_bayer,
+               fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
+              {half_raw[0], half_color[0], "half-cam3", cam_gain[0], cam_bayer[0]},
+              {half_raw[1], half_color[1], "half-cam4", cam_gain[1], cam_bayer[1]},
+              {half_raw[2], half_color[2], "half-cam5", cam_gain[2], cam_bayer[2]},
+              {half_raw[3], half_color[3], "half-cam6", cam_gain[3], cam_bayer[3]}};
+          six_isp->Apply(jobs);
+        } else {
+          half_isp.ApplyParallel({
+              {half_raw[0], half_color[0], "half-cam3", cam_gain[0], cam_bayer[0]},
+              {half_raw[1], half_color[1], "half-cam4", cam_gain[1], cam_bayer[1]},
+              {half_raw[2], half_color[2], "half-cam5", cam_gain[2], cam_bayer[2]},
+              {half_raw[3], half_color[3], "half-cam6", cam_gain[3], cam_bayer[3]},
+          });
+        }
         MirrorImage5Vertical(half_raw[2], half_color[2]);
         // half_isp slots 2/3 are physical C5/C6, same digital exposure as image1.
-        c56.digital_gain[0] = half_isp.DigitalGain(2);
-        c56.digital_gain[1] = half_isp.DigitalGain(3);
+        c56.digital_gain[0] = six_this_frame ? six_isp->DigitalGain(4) : half_isp.DigitalGain(2);
+        c56.digital_gain[1] = six_this_frame ? six_isp->DigitalGain(5) : half_isp.DigitalGain(3);
       } else if (process_cameras >= 4) {
         isp.ApplyParallel({
             {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
@@ -870,6 +894,11 @@ static int run(int argc, char *argv[]) {
 
     double digital_gain[4];
     for (int i = 0; i < 4; ++i) digital_gain[i] = isp.DigitalGain(i);
+    if (six_this_frame) {
+      // Diagnostic plane order remains C1,C2,C4,C3.
+      const int slots[4] = {0, 1, 3, 2};
+      for (int i = 0; i < 4; ++i) digital_gain[i] = six_isp->DigitalGain(slots[i]);
+    }
     LogCaptureDiagnostics(
         count, capture_log_every, process_cameras, is_smartsens, image_timestamp,
         exposure_time, exposure_lines, camera_gain, digital_gain,

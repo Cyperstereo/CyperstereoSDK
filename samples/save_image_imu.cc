@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #endif
 #include "../src/usb/uvc/camera_output.h"
+#include "../src/usb/uvc/six_camera_isp.h"
 #include "../src/usb/uvc/hdr_isp.h"
 #include "../src/usb/uvc/tic_toc.h"
 #include "../src/usb/uvc/thread_priority.h"
@@ -51,8 +52,10 @@ struct ImageRecord {
   std::vector<cv::Mat> images;
   std::array<bool, 4> fpga_bayer_nr{};
   RawTelemetrySnapshot raw_telemetry{};
+  bool recycle_raw = false;
 };
 std::queue<ImageRecord> IMAGE;
+std::queue<std::vector<cv::Mat>> RECYCLED_RAW;  // guarded by m_buf; at most 8 sets
 struct GnssRecord {
   double gnss_timestamp;
   std::string gnss_utc_time;
@@ -83,7 +86,7 @@ void InputIMAGE(const double timestamp, uint32_t hardware_version,
                 const std::array<bool, 4> &fpga_bayer_nr,
                  const RawTelemetrySnapshot &raw_telemetry,
                 int process_cameras,
-                const std::vector<cv::Mat>& images);
+                std::vector<cv::Mat>& images);
 void InputIMU(const double timestamp, double gyro_x, double gyro_y, double gyro_z, double acc_x, double acc_y, double acc_z);
 void InputGNSS(const cyperstereo::GNSSStreamData &gnss);
 
@@ -206,7 +209,16 @@ int main(int argc, char *argv[]) {
     }
     InputIMAGE(image_timestamp, hardware_version, software_version,
                camera_gain, c56_gain, fpga_bayer_nr, raw_telemetry, process_cameras,
-               images);  // clones into the save queue
+               images);
+    // Selected AR0234 planes now belong to the save queue. Give capture the
+    // recycled/empty planes before the next swap; it must never overwrite an
+    // input still being read by the ISP. Skipped frames retain their buffers.
+    cv::swap(left_image, images[0]);
+    if (process_cameras >= 2) cv::swap(right_image, images[1]);
+    if (process_cameras >= 4) {
+      cv::swap(left_front_image, images[2]);
+      cv::swap(right_front_image, images[3]);
+    }
     for (int i = 0; i < imu_data.imu_count; ++i) {
       InputIMU(imu_data.imu_timestamp[i], imu_data.gyro_x[i], imu_data.gyro_y[i],
                imu_data.gyro_z[i], imu_data.acc_x[i], imu_data.acc_y[i],
@@ -266,17 +278,42 @@ void InputIMAGE(const double timestamp, uint32_t hardware_version,
                  const std::array<bool, 4> &fpga_bayer_nr,
                  const RawTelemetrySnapshot &raw_telemetry,
                  int process_cameras,
-                 const std::vector<cv::Mat>& images) {
-    m_buf.lock();
+                 std::vector<cv::Mat>& images) {
+    // Select exactly the same frames as the old consumer-side count%2/3
+    // policy, before allocating/copying RAW. IMU and GNSS are queued separately.
+    const int n = process_cameras > 0 ? process_cameras : static_cast<int>(images.size());
+    const bool one_ok = n >= 1 && !images.empty() && !images[0].empty();
+    const bool two_ok = n >= 2 && images.size() >= 2 && one_ok && !images[1].empty();
+    const bool bayer = IsSmartSensFamilyHardware(static_cast<int>(hardware_version));
+    static uint64_t capture_count = 0;  // single capture-thread producer
+    const int interval = bayer && one_ok ? 2 : (two_ok ? 3 : 0);
+    if (interval == 0 || capture_count++ % interval != 0) return;
     ImageRecord record{
         timestamp, hardware_version, software_version, camera_gain,
         c56_gain, process_cameras, {}, fpga_bayer_nr, raw_telemetry};
-    record.images.reserve(images.size());
-    for (const auto &img : images) {
-      record.images.push_back(img.clone());
+    record.recycle_raw = IsAr0234FamilyHardware(static_cast<int>(hardware_version)) &&
+        !FastEnvTruthy("CYPERSTEREO_SAVE_COPY_RAW");
+    if (record.recycle_raw) {
+      record.images.swap(images);
+      {
+        std::lock_guard<std::mutex> lock(m_buf);
+        if (!RECYCLED_RAW.empty()) {
+          images.swap(RECYCLED_RAW.front());
+          RECYCLED_RAW.pop();
+        }
+      }
+      images.resize(record.images.size());
+      // create() is allocation-free when a returned plane already matches.
+      for (size_t i=0;i<images.size();++i)
+        images[i].create(record.images[i].size(),record.images[i].type());
+    } else {
+      record.images.reserve(images.size());
+      for (const auto &img : images) record.images.push_back(img.clone());
     }
-    IMAGE.push(std::move(record));
-    m_buf.unlock();
+    {
+      std::lock_guard<std::mutex> lock(m_buf);
+      IMAGE.push(std::move(record));
+    }
     con.notify_one();
 }
 
@@ -285,7 +322,7 @@ void DataFlow() {
   // so run it at real-time worker priority (configured in thread_priority.h).
   cyperstereo::ApplyThreadPriority(cyperstereo::ThreadRole::kWorker, "dataflow");
 
-  int count = 0;
+
   // Pre-allocated demosaic output buffers for the 4-camera (SmartSens) path,
   // reused every processed frame to avoid reallocating on the hot path. Sized
   // lazily on first use so the same binary works for either camera profile.
@@ -296,6 +333,9 @@ void DataFlow() {
   // Six-image firmware (04/07, 05/07): the four half images of lanes 2/3 keep
   // their own AWB/exposure state, separate from the full-width C1/C2.
   IspProcessor half_isp(isp.mode());
+  std::unique_ptr<SixCameraIspProcessor> six_isp;
+  const bool use_six_scheduler = use_fast_balanced &&
+      !FastEnvTruthy("CYPERSTEREO_DISABLE_SIX_CAMERA_ISP");
   cv::Mat half_raw[4], half_color[4];
   bool half_res_announced = false;
   std::cout << "ISP mode: "
@@ -408,7 +448,7 @@ void DataFlow() {
           half_res_announced = true;
         }
         if (is_bayer && one_ok) {
-          if (count % 2 == 0) {
+          {  // The producer has already selected the frame.
             cv::Mat left_image = imgs[0];
             cv::Mat right_image = two_ok ? imgs[1] : cv::Mat{};
             cv::Mat left_front_image = four_ok ? imgs[2] : cv::Mat{};
@@ -422,7 +462,9 @@ void DataFlow() {
                                  &left_front_color, &right_front_color};
             const int active =
                 half_res_lanes ? 2 : (four_ok ? 4 : (two_ok ? 2 : 1));
-            ApplyBayerCameraIsp(isp, raws, colors, active,
+            const bool six = half_res_lanes && use_six_scheduler &&
+                IsAr0234FamilyHardware(static_cast<int>(record.hardware_version));
+            if (!six) ApplyBayerCameraIsp(isp, raws, colors, active,
                 record.hardware_version, record.software_version,
                 record.camera_gain, record.fpga_bayer_nr, record.raw_telemetry);
             if (half_res_lanes) {
@@ -433,7 +475,17 @@ void DataFlow() {
                                           record.c56_gain[0], record.c56_gain[1]};
               const uint32_t hw = record.hardware_version;
               const uint32_t sw = record.software_version;
-              half_isp.ApplyParallel({
+              if (six) {
+                if (!six_isp) six_isp.reset(new SixCameraIspProcessor());
+                IspFrameJob jobs[] = {
+                  {left_image,left_color,"cam1",record.camera_gain[0],SelectDeliveredPlaneBayer(hw,sw,0),record.fpga_bayer_nr[0],record.raw_telemetry.RegionForPlane(0)},
+                  {right_image,right_color,"cam2",record.camera_gain[1],SelectDeliveredPlaneBayer(hw,sw,1),record.fpga_bayer_nr[1],record.raw_telemetry.RegionForPlane(1)},
+                  {half_raw[0],half_color[0],"half-cam3",cam_gain[0],SelectCameraBayerConversion(hw,sw,SixCamHalfImageCamera(0))},
+                  {half_raw[1],half_color[1],"half-cam4",cam_gain[1],SelectCameraBayerConversion(hw,sw,SixCamHalfImageCamera(1))},
+                  {half_raw[2],half_color[2],"half-cam5",cam_gain[2],SelectCameraBayerConversion(hw,sw,SixCamHalfImageCamera(2))},
+                  {half_raw[3],half_color[3],"half-cam6",cam_gain[3],SelectCameraBayerConversion(hw,sw,SixCamHalfImageCamera(3))}};
+                six_isp->Apply(jobs);
+              } else half_isp.ApplyParallel({
                   {half_raw[0], half_color[0], "half-cam3", cam_gain[0],
                    SelectCameraBayerConversion(hw, sw, SixCamHalfImageCamera(0))},
                   {half_raw[1], half_color[1], "half-cam4", cam_gain[1],
@@ -467,15 +519,21 @@ void DataFlow() {
               if (t.joinable()) t.join();
 
           }
-          count++;
+
         } else if (two_ok) {
-          if (count % 3 == 0) {
+          {  // The producer has already selected the frame.
             // MT9V034 is monochrome: save the two raw planes directly.
             const std::string image_name = std::to_string(static_cast<int64_t>(image_timestamp * 10000)) + ".png";
             cv::imwrite("./cam1/" + image_name, imgs[0]);
             cv::imwrite("./cam2/" + image_name, imgs[1]);
           }
-          count++;
+
+        }
+        // All ISP workers and PNG writers have joined before recycling.
+        if (record.recycle_raw) {
+          std::lock_guard<std::mutex> lock(m_buf);
+          if (RECYCLED_RAW.size() < 8)
+            RECYCLED_RAW.push(std::move(image_data.front().images));
         }
         image_data.pop();
       }
@@ -483,16 +541,7 @@ void DataFlow() {
 }
 
 void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<ImageRecord> &image_data, std::queue<GnssRecord> &gnss_data) {
-  while (!IMU.empty()) {
-    imu_data.push(IMU.front());
-    IMU.pop();
-  }
-  while (!IMAGE.empty()) {
-    image_data.push(IMAGE.front());
-    IMAGE.pop();
-  }
-  while (!GNSS.empty()) {
-    gnss_data.push(GNSS.front());
-    GNSS.pop();
-  }
+  imu_data.swap(IMU);
+  image_data.swap(IMAGE);
+  gnss_data.swap(GNSS);
 }

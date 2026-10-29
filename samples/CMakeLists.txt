@@ -51,13 +51,13 @@ endif()
 include(CheckCXXCompilerFlag)
 
 set(TARGET_BOARD "auto" CACHE STRING
-    "CPU tuning: auto|native|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic")
+    "CPU tuning: auto|native|rk3576|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic")
 set_property(CACHE TARGET_BOARD PROPERTY STRINGS
-    auto native rk3588 sunrise-x5 pi5 pi4 pi3
+    auto native rk3576 rk3588 sunrise-x5 pi5 pi4 pi3
     jetson-xavier jetson-orin jetson-thor generic)
 string(TOLOWER "${TARGET_BOARD}" TARGET_BOARD)
 if(NOT TARGET_BOARD MATCHES
-   "^(auto|native|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic)$")
+   "^(auto|native|rk3576|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic)$")
   message(FATAL_ERROR "Unknown TARGET_BOARD=${TARGET_BOARD}")
 endif()
 
@@ -114,7 +114,9 @@ if(MSVC)
   # below. In particular, never feed GCC-style flags to cl.exe.
 elseif(_proc MATCHES "^(aarch64|arm64)")
   # 64-bit ARM: NEON (ASIMD) is always present; pick the best CPU tuning.
-  if(TARGET_BOARD STREQUAL "rk3588")
+  if(TARGET_BOARD STREQUAL "rk3576")
+    set(_cands "-mcpu=cortex-a72.cortex-a53" "-mcpu=cortex-a72" "-march=armv8-a+simd")
+  elseif(TARGET_BOARD STREQUAL "rk3588")
     set(_cands "-mcpu=cortex-a76.cortex-a55" "-mcpu=cortex-a76" "-march=armv8.2-a+simd")
   elseif(TARGET_BOARD STREQUAL "sunrise-x5")
     set(_cands "-mcpu=cortex-a55" "-march=armv8.2-a+simd")
@@ -149,7 +151,7 @@ elseif(_proc MATCHES "^(arm|armv[0-9])")
   if(TARGET_BOARD STREQUAL "pi3")
     set(_cands "-mcpu=cortex-a53 -mfpu=neon-fp-armv8"
                "-march=armv7-a -mfpu=neon-vfpv4")
-  elseif(TARGET_BOARD MATCHES "^(rk3588|sunrise-x5|pi5|pi4)$")
+  elseif(TARGET_BOARD MATCHES "^(rk3576|rk3588|sunrise-x5|pi5|pi4)$")
     # These boards normally run AArch64, but a 32-bit userspace still needs an
     # ARMv7+NEON binary. Never use the x86 build host's -mcpu=native here.
     set(_cands "-march=armv7-a -mfpu=neon-vfpv4"
@@ -222,6 +224,21 @@ else()
       "No explicit optimisation policy for compiler '${CMAKE_CXX_COMPILER_ID}'")
 endif()
 
+# Recognize this board during a native default build; do not guess topology
+# from the architecture alone, and do not inspect the host for cross builds.
+set(_native_rk3576 FALSE)
+if(NOT CMAKE_CROSSCOMPILING AND TARGET_BOARD STREQUAL "auto" AND
+   EXISTS "/proc/device-tree/compatible")
+  file(STRINGS "/proc/device-tree/compatible" _native_compatible)
+  if(_native_compatible MATCHES "rockchip,rk3576")
+    set(_native_rk3576 TRUE)
+  endif()
+endif()
+if((TARGET_BOARD STREQUAL "rk3576" OR _native_rk3576) AND
+   _proc MATCHES "^(aarch64|arm64)$")
+  add_definitions(-DCYPERSTEREO_RK3576=1)
+endif()
+
 # RK3588 Linux enumerates the four Cortex-A55 efficiency cores as CPU0-3 and
 # the four Cortex-A76 performance cores as CPU4-7. Expose the selected board
 # to the header-only ISP scheduler so its four camera workers can be pinned
@@ -278,6 +295,12 @@ add_executable(save_image_imu
   save_image_imu.cc)
 target_link_libraries(capture_image_imu Cyperlib ${OpenCV_LIBRARIES})
 target_link_libraries(save_image_imu Cyperlib ${OpenCV_LIBRARIES})
+
+option(CYPERSTEREO_BUILD_ISP_TESTS "Build Linux ISP bit-exact regression/benchmark tool" OFF)
+if(CYPERSTEREO_BUILD_ISP_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(isp_opt_bench isp_opt_bench.cc)
+  target_link_libraries(isp_opt_bench Cyperlib ${OpenCV_LIBRARIES})
+endif()
 
 # The deployed Windows x64 platform (Intel family 6 model 158) supports AVX2.
 # Compile the header-only fast ISP consumers accordingly; without this option

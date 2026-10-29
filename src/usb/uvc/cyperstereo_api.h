@@ -439,13 +439,8 @@ inline void BayerVBin2SameColor(const cv::Mat &src, cv::Mat &dst) {
     for (; x + 16 <= cols; x += 16) {
       const uint8x16_t va = vld1q_u8(a + x);
       const uint8x16_t vb = vld1q_u8(b + x);
-      const uint16x8_t lo =
-          vaddq_u16(vaddl_u8(vget_low_u8(va), vget_low_u8(vb)),
-                    vdupq_n_u16(1));
-      const uint16x8_t hi =
-          vaddq_u16(vaddl_u8(vget_high_u8(va), vget_high_u8(vb)),
-                    vdupq_n_u16(1));
-      vst1q_u8(d + x, vcombine_u8(vshrn_n_u16(lo, 1), vshrn_n_u16(hi, 1)));
+      // Rounded halving add is exactly (a+b+1)>>1 without u8 overflow.
+      vst1q_u8(d + x, vrhaddq_u8(va, vb));
     }
 #endif
     for (; x < cols; ++x)
@@ -458,10 +453,28 @@ inline void BayerVBin2SameColor(const cv::Mat &src, cv::Mat &dst) {
 // four (cam_width/2) x (frame_height/2) RAW images.
 inline void SplitAndVBinHalfResLanes(const cv::Mat &lane2, const cv::Mat &lane3,
                                      cv::Mat quarter[4]) {
-  cv::Mat v2, v3;
-  BayerVBin2SameColor(lane2, v2);
-  BayerVBin2SameColor(lane3, v3);
-  SplitHalfResLanes(v2, v3, quarter);
+  CV_Assert(lane2.type() == CV_8U && lane3.type() == CV_8U);
+  CV_Assert(lane2.size() == lane3.size() && (lane2.cols % 2) == 0);
+  // Preserve the old behavior for callers reusing an input allocation as an
+  // output. Normal persistent output planes are independent allocations.
+  bool aliases_input = false;
+  for (int i=0;i<4;++i)
+    aliases_input |= quarter[i].datastart &&
+        (quarter[i].datastart == lane2.datastart || quarter[i].datastart == lane3.datastart);
+  if (aliases_input) {
+    cv::Mat v2, v3;
+    BayerVBin2SameColor(lane2, v2);
+    BayerVBin2SameColor(lane3, v3);
+    SplitHalfResLanes(v2, v3, quarter);
+    return;
+  }
+  const int w = lane2.cols / 2;
+  // Each destination is written once: no two full-width intermediate Mats,
+  // and no second full-image copy. ROI row strides are handled by ptr(y).
+  BayerVBin2SameColor(lane2.colRange(0,w), quarter[0]);
+  BayerVBin2SameColor(lane2.colRange(w,2*w), quarter[1]);
+  BayerVBin2SameColor(lane3.colRange(0,w), quarter[2]);
+  BayerVBin2SameColor(lane3.colRange(w,2*w), quarter[3]);
 }
 
 // image5 is half-camera C5 (quarter[2]). Flip it vertically after demosaic:
@@ -1618,7 +1631,7 @@ inline bool FastToneYccEnabled() {
 inline bool FastIspBigLittleCpuSetAvailable() {
 #if defined(CYPERSTEREO_FAST_BIG_LITTLE_HOST_TEST)
   return true;
-#elif defined(CYPERSTEREO_RK3588) && defined(__aarch64__) && \
+#elif (defined(CYPERSTEREO_RK3588) || defined(CYPERSTEREO_RK3576)) && defined(__aarch64__) && \
     defined(__linux__)
   // pthread_getaffinity alone only reports the caller's current mask, which
   // may be intentionally narrow even though its cpuset allows all RK3588
@@ -1671,10 +1684,34 @@ inline bool FastIspBigLittleCpuSetAvailable() {
 #endif
 }
 
-inline bool FastIspBigLittleBatchEnabled() {
-#if (defined(CYPERSTEREO_RK3588) && defined(__aarch64__)) || \
-    defined(CYPERSTEREO_FAST_BIG_LITTLE_HOST_TEST)
+// A six-camera RK3576 owner may opt into the measured row split without
+// changing process-wide environment variables or unrelated ISP callers.
+inline bool &FastIspBigLittleDefaultScope() {
+  static thread_local bool enabled = false;
+  return enabled;
+}
+class FastIspBigLittleDefaultGuard {
+ public:
+  explicit FastIspBigLittleDefaultGuard(bool enabled)
+      : previous_(FastIspBigLittleDefaultScope()) {
+    FastIspBigLittleDefaultScope() = enabled;
+  }
+  ~FastIspBigLittleDefaultGuard() { FastIspBigLittleDefaultScope() = previous_; }
+  FastIspBigLittleDefaultGuard(const FastIspBigLittleDefaultGuard &) = delete;
+  FastIspBigLittleDefaultGuard &operator=(const FastIspBigLittleDefaultGuard &) = delete;
+ private:
+  bool previous_;
+};
+inline const char *FastIspBigLittleMode() {
   const char *mode = std::getenv("CYPERSTEREO_FAST_BIG_LITTLE");
+  if (mode) return mode;
+  return FastIspBigLittleDefaultScope() ? "front,output" : nullptr;
+}
+
+inline bool FastIspBigLittleBatchEnabled() {
+#if ((defined(CYPERSTEREO_RK3588) || defined(CYPERSTEREO_RK3576)) && defined(__aarch64__)) || \
+    defined(CYPERSTEREO_FAST_BIG_LITTLE_HOST_TEST)
+  const char *mode = FastIspBigLittleMode();
   return mode && std::strcmp(mode, "0") != 0 &&
          std::strcmp(mode, "off") != 0 &&
          std::strcmp(mode, "false") != 0 &&
@@ -1698,7 +1735,7 @@ inline bool FastIspBigLittleStageEnabled(const char *stage) {
   if (!FastIspBigLittleBatchEnabled() ||
       !FastIspBigLittleKnownStage(stage))
     return false;
-  const char *mode = std::getenv("CYPERSTEREO_FAST_BIG_LITTLE");
+  const char *mode = FastIspBigLittleMode();
   if (std::strcmp(mode, "1") == 0 || std::strcmp(mode, "true") == 0 ||
       std::strcmp(mode, "TRUE") == 0 || std::strcmp(mode, "on") == 0 ||
       std::strcmp(mode, "ON") == 0 || std::strcmp(mode, "all") == 0)
@@ -1842,8 +1879,26 @@ class FastIspLittleLaneHelper {
     if (helper_error) std::rethrow_exception(helper_error);
   }
 
+  // Range jobs own their row-ring scratch on each executing thread. Halos
+  // read from the complete source; split points are not image borders.
+  template <class RangeBody>
+  void RunRanges(int rows, int big_weight, const RangeBody &body) {
+    // Different processor instances share the lane helper. Keep submission,
+    // owner work and exception collection one transaction.
+    std::lock_guard<std::mutex> owner(owner_mutex_);
+    const int little_rows = rows / (big_weight + 1);
+    if (little_rows <= 0) { body(0, rows); return; }
+    Start([&body, little_rows] { body(0, little_rows); });
+    std::exception_ptr owner_error, helper_error;
+    try { body(little_rows, rows); } catch (...) { owner_error = std::current_exception(); }
+    try { Wait(); } catch (...) { helper_error = std::current_exception(); }
+    if (owner_error) std::rethrow_exception(owner_error);
+    if (helper_error) std::rethrow_exception(helper_error);
+  }
+
   template <class RowBody>
   void RunRows(int rows, int big_weight, const RowBody &body) {
+    std::lock_guard<std::mutex> owner(owner_mutex_);
     // Floor keeps tiny stages on the A76 rather than paying a wake/wait cost.
     const int little_rows = rows / (big_weight + 1);
     if (little_rows <= 0) {
@@ -1874,7 +1929,7 @@ class FastIspLittleLaneHelper {
  private:
   void WorkerLoop() {
     ApplyThreadPriority(ThreadRole::kWorker, "isp-little-lane");
-#if defined(CYPERSTEREO_RK3588)
+#if (defined(CYPERSTEREO_RK3588) || defined(CYPERSTEREO_RK3576))
     PinThreadToCpu(cpu_);
 #else
     (void)cpu_;
@@ -1905,6 +1960,7 @@ class FastIspLittleLaneHelper {
   }
 
   int cpu_;
+  std::mutex owner_mutex_;
   std::mutex mutex_;
   std::condition_variable go_, done_, idle_;
   std::function<void()> job_;
@@ -2522,7 +2578,11 @@ class WhiteBalance {
         ratios_rg_.push_back(static_cast<float>(gg / rr));
       }
     }
-    if (static_cast<int>(ratios_bg_.size()) < n_total / 100) {
+    // Small or entirely clipped/dark inputs can have no accepted samples
+    // while integer division makes the relative threshold zero. Never
+    // take the median of an empty vector; retain the prior/unity gains.
+    if (ratios_bg_.empty() ||
+        static_cast<int>(ratios_bg_.size()) < n_total / 100) {
       // In very dim AR0234 frames the bright-sample estimator can have no
       // support. A newly started stream would then leave R/B at unity and
       // amplify the resulting green cast with digital exposure. Average
@@ -5313,6 +5373,7 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
   // Planar production path. Four rows still occupy exactly 4*W bytes;
   // each row's first W/2 bytes hold even CFA columns and its second half odd
   // columns. Advancing an output pair retains two rows and replaces two.
+  const auto process_range = [&](int begin_pair, int end_pair) {
   static thread_local cv::Mat wb_planar_ring;
   wb_planar_ring.create(4, width, CV_8UC1);
   int row_tag[4] = {-1, -1, -1, -1};
@@ -5330,10 +5391,9 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
     return EaPlanarBayerRow{row, row + width / 2};
   };
 
-  // Deliberately serial inside one camera: the outer four-camera scheduler
-  // already pins one ISP to each A76 (CPU4..7), so no A55 is recruited.
+  // Each shard has its own scratch and real image-border checks.
   const bool front_rows = FastNeonFrontRowsEnabled();
-  for (int yh = 0; yh < half_height; ++yh) {
+  for (int yh = begin_pair; yh < end_pair; ++yh) {
     const int r0 = 2 * yh;
     const int r1 = r0 + 1;
     const bool replicate_top = r0 == 0;
@@ -5360,6 +5420,13 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
         swap_red_blue, y8.ptr<uchar>(r0), y8.ptr<uchar>(r1),
         cr_h.ptr<uchar>(yh), cb_h.ptr<uchar>(yh), front_rows);
   }
+  };
+  const int lane = FastIspBigLittleLane();
+  if (lane >= 0 && FastIspBigLittleStageEnabled("front"))
+    GetFastIspLittleLaneHelper(lane).RunRanges(
+        half_height, FastIspBigLittleStageWeight("front"), process_range);
+  else
+    process_range(0, half_height);
 }
 #endif  // __aarch64__
 #endif  // CYPERSTEREO_HAVE_NEON

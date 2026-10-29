@@ -24,13 +24,13 @@ set(CYPERSTEREO_CPU_TUNE "native" CACHE STRING
     "Linux CPU tuning: native|avx2|portable")
 set_property(CACHE CYPERSTEREO_CPU_TUNE PROPERTY STRINGS native avx2 portable)
 set(TARGET_BOARD "auto" CACHE STRING
-    "ARM CPU tuning: auto|native|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic")
+    "ARM CPU tuning: auto|native|rk3576|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic")
 set_property(CACHE TARGET_BOARD PROPERTY STRINGS
-    auto native rk3588 sunrise-x5 pi5 pi4 pi3
+    auto native rk3576 rk3588 sunrise-x5 pi5 pi4 pi3
     jetson-xavier jetson-orin jetson-thor generic)
 string(TOLOWER "${TARGET_BOARD}" TARGET_BOARD)
 if(NOT TARGET_BOARD MATCHES
-   "^(auto|native|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic)$")
+   "^(auto|native|rk3576|rk3588|sunrise-x5|pi5|pi4|pi3|jetson-xavier|jetson-orin|jetson-thor|generic)$")
   message(FATAL_ERROR "Unknown TARGET_BOARD=${TARGET_BOARD}")
 endif()
 
@@ -87,6 +87,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     elseif(TARGET_BOARD STREQUAL "native" OR
        (TARGET_BOARD STREQUAL "auto" AND NOT CMAKE_CROSSCOMPILING))
       set(_cyper_arm_candidates "-mcpu=native" "-march=armv8-a+simd")
+    elseif(TARGET_BOARD STREQUAL "rk3576")
+      set(_cyper_arm_candidates "-mcpu=cortex-a72.cortex-a53"
+          "-mcpu=cortex-a72" "-march=armv8-a+simd")
     elseif(TARGET_BOARD STREQUAL "rk3588")
       set(_cyper_arm_candidates "-mcpu=cortex-a76.cortex-a55"
           "-mcpu=cortex-a76" "-march=armv8.2-a+simd")
@@ -132,7 +135,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
       set(_cyper_arm_candidates
           "-mcpu=native -mfpu=neon-vfpv4"
           "-march=armv7-a -mfpu=neon-vfpv4")
-    elseif(TARGET_BOARD MATCHES "^(rk3588|sunrise-x5|pi5|pi4|pi3)$")
+    elseif(TARGET_BOARD MATCHES "^(rk3576|rk3588|sunrise-x5|pi5|pi4|pi3)$")
       set(_cyper_arm_candidates
           "-march=armv7-a -mfpu=neon-vfpv4"
           "-march=armv7-a -mfpu=neon")
@@ -223,6 +226,19 @@ catkin_package(CATKIN_DEPENDS
 )
 
 add_executable(capture_image_imu capture_image_imu.cpp)
+set(_native_rk3576 FALSE)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING AND
+   (TARGET_BOARD STREQUAL "auto" OR TARGET_BOARD STREQUAL "native") AND
+   EXISTS "/proc/device-tree/compatible")
+  file(STRINGS "/proc/device-tree/compatible" _device_compatible)
+  if("${_device_compatible}" MATCHES "rockchip,rk3576")
+    set(_native_rk3576 TRUE)
+  endif()
+endif()
+if((TARGET_BOARD STREQUAL "rk3576" OR _native_rk3576) AND
+   _cyper_cpu MATCHES "^(aarch64|arm64)$")
+  target_compile_definitions(Cyperlib PUBLIC CYPERSTEREO_RK3576=1)
+endif()
 if(TARGET_BOARD STREQUAL "rk3588" AND
    _cyper_cpu MATCHES "^(aarch64|arm64|arm|armv[0-9])")
   target_compile_definitions(Cyperlib PUBLIC CYPERSTEREO_RK3588=1)
