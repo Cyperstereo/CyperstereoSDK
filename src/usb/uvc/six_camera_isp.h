@@ -60,12 +60,11 @@ class SixCameraIspProcessor {
   }
   void Process(int index) {
     const auto& j=jobs_[index];
-    // Only the two full-resolution cameras recruit small cores. Half images
-    // remain on their A72 owners, leaving CPU2/3 available for capture.
-#if defined(CYPERSTEREO_RK3576)
-    FastIspBigLittleDefaultGuard defaults(index<2);
-#endif
-    FastIspBigLittleLaneGuard helper(index<2 ? index : -1);
+    // Each full-resolution camera stays on one A72: C1 on CPU4 and C2
+    // on CPU5. Do not recruit little-core row workers, even if a process
+    // environment setting enables them for other ISP callers.
+    FastIspBigLittleDefaultGuard defaults(false);
+    FastIspBigLittleLaneGuard helper(-1);
     ApplyFastBalancedISPImpl(*j.raw,*j.output,wb_[index],j.name,j.sensor_gain,
         j.bayer,output_format_,j.raw_bayer_nr_done,j.metadata_region);
   }

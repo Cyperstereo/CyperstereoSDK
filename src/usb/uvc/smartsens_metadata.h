@@ -183,6 +183,9 @@ inline double Ar0234AnalogGainFromReadback(int gain_raw) {
 // 1.5 frame periods of the 33.33 ms AR0234 frame.
 static constexpr double kAr0234ImageGapThresholdSec = 0.050;
 // Host image order C1, C2, C4, C3.  Each camera runs its own AE.
+// Column 68 is the {0xAE, lo} marker described at kSmartSensAeMarkerHigh;
+// six-image AR0234 sets the FPGA BayerNR bits for C1/C2 only.
+static constexpr int kAr0234AeMarkerCol = 68;
 static constexpr int kAr0234AeExpBaseCol = 69;    // R0x3164 lines
 static constexpr int kAr0234AeGainBaseCol = 73;   // R0x312A
 static constexpr int kAr0234FlashWidthUsCol = 77;

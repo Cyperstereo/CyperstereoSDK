@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -190,6 +191,13 @@ struct device {
   bool is_capturing = false;
   int last_start_error = 0;
   std::vector<buffer> buffers;
+  // Buffers handed to the consumer and not yet requeued by its release
+  // continuation.  A light restart must leave these to the consumer: vb2
+  // rejects a second QBUF of the same index.  Guarded by device_mutex.
+  std::vector<bool> buf_in_consumer;
+  // Bumped whenever the buffer set is reallocated, so a release continuation
+  // from the previous set cannot requeue an index of the new one.
+  uint32_t buffer_generation = 0;
 
   std::thread thread;
   std::mutex device_mutex; // 新增互斥锁
@@ -266,6 +274,16 @@ struct device {
   uint32_t last_short_bytesused = 0;
   int identical_short_count = 0;
   int short_in_window = 0;
+  // Storms made only of zero-length ERROR buffers are an EPROTO burst; the
+  // FX3 (seqresync firmware) realigns its endpoint by itself, so the restart
+  // is deferred this long and cancelled if a good frame arrives first.
+  // CYPERSTEREO_UVC_EPROTO_GRACE_MS=0 restores the immediate restart.
+  int nonzero_bad_in_window = 0;
+  const double eproto_grace_ms = [] {
+    const char *v = std::getenv("CYPERSTEREO_UVC_EPROTO_GRACE_MS");
+    return v == nullptr ? 100.0 : std::atof(v);
+  }();
+  diag_clock::time_point eproto_storm_since{};
   // Time of the last successful STREAMON; used to identify the burst of
   // zero-length cancelled buffers our own restart produces (see the
   // restart-artifact grace period in poll()).
@@ -291,6 +309,32 @@ struct device {
   // unthrottled retry loop re-REQBUFS'ing 32 x 5 MB buffer sets against a
   // wedged device OOM-killed the whole board (vb2_vmalloc in the OOM stack).
   double restart_backoff_ms = 500.0;
+  // First restart after a good frame only cycles STREAMOFF/QBUF/STREAMON and
+  // keeps the 32 x 5 MB mmap set: the single-burst EPROTO case needs nothing
+  // more, and skipping S_FMT/REQBUFS/mmap shortens the outage.  A second
+  // restart without a good frame in between falls back to the full rebuild.
+  // CYPERSTEREO_UVC_LIGHT_RESTART=0 disables it.
+  const bool light_restart_enabled = [] {
+    const char *v = std::getenv("CYPERSTEREO_UVC_LIGHT_RESTART");
+    return v == nullptr || std::atoi(v) != 0;
+  }();
+  // Test hook: CYPERSTEREO_UVC_TEST_RESTART_MS=N forces a restart_stream()
+  // every N ms of healthy streaming, to measure the restart outage without
+  // waiting for a real EPROTO burst.  Unset/0 = off.
+  const double test_restart_ms = [] {
+    const char *v = std::getenv("CYPERSTEREO_UVC_TEST_RESTART_MS");
+    return v == nullptr ? 0.0 : std::atof(v);
+  }();
+  diag_clock::time_point test_restart_last{};
+  // With CYPERSTEREO_UVC_TEST_USB_RESET=1 the forced restart takes the
+  // FX3-hang path (USB port reset) instead of the light restart.
+  const bool test_usb_reset = [] {
+    const char *v = std::getenv("CYPERSTEREO_UVC_TEST_USB_RESET");
+    return v != nullptr && std::atoi(v) != 0;
+  }();
+  // Set by restart_stream(); cleared (and reported) by the next good frame.
+  diag_clock::time_point restart_begin_time{};
+  const char *restart_kind = "";
   // Set when REQBUFS(0) fails: the kernel is still holding the old buffer
   // set (vb2 refuses to release while it thinks the queue is busy, e.g.
   // after a failed STREAMOFF on a wedged device).  Retrying REQBUFS(32) on
@@ -401,6 +445,53 @@ struct device {
   // a row escalates to the USB port reset above.  Reset on good frames.
   int reopens_since_frame = 0;
 
+  // FX3 firmware hang: STREAMON still succeeds but no data ever arrives and
+  // every control transfer times out (~5 s each), so the light -> full ->
+  // reopen x2 ladder spends tens of seconds before the port reset that
+  // actually fixes it.  With fast reset on, a restart that did not bring a
+  // frame back (or a timed-out XU query) goes straight to the port reset.
+  // CYPERSTEREO_UVC_FAST_USB_RESET=0 restores the old ladder.
+  bool fx3_unresponsive = false;
+  const bool fast_usb_reset_enabled = [] {
+    const char *v = std::getenv("CYPERSTEREO_UVC_FAST_USB_RESET");
+    return v == nullptr || std::atoi(v) != 0;
+  }();
+
+  // Port reset BEFORE touching the old fd: on a hung FX3, STREAMOFF (and
+  // the close() of a streaming fd) block ~5 s in usb_clear_halt, whereas
+  // after the reset the old node is unregistered and those calls fail fast.
+  void usb_reset_restart() {
+    restart_kind = "usb-reset";
+    std::cout << "[v4l2] "
+              << (fx3_unresponsive ? "FX3 control endpoint timed out"
+                                   : "restart brought no frames back")
+              << " -> USB port reset (FX3 presumed hung)" << std::endl;
+    fx3_unresponsive = false;
+    reopens_since_frame = 0;
+    const auto t0 = diag_clock::now();
+    usb_reset_device();
+    const auto t1 = diag_clock::now();
+    stop_capture();
+    reopen_device();
+    const auto t2 = diag_clock::now();
+    if (fd == -1)
+      return;  // poll() keeps retrying through its fd == -1 branch
+    bool started;
+    {
+      std::lock_guard<std::mutex> lock(device_mutex);
+      started = start_capture();
+    }
+    if (!started) {
+      std::cout << "[v4l2] stream restart after USB reset failed, will retry"
+                << std::endl;
+      return;
+    }
+    std::cout << "[v4l2] usb-reset restart: reset=" << ms_between(t0, t1)
+              << "ms stop+reopen=" << ms_between(t1, t2)
+              << "ms start=" << ms_between(t2, diag_clock::now()) << "ms"
+              << std::endl;
+  }
+
   void reopen_device() {
     std::lock_guard<std::mutex> lock(device_mutex);
     std::cout << "[v4l2] driver appears wedged (repeated restarts without "
@@ -437,6 +528,7 @@ struct device {
   // All stream restarts funnel through here so the wedged-driver escalation
   // sees every attempt regardless of which detector triggered it.
   void restart_stream() {
+    eproto_storm_since = {};
     // Rate limit with exponential backoff: each attempt sets up 32 x 5 MB
     // of kernel buffers; on a wedged device an unthrottled retry loop
     // churns that setup several times per second, ballooning kernel memory
@@ -449,17 +541,98 @@ struct device {
       return;
     last_restart_time = now;
     restart_backoff_ms = std::min(restart_backoff_ms * 2.0, 8000.0);
+    restart_begin_time = now;
+    // Do NOT poll the FX3 counters here: if the firmware has hung, the
+    // control transfer blocks for the full USB timeout (~5 s) while holding
+    // device_mutex and stalls the watchdog escalation.  The snapshot is taken
+    // after the first good frame instead (see poll()).
 
-    stop_capture();
+    if (fast_usb_reset_enabled && fd != -1 &&
+        (fx3_unresponsive || restarts_since_frame >= 1)) {
+      ++restarts_since_frame;
+      usb_reset_restart();
+      return;
+    }
+
+    const bool try_light = light_restart_enabled && restarts_since_frame == 0 &&
+                           !kernel_bufs_stuck && fd != -1;
     ++restarts_since_frame;
+    if (try_light) {
+      if (light_restart()) {
+        restart_kind = "light";
+        return;
+      }
+      std::cout << "[v4l2] light restart failed, falling back to full restart"
+                << std::endl;
+    }
+
+    restart_kind = "full";
+    stop_capture();
+    const auto stopped = diag_clock::now();
     if (fd == -1 || kernel_bufs_stuck || restarts_since_frame >= 3) {
       restarts_since_frame = 0;
       reopen_device();
       if (fd == -1)
         return;
     }
-    if (!start_capture())
+    bool started;
+    {
+      std::lock_guard<std::mutex> lock(device_mutex);
+      started = start_capture();
+    }
+    if (!started) {
       std::cout << "[v4l2] stream restart failed, will retry" << std::endl;
+      return;
+    }
+    std::cout << "[v4l2] full restart: stop=" << ms_between(now, stopped)
+              << "ms start=" << ms_between(stopped, diag_clock::now()) << "ms"
+              << std::endl;
+  }
+
+  // STREAMOFF -> requeue every buffer the consumer does not hold -> STREAMON,
+  // keeping the negotiated format and the mmap'd buffer set.  Holds
+  // device_mutex throughout so a consumer release cannot interleave its QBUF
+  // with ours.  On failure the stream may be left off with is_capturing
+  // still set; the caller's stop_capture() then tears it down normally.
+  bool light_restart() {
+    std::lock_guard<std::mutex> lock(device_mutex);
+    if (!is_capturing || fd == -1 || buffers.empty() ||
+        buf_in_consumer.size() != buffers.size())
+      return false;
+    const auto t0 = diag_clock::now();
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd, VIDIOC_STREAMOFF, &type) < 0) {
+      std::cout << "[v4l2] light restart: STREAMOFF failed: "
+                << strerror(errno) << std::endl;
+      return false;
+    }
+    const auto t1 = diag_clock::now();
+    int queued = 0;
+    for (size_t i = 0; i < buffers.size(); ++i) {
+      if (buf_in_consumer[i])
+        continue;
+      v4l2_buffer buf = {};
+      buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index = i;
+      if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+        std::cout << "[v4l2] light restart: QBUF " << i << " failed: "
+                  << strerror(errno) << std::endl;
+        return false;
+      }
+      ++queued;
+    }
+    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+      std::cout << "[v4l2] light restart: STREAMON failed: "
+                << strerror(errno) << std::endl;
+      return false;
+    }
+    const auto t2 = diag_clock::now();
+    capture_start_time = t2;
+    std::cout << "[v4l2] light restart: streamoff=" << ms_between(t0, t1)
+              << "ms requeue+streamon=" << ms_between(t1, t2) << "ms queued="
+              << queued << "/" << buffers.size() << std::endl;
+    return true;
   }
   // Log throttling: during a storm (e.g. ~200 zero-length cancelled buffers
   // at stream start) printing every bad frame floods the console.  Print
@@ -667,11 +840,15 @@ struct device {
     // CHECK_NOTNULL(data);
     uvc_xu_control_query q = {xu.unit, selector, query, size, data};
     if (xioctl(fd, UVCIOC_CTRL_QUERY, &q) < 0) {
-      std::cout << "xu_control_query failed" << std::endl;
+      last_xu_errno = errno;
+      std::cout << "xu_control_query failed (selector " << int(selector)
+                << ": " << strerror(last_xu_errno) << ")" << std::endl;
       return false;
     }
+    last_xu_errno = 0;
     return true;
   }
+  mutable int last_xu_errno = 0;
 
   void set_format(
       int width, int height, int fourcc, int fps,
@@ -692,6 +869,7 @@ struct device {
       buffers[i].start = nullptr;
     }
     buffers.clear();
+    buf_in_consumer.clear();
     v4l2_requestbuffers req = {};
     req.count = 0;
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -709,6 +887,7 @@ struct device {
   // a wedged device left poll() dereferencing unmapped/MAP_FAILED buffers
   // (segfault) while the retry churn of half-built 32 x 5 MB buffer sets
   // drove the kernel into the OOM killer (both observed on Orange Pi 5).
+  // Caller must hold device_mutex.
   bool start_capture(bool suppress_busy_log = false) {
     last_start_error = 0;
     if (is_capturing) {
@@ -784,6 +963,8 @@ struct device {
     }
 
     buffers.resize(req.count);
+    buf_in_consumer.assign(req.count, false);
+    ++buffer_generation;
     for (size_t i = 0; i < buffers.size(); ++i) {
       buffers[i].start = nullptr;
       buffers[i].length = 0;
@@ -857,6 +1038,7 @@ struct device {
       buffers[i].start = nullptr;
     }
     buffers.clear();
+    buf_in_consumer.clear();
 
     // Close memory mapped IO
     struct v4l2_requestbuffers req = {};
@@ -909,8 +1091,10 @@ struct device {
         if (!rediscover_dev_name())
           return;
         reopen_device();
-        if (fd != -1)
+        if (fd != -1) {
+          std::lock_guard<std::mutex> lock(device_mutex);
           start_capture();
+        }
       } else {
         restart_stream();
       }
@@ -933,11 +1117,27 @@ struct device {
       last_poll_time = now;
     }
 
+    struct timeval tv = {0, UVC_V4L2_SELECT_TIMEOUT_US};
+    if (eproto_storm_since.time_since_epoch().count() != 0) {
+      const double waited = ms_between(eproto_storm_since, diag_clock::now());
+      if (waited >= eproto_grace_ms) {
+        std::cout << "[v4l2] BAD FRAME STORM (EPROTO, no good frame within "
+                  << waited << " ms) -> restarting stream" << std::endl;
+        eproto_storm_since = {};
+        bad_in_window = 0;
+        identical_short_count = 0;
+        last_short_bytesused = 0;
+        short_in_window = 0;
+        nonzero_bad_in_window = 0;
+        restart_stream();
+        return;
+      }
+      tv.tv_usec = 10000;
+    }
+
     fd_set fds;
     FD_ZERO(&fds);
     FD_SET(fd, &fds);
-
-    struct timeval tv = {0, UVC_V4L2_SELECT_TIMEOUT_US};
 
     if (select(fd + 1, &fds, NULL, NULL, &tv) < 0) {
       if (errno == EINTR)
@@ -1074,8 +1274,10 @@ struct device {
               identical_short_count = 0;
               last_short_bytesused = 0;
               short_in_window = 0;
+              nonzero_bad_in_window = 0;
             }
             ++bad_in_window;
+            if (buf.bytesused > 0) ++nonzero_bad_in_window;
 
             // Fast paths: see the detector comments at the member
             // declarations.  (1) identical-length short frames = stable
@@ -1098,7 +1300,23 @@ struct device {
             if (!fingerprint && ++short_in_window >= 6)
               fingerprint = "6 bad frames";
 
-            if (fingerprint || bad_in_window >= 10) {
+            if ((fingerprint || bad_in_window >= 10) &&
+                nonzero_bad_in_window == 0 && eproto_grace_ms > 0.0) {
+              if (eproto_storm_since.time_since_epoch().count() == 0) {
+                eproto_storm_since = now;
+                std::cout << "[v4l2] EPROTO storm (" << bad_in_window
+                          << " zero-length ERROR frames) -> waiting up to "
+                          << eproto_grace_ms
+                          << " ms for device self-resync" << std::endl;
+              }
+              if (ms_between(eproto_storm_since, now) < eproto_grace_ms)
+                fingerprint = nullptr;
+            }
+            if ((fingerprint || bad_in_window >= 10) &&
+                (eproto_storm_since.time_since_epoch().count() == 0 ||
+                 ms_between(eproto_storm_since, now) >= eproto_grace_ms)) {
+              eproto_storm_since = {};
+              nonzero_bad_in_window = 0;
               std::cout << "[v4l2] BAD FRAME STORM ("
                         << (fingerprint ? fingerprint : "10 bad frames")
                         << " in " << ms_between(bad_window_start, now)
@@ -1118,7 +1336,39 @@ struct device {
         // so clear the wedged-driver escalation counters and retry backoff.
         restarts_since_frame = 0;
         reopens_since_frame = 0;
+        fx3_unresponsive = false;
         restart_backoff_ms = 500.0;
+        if (eproto_storm_since.time_since_epoch().count() != 0) {
+          std::cout << "[v4l2] EPROTO storm self-healed, first good frame +"
+                    << ms_between(eproto_storm_since, diag_clock::now())
+                    << "ms, no restart seq=" << buf.sequence << std::endl;
+          eproto_storm_since = {};
+          bad_in_window = 0;
+          short_in_window = 0;
+          nonzero_bad_in_window = 0;
+        }
+        if (restart_begin_time.time_since_epoch().count() != 0) {
+          std::cout << "[v4l2] first good frame " << restart_kind
+                    << " restart+" << ms_between(restart_begin_time,
+                                                  diag_clock::now())
+                    << "ms seq=" << buf.sequence << std::endl;
+          restart_begin_time = {};
+          last_fx3_stats_poll = {};  // second snapshot once the stream is back
+        }
+        if (test_restart_ms > 0) {
+          const auto now = diag_clock::now();
+          if (test_restart_last.time_since_epoch().count() == 0) {
+            test_restart_last = now;
+          } else if (ms_between(test_restart_last, now) >= test_restart_ms) {
+            test_restart_last = now;
+            std::cout << "[v4l2] TEST forced restart" << std::endl;
+            if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
+              std::cout << "VIDIOC_QBUF (test-restart requeue)" << std::endl;
+            fx3_unresponsive = test_usb_reset;
+            restart_stream();
+            return;
+          }
+        }
         if (buf.bytesused > full_frame_bytes)
           full_frame_bytes = buf.bytesused;
 
@@ -1137,8 +1387,19 @@ struct device {
 
       if (callback) {
         const auto cb_start = diag_clock::now();
-        callback(buffers[buf.index].start, [buf, this]() mutable {
+        uint32_t gen;
+        {
           std::lock_guard<std::mutex> lock(device_mutex);
+          gen = buffer_generation;
+          if (buf.index < buf_in_consumer.size())
+            buf_in_consumer[buf.index] = true;
+        }
+        callback(buffers[buf.index].start, [buf, gen, this]() mutable {
+          std::lock_guard<std::mutex> lock(device_mutex);
+          if (gen != buffer_generation)
+            return;
+          if (buf.index < buf_in_consumer.size())
+            buf_in_consumer[buf.index] = false;
           if (is_capturing && fd != -1) {
             if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
               // Never throw and never call stop_capture() here: throwing
@@ -1171,7 +1432,7 @@ struct device {
       }
 
       no_data_count = 0;
-    } else {
+    } else if (eproto_storm_since.time_since_epoch().count() == 0) {
       no_data_count++;
     }
 
@@ -1186,6 +1447,11 @@ struct device {
 
   void poll_fx3_link_stats() {
     if (!fx3_stats_supported)
+      return;
+    // Runs on the capture thread: never query a device that is not
+    // currently delivering frames, a hung FX3 blocks the query ~5 s and
+    // freezes the no-data watchdog with it.
+    if (no_data_count != 0 || restart_begin_time.time_since_epoch().count() != 0)
       return;
 
     const auto now = diag_clock::now();
@@ -1202,6 +1468,12 @@ struct device {
       const xu stats_xu{kFx3XuUnit, 0, {}};
       if (!xu_control_query(stats_xu, kFx3XuLinkErrorStatsSelector,
                             UVC_GET_CUR, fx3_stats_len, data)) {
+        if (last_xu_errno == ETIMEDOUT) {
+          std::cout << "[fx3-stats] query timed out -> FX3 unresponsive, "
+                       "next restart goes straight to USB reset" << std::endl;
+          fx3_unresponsive = true;
+          return;
+        }
         // First failure with the 32-byte format: probe the pre-2026-07
         // 16-byte format (the kernel rejects a size that mismatches the
         // device's GET_LEN, so old firmware fails the 32-byte query).
@@ -1289,6 +1561,95 @@ struct device {
     for (int i = 0; i < nvals; ++i)
       fx3_stats_prev[i] = vals[i];
     fx3_stats_have_prev = true;
+
+    poll_fx3_prot_stats();
+  }
+
+  // XU selector 8 (firmware 2026-11+): USB3 protocol-layer flags of the
+  // video IN endpoint, sampled per consumed DMA buffer.  RETRY counts DPPs
+  // the host rejected and the FX3 replayed -- the recovered precursors of
+  // the -71 incidents.  Selectors 5..7 are the firmware upgrade channels;
+  // never send them anything but GET_CUR.  Firmware that does not advertise
+  // selector 8 fails the query; the schema byte guards against any echo.
+  static constexpr uint8_t kFx3XuProtStatsSelector = 8;
+  bool fx3_prot_supported = true;
+  uint32_t fx3_prot_prev[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  bool fx3_prot_have_prev = false;
+
+  void poll_fx3_prot_stats() {
+    if (!fx3_prot_supported)
+      return;
+    uint8_t data[32] = {0};
+    {
+      std::lock_guard<std::mutex> lock(device_mutex);
+      if (fd == -1 || !is_capturing)
+        return;
+      const xu stats_xu{kFx3XuUnit, 0, {}};
+      if (!xu_control_query(stats_xu, kFx3XuProtStatsSelector, UVC_GET_CUR,
+                            sizeof(data), data)) {
+        if (last_xu_errno == ETIMEDOUT) {
+          fx3_unresponsive = true;
+          return;
+        }
+        std::cout << "[fx3-prot] protocol stats XU not available (firmware "
+                     "without selector 8), disabling" << std::endl;
+        fx3_prot_supported = false;
+        return;
+      }
+    }
+    uint32_t v[8];
+    for (int i = 0; i < 8; ++i)
+      v[i] = static_cast<uint32_t>(data[i * 4]) |
+             (static_cast<uint32_t>(data[i * 4 + 1]) << 8) |
+             (static_cast<uint32_t>(data[i * 4 + 2]) << 16) |
+             (static_cast<uint32_t>(data[i * 4 + 3]) << 24);
+    const uint32_t burst = (v[0] >> 8) & 0xFF;
+    const uint32_t schema = v[0] & 0xFF;
+    if (schema < 1 || schema > 3 || burst == 0 || burst > 16 ||
+        (v[0] >> 27) != 0) {
+      std::cout << "[fx3-prot] firmware without protocol stats (selector 8 "
+                   "word0=0x" << std::hex << v[0] << std::dec
+                << "), disabling" << std::endl;
+      fx3_prot_supported = false;
+      return;
+    }
+    std::cout << "[fx3-prot] v" << schema << " burst=" << burst
+              << " retry=" << v[1] << " oos=" << v[2]
+              << " host_bterm=" << v[3] << " dev_bterm=" << v[4];
+    // v1: [5] = retry peak per loop.  v2/v3: [5] = endpoint resets (15..0),
+    // bulk-stream errors (v2) / sequence-error self-resyncs (v3) in 30..16,
+    // BTERM interrupt dropped (31).
+    if (schema == 1)
+      std::cout << " retry_peak/loop=" << v[5];
+    else
+      std::cout << " ep_reset=" << (v[5] & 0xFFFF)
+                << (schema == 2 ? " stream_err=" : " seq_resync=")
+                << ((v[5] >> 16) & 0x7FFF)
+                << ((v[5] >> 31) ? " bterm_irq=off" : "");
+    std::cout << " samples=" << v[6]
+              << std::hex << " lnk_status=0x" << (v[7] & 0xFFFF)
+              << " phy_status=0x" << (v[7] >> 16)
+              << " epi_masks=0x" << ((v[0] >> 16) & 0x7FF) << std::dec;
+    // Same reboot rule as selector 2: totals only move forward.
+    if (fx3_prot_have_prev && v[6] >= fx3_prot_prev[6] &&
+        v[1] >= fx3_prot_prev[1]) {
+      std::cout << "  (delta: retry+" << (v[1] - fx3_prot_prev[1])
+                << " oos+" << (v[2] - fx3_prot_prev[2])
+                << " host_bterm+" << (v[3] - fx3_prot_prev[3])
+                << " dev_bterm+" << (v[4] - fx3_prot_prev[4]);
+      if (schema >= 2)
+        std::cout << " ep_reset+"
+                  << ((v[5] & 0xFFFF) - (fx3_prot_prev[5] & 0xFFFF));
+      if (schema == 3)
+        std::cout << " seq_resync+"
+                  << (((v[5] >> 16) & 0x7FFF) -
+                      ((fx3_prot_prev[5] >> 16) & 0x7FFF));
+      std::cout << " samples+" << (v[6] - fx3_prot_prev[6]) << ")";
+    }
+    std::cout << std::endl;
+    for (int i = 0; i < 8; ++i)
+      fx3_prot_prev[i] = v[i];
+    fx3_prot_have_prev = true;
   }
 
   void start_streaming() {
