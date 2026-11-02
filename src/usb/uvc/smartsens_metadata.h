@@ -11,10 +11,13 @@
 namespace cyperstereo {
 
 // Cyperstereo SmartSens serials encode the SKU in character 1:
-// S0xxxxxx=quad (C1/C2/C4/C3), S1xxxxxx=mono color (process C1 only),
-// S2xxxxxx=stereo (C1/C2). The FX3 transport may still carry unused lanes
-// for S1; consumers must skip those planes. Return 0 for another family/SKU
-// so the caller can use UVC-size or legacy fallback logic.
+// S0xxxxxx=quad (C1/C2/C4/C3), S6xxxxxx=six-image,
+// S1xxxxxx=mono color (process C1 only), S2xxxxxx=stereo (C1/C2).
+// S0 and S6 share the four-lane 2560x1024 transport and the same metadata
+// column 0 (02 default board, 04 V1.6), so the serial alone selects the
+// lane layout. The FX3 transport may still carry unused lanes for S1;
+// consumers must skip those planes. Return 0 for another family/SKU so the
+// caller can use UVC-size or legacy fallback.
 inline int SmartSensCameraCountFromSerial(const std::string &serial_number) {
   if (serial_number.size() < 2 ||
       (serial_number[0] != 'S' && serial_number[0] != 's'))
@@ -22,6 +25,7 @@ inline int SmartSensCameraCountFromSerial(const std::string &serial_number) {
   if (serial_number[1] == '0') return 4;
   if (serial_number[1] == '1') return 1;
   if (serial_number[1] == '2') return 2;
+  if (serial_number[1] == '6') return 6;
   return 0;
 }
 
@@ -38,9 +42,9 @@ inline int SmartSensProcessedCameraCount(const std::string &serial_number,
 }
 
 // AR0234 serials encode the SKU in character 1: A0xxxxx=quad,
-// A6xxxxx=six-camera. Both use the four-lane 3840x1080 transport; the
-// six-image lane layout itself is still selected per frame by metadata
-// column 0 (03 / 05). Return 0 for another family/SKU.
+// A6xxxxx=six-image. Both use the four-lane 3840x1080 transport and the same
+// metadata column 0 (03 default board, 05 V1.6). Return 0 for another
+// family/SKU.
 inline int Ar0234CameraCountFromSerial(const std::string &serial_number) {
   if (serial_number.size() < 2 ||
       (serial_number[0] != 'A' && serial_number[0] != 'a'))
@@ -48,6 +52,13 @@ inline int Ar0234CameraCountFromSerial(const std::string &serial_number) {
   if (serial_number[1] == '0') return 4;
   if (serial_number[1] == '6') return 6;
   return 0;
+}
+
+// S6 / A6. The FPGA reports the same column 0 for quad and six-image, so the
+// serial is the only thing that says byte lanes 2/3 carry half images.
+inline bool IsSixImageSerial(const std::string &serial_number) {
+  return SmartSensCameraCountFromSerial(serial_number) == 6 ||
+         Ar0234CameraCountFromSerial(serial_number) == 6;
 }
 
 static constexpr int kSmartSensHardwareVersion = 2;
@@ -58,46 +69,56 @@ static constexpr int kSmartSensSoftwareVersion6 = 6;
 static constexpr int kSmartSensSoftwareVersion7 = 7;
 static constexpr int kSmartSensSoftwareVersion8 = 8;
 
-// Metadata column 0 is the sensor family: 02 = SC136HGS, 03 = AR0234.  Both
-// share the FX3 four-lane transport (C1/C2/C4/C3), the timestamp/IMU columns
-// and the column-68 marker; only the plane size and telemetry differ.
+// Metadata column 0 = sensor and board (EZ_CAMERA_LINKER_Params.v
+// CAM_HW_VERSION); column 1 = 07. Quad and six-image report the same value;
+// the FX3 serial (S0/A0 quad, S6/A6 six) tells them apart.
+//   02 = SC136HGS, default (0718) board    03 = AR0234, default board
+//   04 = SC136HGS, V1.6 board              05 = AR0234, V1.6 board
+// All four share the FX3 transport of their sensor (2560x1024 or 3840x1080),
+// the timestamp/IMU columns and the column-68 marker.
 static constexpr int kAr0234HardwareVersion = 3;
 static constexpr int kAr0234SoftwareVersion7 = 7;
+static constexpr int kSc136V16HardwareVersion = 4;
+static constexpr int kAr0234V16HardwareVersion = 5;
 
-// Six-camera boards keep software 07 and mark the mode in column 0:
-// 04 = SC136HGS six-camera, 05 = AR0234 six-camera.  Lanes 0/1 (C1/C2 full)
-// and metadata columns 0..131 are identical to 02/07 resp. 03/07, but byte
-// lanes 2/3 carry FOUR horizontally 2:1 binned images of the physical
-// sensors C3..C6 instead of full-width C4/C3:
-//   lane2 (third_image)  = C3 half [left]  | C4 half [right]
-//   lane3 (fourth_image) = C5 half [left]  | C6 half [right]
-static constexpr int kSc136SixCamHardwareVersion = 4;
-static constexpr int kAr0234SixCamHardwareVersion = 5;
+inline bool IsV16BoardHardware(int hardware_version) {
+  return hardware_version == kSc136V16HardwareVersion ||
+         hardware_version == kAr0234V16HardwareVersion;
+}
+
+// Six-image units keep lanes 0/1 (C1/C2 full) and metadata columns 0..131 of
+// the quad. Byte lanes 2/3 carry four horizontally 2:1 binned images:
+//   V1.6 board:    lane2 = C3h | C4h, lane3 = C5h | C6h (physical C5/C6)
+//   default board: lane2 = C1h | C2h, lane3 = C3h | C4h (no C5/C6 sensors)
 // Physical camera (1-based) of half image 0..3 (lane2 left/right, lane3
 // left/right).
-inline int SixCamHalfImageCamera(int half_index) { return half_index + 3; }
-// SC136HGS six-camera C5/C6 AE telemetry, same encodings as columns 69..80:
-// column 132 = {0xC6, cam6/cam5 present}; then exposure (C5, C6),
-// temperature (C5, C6) and gain (C5, C6).
+inline int SixCamHalfImageCamera(int hardware_version, int half_index) {
+  return IsV16BoardHardware(hardware_version) ? half_index + 3
+                                              : half_index + 1;
+}
+// SC136HGS V1.6 six-image C5/C6 AE telemetry, same encodings as columns
+// 69..80: column 132 = {0xC6, cam6/cam5 present}; then exposure (C5, C6),
+// temperature (C5, C6) and gain (C5, C6). V1.6 quad has pixels there, so
+// decode these columns only for six-image serials.
 static constexpr int kSixCamC56MarkerCol = 132;
 static constexpr int kSixCamC56MarkerHigh = 0xC6;
 static constexpr int kSixCamC56ExposureCol = 133;
 static constexpr int kSixCamC56TemperatureCol = 135;
 static constexpr int kSixCamC56GainCol = 137;
 static constexpr int kSixCamC56EndCol = 139;  // exclusive
-// AR0234 six-camera (05/07) uses the same marker/exposure/gain columns with
+// AR0234 V1.6 six-image (05/07) uses the same marker/exposure/gain columns with
 // the AR0234 encodings (R0x3164 lines, R0x312A gain); columns 135/136 are 0
 // and the C5/C6 register-readback mailboxes {addr, value, seq, status} follow
 // at 139..142 (C5) and 143..146 (C6).
 static constexpr int kAr0234SixCamC56MailboxCol = 139;
 static constexpr int kAr0234SixCamC56EndCol = 147;  // exclusive
 
-// Sensor family of a column-0 marker: six-image codes map to the quad code
-// whose sensor, plane size, Bayer phase and telemetry they share.
+// Sensor family of a column-0 marker: the V1.6 codes map to the default-board
+// code whose sensor, plane size, Bayer phase and telemetry they share.
 inline int SensorFamilyHardwareVersion(int hardware_version) {
-  if (hardware_version == kSc136SixCamHardwareVersion)
+  if (hardware_version == kSc136V16HardwareVersion)
     return kSmartSensHardwareVersion;
-  if (hardware_version == kAr0234SixCamHardwareVersion)
+  if (hardware_version == kAr0234V16HardwareVersion)
     return kAr0234HardwareVersion;
   return hardware_version;
 }
@@ -118,15 +139,34 @@ inline bool IsSc136FamilyHardware(int hardware_version) {
          kSmartSensHardwareVersion;
 }
 
-inline bool IsSixCamHardware(int hardware_version) {
-  return hardware_version == kSc136SixCamHardwareVersion ||
-         hardware_version == kAr0234SixCamHardwareVersion;
+// Name of a column-0 marker plus the serial's quad/six choice. Null for
+// MT9V034 and any other marker.
+inline const char *CameraModeName(int hardware_version, bool six_image) {
+  switch (hardware_version) {
+    case kSmartSensHardwareVersion:
+      return six_image ? "SC136HGS(six/02)" : "SC136HGS(quad/02)";
+    case kAr0234HardwareVersion:
+      return six_image ? "AR0234(six/03)" : "AR0234(quad/03)";
+    case kSc136V16HardwareVersion:
+      return six_image ? "SC136HGS(V1.6 six/04)" : "SC136HGS(V1.6 quad/04)";
+    case kAr0234V16HardwareVersion:
+      return six_image ? "AR0234(V1.6 six/05)" : "AR0234(V1.6 quad/05)";
+    default:
+      return nullptr;
+  }
 }
 
-// True when byte lanes 2/3 carry the four half-width images (04/07, 05/07).
-inline bool IsSmartSensHalfResLaneLayout(int hardware_version,
+// Images the host should present. Six-image units still occupy four USB
+// byte lanes; lane_cameras is that transport count (4, or 2/1 for S2/S1).
+inline int CameraModeImageCount(bool six_image, int lane_cameras) {
+  return six_image && lane_cameras >= 4 ? 6 : lane_cameras;
+}
+
+// True when byte lanes 2/3 carry the four half-width images: a six-image
+// serial (IsSixImageSerial) on 02/07, 03/07, 04/07 or 05/07 firmware.
+inline bool IsSmartSensHalfResLaneLayout(bool six_image, int hardware_version,
                                          int software_version) {
-  return IsSixCamHardware(hardware_version) &&
+  return six_image && IsSmartSensFamilyHardware(hardware_version) &&
          software_version == kSmartSensSoftwareVersion7;
 }
 
@@ -222,7 +262,7 @@ struct SmartSensMetadataLayout {
 
 inline bool IsSupportedSmartSensFirmware(int hardware_version,
                                          int software_version) {
-  if (IsSixCamHardware(hardware_version))
+  if (IsV16BoardHardware(hardware_version))
     return software_version == kSmartSensSoftwareVersion7;
   if (hardware_version == kAr0234HardwareVersion)
     return software_version == kAr0234SoftwareVersion7;
@@ -237,7 +277,8 @@ inline bool IsSupportedSmartSensFirmware(int hardware_version,
 
 inline SmartSensMetadataLayout GetSmartSensMetadataLayout(
     int hardware_version, int software_version) {
-  if (IsSmartSensHalfResLaneLayout(hardware_version, software_version))
+  // V1.6 (04/05) has the default-board metadata layout of its sensor.
+  if (IsV16BoardHardware(hardware_version))
     hardware_version = SensorFamilyHardwareVersion(hardware_version);
   if (hardware_version == kAr0234HardwareVersion &&
       software_version == kAr0234SoftwareVersion7) {

@@ -514,10 +514,13 @@ static int run(int argc, char *argv[]) {
   const int num_cameras = profile.num_cameras;
   const int process_cameras =
       cyperstereo::SmartSensProcessedCameraCount(serial_num, num_cameras);
+  // S6/A6 serial = six-image FPGA build (column 0 is the same as the quad).
+  const bool six_image = cyperstereo::IsSixImageSerial(serial_num);
   std::cout << "camera: " << profile.name << "  serial: "
             << (serial_num.empty() ? "(none)" : serial_num) << "  "
           << profile.frame_width << "x" << profile.frame_height << "@"
-          << profile.fps << "  cameras: " << num_cameras;
+          << profile.fps << "  cameras: "
+          << cyperstereo::CameraModeImageCount(six_image, num_cameras);
   if (process_cameras == 1 && num_cameras > 1)
     std::cout << "  process: C1 only (S1 color SKU)";
   std::cout << std::endl;
@@ -553,7 +556,7 @@ static int run(int argc, char *argv[]) {
       use_fast_balanced, use_uyvy422, show_preview, capture_log_every,
       left_color.step[0], process_cameras);
   IspProcessor isp(isp_mode);
-  // Six-image firmware (04/07, 05/07) packs four half-width binned cameras
+  // Six-image firmware (S6/A6 serial) packs four half-width binned cameras
   // into image3/image4.  A second processor keeps those halves on their own
   // AWB/exposure state so C1/C2's full-width state is not overwritten.
   IspProcessor half_isp(isp_mode);
@@ -705,7 +708,8 @@ static int run(int argc, char *argv[]) {
           SelectBayerConversion(hardware_version, software_version, 3);
       const bool half_res_lanes =
           process_cameras >= 4 &&
-          IsSmartSensHalfResLaneLayout(static_cast<int>(hardware_version),
+          IsSmartSensHalfResLaneLayout(six_image,
+                                       static_cast<int>(hardware_version),
                                        static_cast<int>(software_version));
       if (process_cameras <= 1) {
         // S1: C1-only color SKU. Unused FX3 lanes are not ISP'd.
@@ -714,16 +718,21 @@ static int run(int argc, char *argv[]) {
              fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
         });
       } else if (half_res_lanes) {
-        // image3/image4 are concat half-width RAW pairs of C3|C4 and C5|C6.
-        // Split them into four cameras, then vertically 2:1 same-colour bin in
-        // RAW (the FPGA already did horizontal 2:1) so the ISP runs on
-        // quarter-size images.
+        // image3/image4 are concat half-width RAW pairs (V1.6: C3|C4 and
+        // C5|C6, default board: C1|C2 and C3|C4). Split them into four
+        // cameras, then vertically 2:1 same-colour bin in RAW (the FPGA
+        // already did horizontal 2:1) so the ISP runs on quarter-size images.
+        const SixImageHalves halves = SelectSixImageHalves(
+            hardware_version, software_version, isp_camera_gain,
+            c56.camera_gain);
         if (!half_res_announced) {
           std::cout << "[half-res] " << hardware_version << "/"
                     << software_version << " six-image "
                     << (IsAr0234FamilyHardware(static_cast<int>(hardware_version))
                             ? "AR0234" : "SC136HGS")
-                    << ": split image3/image4 -> C3h/C4h/C5h/C6h "
+                    << ": split image3/image4 -> C" << halves.camera[0]
+                    << "h/C" << halves.camera[1] << "h/C" << halves.camera[2]
+                    << "h/C" << halves.camera[3] << "h "
                     << half_color[0].cols << "x" << half_color[0].rows
                     << " (RAW vbin " << left_front_image.rows << "->"
                     << half_color[0].rows << ")" << std::endl;
@@ -751,14 +760,8 @@ static int run(int argc, char *argv[]) {
           });
         }
         SplitAndVBinHalfResLanes(left_front_image, right_front_image, half_raw);
-        BayerConversion cam_bayer[4];
-        for (int h = 0; h < 4; ++h)
-          cam_bayer[h] = SelectCameraBayerConversion(
-              hardware_version, software_version, SixCamHalfImageCamera(h));
-        // isp_camera_gain[] is display-plane order C1,C2,C4,C3; C5/C6 come
-        // from their own metadata columns.
-        const double cam_gain[4] = {isp_camera_gain[3], isp_camera_gain[2],
-                                    c56.camera_gain[0], c56.camera_gain[1]};
+        const BayerConversion *cam_bayer = halves.bayer;
+        const double *cam_gain = halves.gain;
         // The FPGA leaves the half lanes unfiltered (nr_active = 0), and they
         // carry no metadata row, so the host NR runs and no region is masked.
         if (six_this_frame) {
@@ -770,23 +773,26 @@ static int run(int argc, char *argv[]) {
                fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
               {right_image, right_color, "cam2", isp_camera_gain[1], image2_bayer,
                fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
-              {half_raw[0], half_color[0], "half-cam3", cam_gain[0], cam_bayer[0]},
-              {half_raw[1], half_color[1], "half-cam4", cam_gain[1], cam_bayer[1]},
-              {half_raw[2], half_color[2], "half-cam5", cam_gain[2], cam_bayer[2]},
-              {half_raw[3], half_color[3], "half-cam6", cam_gain[3], cam_bayer[3]}};
+              {half_raw[0], half_color[0], halves.name[0], cam_gain[0], cam_bayer[0], false, {}, kHalfResNrGainScale},
+              {half_raw[1], half_color[1], halves.name[1], cam_gain[1], cam_bayer[1], false, {}, kHalfResNrGainScale},
+              {half_raw[2], half_color[2], halves.name[2], cam_gain[2], cam_bayer[2], false, {}, kHalfResNrGainScale},
+              {half_raw[3], half_color[3], halves.name[3], cam_gain[3], cam_bayer[3], false, {}, kHalfResNrGainScale}};
           six_isp->Apply(jobs);
         } else {
           half_isp.ApplyParallel({
-              {half_raw[0], half_color[0], "half-cam3", cam_gain[0], cam_bayer[0]},
-              {half_raw[1], half_color[1], "half-cam4", cam_gain[1], cam_bayer[1]},
-              {half_raw[2], half_color[2], "half-cam5", cam_gain[2], cam_bayer[2]},
-              {half_raw[3], half_color[3], "half-cam6", cam_gain[3], cam_bayer[3]},
+              {half_raw[0], half_color[0], halves.name[0], cam_gain[0], cam_bayer[0], false, {}, kHalfResNrGainScale},
+              {half_raw[1], half_color[1], halves.name[1], cam_gain[1], cam_bayer[1], false, {}, kHalfResNrGainScale},
+              {half_raw[2], half_color[2], halves.name[2], cam_gain[2], cam_bayer[2], false, {}, kHalfResNrGainScale},
+              {half_raw[3], half_color[3], halves.name[3], cam_gain[3], cam_bayer[3], false, {}, kHalfResNrGainScale},
           });
         }
-        MirrorImage5Vertical(half_raw[2], half_color[2]);
-        // half_isp slots 2/3 are physical C5/C6, same digital exposure as image1.
-        c56.digital_gain[0] = six_this_frame ? six_isp->DigitalGain(4) : half_isp.DigitalGain(2);
-        c56.digital_gain[1] = six_this_frame ? six_isp->DigitalGain(5) : half_isp.DigitalGain(3);
+        OrientSixImageHalves(hardware_version, half_raw, half_color);
+        // V1.6: half_isp slots 2/3 are physical C5/C6, same digital exposure
+        // as image1.
+        if (halves.camera[2] == 5) {
+          c56.digital_gain[0] = six_this_frame ? six_isp->DigitalGain(4) : half_isp.DigitalGain(2);
+          c56.digital_gain[1] = six_this_frame ? six_isp->DigitalGain(5) : half_isp.DigitalGain(3);
+        }
       } else if (process_cameras >= 4) {
         isp.ApplyParallel({
             {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
@@ -818,17 +824,27 @@ static int run(int argc, char *argv[]) {
       const cv::Mat *raw_images[6] = {
           &left_image, &right_image, &left_front_image, &right_front_image,
           nullptr, nullptr};
-      // Display/save slot -> camera tag.  In six-image mode slots 4/5 show
-      // C5h/C4h.  Processing above is unchanged.
+      // Display/save slot -> camera tag.  In six-image mode slots 3..6 follow
+      // SixImageHalfOutputOrder (V1.6: C3h C4h C5h C6h); saved files keep the
+      // physical camera name.  Processing above is unchanged.
       std::string image_tags[6] = {"image1", "image2", "image3",
                                    "image4", "image5", "image6"};
+      if (!half_res_lanes && n_images >= 4 &&
+          V16QuadShowsC3ThenC4(static_cast<int>(hardware_version), false)) {
+        std::swap(color_images[2], color_images[3]);
+        std::swap(raw_images[2], raw_images[3]);
+      }
       if (half_res_lanes) {
-        static const int kHalfOrder[4] = {0, 2, 1, 3};
-        static const char *const kHalfTags[4] = {"C3h", "C4h", "C5h", "C6h"};
+        const int *half_order = SixImageHalfOutputOrder(hardware_version);
         for (int i = 0; i < 4; ++i) {
-          color_images[2 + i] = &half_color[kHalfOrder[i]];
-          raw_images[2 + i] = &half_raw[kHalfOrder[i]];
-          image_tags[2 + i] = std::string("image_") + kHalfTags[kHalfOrder[i]];
+          const int h = half_order[i];
+          color_images[2 + i] = &half_color[h];
+          raw_images[2 + i] = &half_raw[h];
+          image_tags[2 + i] =
+              "image_C" +
+              std::to_string(SixCamHalfImageCamera(
+                  static_cast<int>(hardware_version), h)) +
+              "h";
         }
       }
       if (show_preview && count % kShowEvery == 0) {

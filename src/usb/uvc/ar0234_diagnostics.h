@@ -48,7 +48,7 @@ inline bool DecodeAr0234Readback(const unsigned char *lo,
   sample.status = word(base + 3);
   return true;
 }
-// AR0234 six-camera (05/07) C5/C6 mailboxes at columns 139..146 (camera 0 =
+// AR0234 V1.6 six-image (A6 serial, 05/07) C5/C6 mailboxes at columns 139..146 (camera 0 =
 // C5, 1 = C6), present only together with the column-132 0xC6 marker and a
 // six-camera readback layout (0x1004 at 81 or 0x1005 at 106).
 inline bool DecodeAr0234C56Readback(const unsigned char *lo,

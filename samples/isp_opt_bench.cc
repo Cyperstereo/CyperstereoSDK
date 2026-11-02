@@ -30,7 +30,7 @@ int main(int argc,char**argv){
   for(int width: {36,38,1280,1920,1922}) {
    cv::Mat parent[2],lanes[2],got[4],expected[4];
    for(int l=0;l<2;++l){parent[l].create(24,width+12,CV_8U);rng.fill(parent[l],cv::RNG::UNIFORM,0,256);lanes[l]=parent[l](cv::Rect(4,0,width,24));}
-   for(int c=0;c<4;++c){expected[c].create(12,width/2,CV_8U);for(int y=0;y<12;++y)for(int x=0;x<width/2;++x){int iy=(y/2)*4+(y&1),ix=x+(c&1)*(width/2);expected[c].at<uchar>(y,x)=(int(lanes[c/2].at<uchar>(iy,ix))+lanes[c/2].at<uchar>(iy+2,ix)+1)>>1;}}
+   for(int c=0;c<4;++c){expected[c].create(12,width/2,CV_8U);for(int y=0;y<12;++y)for(int x=0;x<width/2;++x){int iy=(y/2)*4+(y&1),ix=x+(c&1)*(width/2);const int a=lanes[c/2].at<uchar>(iy,ix),b=lanes[c/2].at<uchar>(iy+2,ix);expected[c].at<uchar>(y,x)=(y&1)?(a+3*b+2)>>2:(3*a+b+2)>>2;}}
    SplitAndVBinHalfResLanes(lanes[0],lanes[1],got);
    for(int c=0;c<4;++c)if(cv::norm(got[c],expected[c],cv::NORM_INF))return 6;
    got[0]=lanes[0](cv::Rect(0,0,width/2,12));

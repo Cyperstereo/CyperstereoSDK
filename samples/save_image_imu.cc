@@ -75,6 +75,8 @@ std::queue<GnssRecord> GNSS;
 std::mutex m_buf;
 std::condition_variable con;
 bool capture_finished = false;  // guarded by m_buf
+// S6/A6 serial = six-image FPGA build. Set in main before DataFlow starts.
+static bool g_six_image = false;
 static volatile std::sig_atomic_t stop_requested = 0;
 extern "C" void save_stop_handler(int) { stop_requested = 1; }
 void GetData(std::queue<std::pair<double, std::array<double, 6>> > &imu_data, std::queue<ImageRecord> &image_data, std::queue<GnssRecord> &gnss_data);
@@ -133,10 +135,12 @@ int main(int argc, char *argv[]) {
   const int num_cameras = profile.num_cameras;
   const int process_cameras =
       cyperstereo::SmartSensProcessedCameraCount(serial_num, num_cameras);
+  g_six_image = cyperstereo::IsSixImageSerial(serial_num);
   std::cout << "camera: " << profile.name << "  serial: "
             << (serial_num.empty() ? "(none)" : serial_num) << "  "
             << profile.frame_width << "x" << profile.frame_height << "@"
-            << profile.fps << "  cameras: " << num_cameras;
+            << profile.fps << "  cameras: "
+            << cyperstereo::CameraModeImageCount(g_six_image, num_cameras);
   if (process_cameras == 1 && num_cameras > 1)
     std::cout << "  process: C1 only (S1 color SKU)";
   std::cout << std::endl;
@@ -330,7 +334,7 @@ void DataFlow() {
   const bool use_fast_balanced = FastBalancedIspEnabled();
   IspProcessor isp(use_fast_balanced ? IspMode::kFastBalancedBgr888
                                    : IspMode::kQualityReferenceBgr888);
-  // Six-image firmware (04/07, 05/07): the four half images of lanes 2/3 keep
+  // Six-image firmware (S6/A6 serial): the four half images of lanes 2/3 keep
   // their own AWB/exposure state, separate from the full-width C1/C2.
   IspProcessor half_isp(isp.mode());
   std::unique_ptr<SixCameraIspProcessor> six_isp;
@@ -430,21 +434,45 @@ void DataFlow() {
         const bool is_bayer =
             IsSmartSensFamilyHardware(static_cast<int>(record.hardware_version));
         // Six-image: lanes 2/3 are NOT full-width C4/C3 but four horizontally
-        // binned images of C3..C6 (C3h|C4h, C5h|C6h).
+        // binned images (V1.6: C3h|C4h, C5h|C6h; default board: C1h|C2h,
+        // C3h|C4h).
         const bool half_res_lanes = four_ok &&
             IsSmartSensHalfResLaneLayout(
+                g_six_image,
                 static_cast<int>(record.hardware_version),
                 static_cast<int>(record.software_version));
+        const SixImageHalves halves = SelectSixImageHalves(
+            record.hardware_version, record.software_version,
+            record.camera_gain.data(), record.c56_gain.data());
+        // V1.6 halves C3..C6 go to ./cam3..6. On the default board ./cam1 and
+        // ./cam2 already hold the full C1/C2, so the halves go to ./camNh.
+        const bool v16_halves = halves.camera[0] == 3;
+        std::string half_dirs[4];
+        for (int i = 0; i < 4; ++i)
+          half_dirs[i] = "./cam" + std::to_string(halves.camera[i]) +
+                         (v16_halves ? "/" : "h/");
         if (half_res_lanes && !half_res_announced) {
+          if (!v16_halves) {
+            for (int i = 0; i < 4; ++i) {
+#ifdef _WIN32
+              _mkdir(half_dirs[i].c_str());
+#else
+              mkdir(half_dirs[i].c_str(), 0755);
+#endif
+            }
+          }
           std::cout << "[half-res] " << record.hardware_version << "/"
                     << record.software_version << " six-image "
                     << (IsAr0234FamilyHardware(
                             static_cast<int>(record.hardware_version))
                             ? "AR0234" : "SC136HGS")
-                    << ": lanes 2/3 -> C3h/C4h/C5h/C6h "
+                    << ": lanes 2/3 -> C" << halves.camera[0] << "h/C"
+                    << halves.camera[1] << "h/C" << halves.camera[2] << "h/C"
+                    << halves.camera[3] << "h "
                     << SmartSensHalfResWidth(imgs[2].cols) << "x"
-                    << SmartSensHalfResHeight(imgs[2].rows)
-                    << " (saved to ./cam3..6)" << std::endl;
+                    << SmartSensHalfResHeight(imgs[2].rows) << " (saved to "
+                    << half_dirs[0] << " " << half_dirs[1] << " "
+                    << half_dirs[2] << " " << half_dirs[3] << ")" << std::endl;
           half_res_announced = true;
         }
         if (is_bayer && one_ok) {
@@ -469,10 +497,6 @@ void DataFlow() {
                 record.camera_gain, record.fpga_bayer_nr, record.raw_telemetry);
             if (half_res_lanes) {
               SplitAndVBinHalfResLanes(imgs[2], imgs[3], half_raw);
-              // camera_gain[] is display-plane order C1,C2,C4,C3; C5/C6 come
-              // from their own metadata columns.
-              const double cam_gain[4] = {record.camera_gain[3], record.camera_gain[2],
-                                          record.c56_gain[0], record.c56_gain[1]};
               const uint32_t hw = record.hardware_version;
               const uint32_t sw = record.software_version;
               if (six) {
@@ -480,22 +504,22 @@ void DataFlow() {
                 IspFrameJob jobs[] = {
                   {left_image,left_color,"cam1",record.camera_gain[0],SelectDeliveredPlaneBayer(hw,sw,0),record.fpga_bayer_nr[0],record.raw_telemetry.RegionForPlane(0)},
                   {right_image,right_color,"cam2",record.camera_gain[1],SelectDeliveredPlaneBayer(hw,sw,1),record.fpga_bayer_nr[1],record.raw_telemetry.RegionForPlane(1)},
-                  {half_raw[0],half_color[0],"half-cam3",cam_gain[0],SelectCameraBayerConversion(hw,sw,SixCamHalfImageCamera(0))},
-                  {half_raw[1],half_color[1],"half-cam4",cam_gain[1],SelectCameraBayerConversion(hw,sw,SixCamHalfImageCamera(1))},
-                  {half_raw[2],half_color[2],"half-cam5",cam_gain[2],SelectCameraBayerConversion(hw,sw,SixCamHalfImageCamera(2))},
-                  {half_raw[3],half_color[3],"half-cam6",cam_gain[3],SelectCameraBayerConversion(hw,sw,SixCamHalfImageCamera(3))}};
+                  {half_raw[0],half_color[0],halves.name[0],halves.gain[0],halves.bayer[0], false, {}, kHalfResNrGainScale},
+                  {half_raw[1],half_color[1],halves.name[1],halves.gain[1],halves.bayer[1], false, {}, kHalfResNrGainScale},
+                  {half_raw[2],half_color[2],halves.name[2],halves.gain[2],halves.bayer[2], false, {}, kHalfResNrGainScale},
+                  {half_raw[3],half_color[3],halves.name[3],halves.gain[3],halves.bayer[3], false, {}, kHalfResNrGainScale}};
                 six_isp->Apply(jobs);
               } else half_isp.ApplyParallel({
-                  {half_raw[0], half_color[0], "half-cam3", cam_gain[0],
-                   SelectCameraBayerConversion(hw, sw, SixCamHalfImageCamera(0))},
-                  {half_raw[1], half_color[1], "half-cam4", cam_gain[1],
-                   SelectCameraBayerConversion(hw, sw, SixCamHalfImageCamera(1))},
-                  {half_raw[2], half_color[2], "half-cam5", cam_gain[2],
-                   SelectCameraBayerConversion(hw, sw, SixCamHalfImageCamera(2))},
-                  {half_raw[3], half_color[3], "half-cam6", cam_gain[3],
-                   SelectCameraBayerConversion(hw, sw, SixCamHalfImageCamera(3))},
+                  {half_raw[0], half_color[0], halves.name[0], halves.gain[0],
+                   halves.bayer[0], false, {}, kHalfResNrGainScale},
+                  {half_raw[1], half_color[1], halves.name[1], halves.gain[1],
+                   halves.bayer[1], false, {}, kHalfResNrGainScale},
+                  {half_raw[2], half_color[2], halves.name[2], halves.gain[2],
+                   halves.bayer[2], false, {}, kHalfResNrGainScale},
+                  {half_raw[3], half_color[3], halves.name[3], halves.gain[3],
+                   halves.bayer[3], false, {}, kHalfResNrGainScale},
               });
-              MirrorImage5Vertical(half_raw[2], half_color[2]);
+              OrientSixImageHalves(hw, half_raw, half_color);
             }
             std::thread t2;
             if (two_ok) {
@@ -505,11 +529,9 @@ void DataFlow() {
             }
             std::thread th[4];
             if (half_res_lanes) {
-              static const char *const kHalfDirs[4] = {
-                  "./cam3/", "./cam4/", "./cam5/", "./cam6/"};
               for (int i = 0; i < 4; ++i) {
                 th[i] = std::thread([&, i] {
-                  cv::imwrite(kHalfDirs[i] + image_name, half_color[i]);
+                  cv::imwrite(half_dirs[i] + image_name, half_color[i]);
                 });
               }
             }

@@ -11,7 +11,7 @@
 #include <sstream>
 #include <string>
 namespace cyperstereo {
-// Optional extension to 02/07 (and the six-image 04/07, same metadata row).
+// Optional extension to 02/07 (and the V1.6 04/07, same metadata row).
 // Existing columns 0..105 stay unchanged.
 // Columns 106/107 = A915/0106; six words per physical sensor C1,C2,C3,C4.
 struct Sc136AecTelemetry {

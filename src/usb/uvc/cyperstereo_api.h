@@ -410,9 +410,10 @@ static constexpr int kAr0234CamWidth = 1920;
 static constexpr int kAr0234FrameWidth = kAr0234CamWidth * 2;
 static constexpr int kAr0234FrameHeight = 1080;
 
-// Six-image half lanes (04/07 SC136HGS, 05/07 AR0234; see
-// smartsens_metadata.h): split the two full-width "third/fourth" planes into
-// the four horizontally binned camera images, output order C3h, C4h, C5h, C6h.
+// Six-image half lanes (S6/A6 serials; see smartsens_metadata.h): split the
+// two full-width "third/fourth" planes into the four horizontally binned
+// camera images, output order lane2 left, lane2 right, lane3 left, lane3
+// right (C3h C4h C5h C6h on V1.6, C1h C2h C3h C4h on the default board).
 // The halves are COPIED into continuous Mats (allocated on first use / size
 // change) so the ISP kernels, which assume continuous rows, can run on them.
 inline void SplitHalfResLanes(const cv::Mat &lane2, const cv::Mat &lane3,
@@ -422,15 +423,18 @@ inline void SplitHalfResLanes(const cv::Mat &lane2, const cv::Mat &lane3,
   const int w = SmartSensHalfResWidth(lane2.cols);
   const cv::Rect left(0, 0, w, lane2.rows);
   const cv::Rect right(w, 0, w, lane2.rows);
-  lane2(left).copyTo(half[0]);    // C3 half
-  lane2(right).copyTo(half[1]);   // C4 half
-  lane3(left).copyTo(half[2]);    // C5 half
-  lane3(right).copyTo(half[3]);   // C6 half
+  lane2(left).copyTo(half[0]);
+  lane2(right).copyTo(half[1]);
+  lane3(left).copyTo(half[2]);
+  lane3(right).copyTo(half[3]);
 }
 
-// Vertical 2:1 same-Bayer-colour average, matching FPGA bayer_hbin2:
-//   out[2n]   = (in[4n]   + in[4n+2] + 1) >> 1   // even rows stay BG / RG
-//   out[2n+1] = (in[4n+1] + in[4n+3] + 1) >> 1   // odd  rows stay GB / GR
+// Vertical 2:1 same-Bayer-colour bin with 3:1 weights:
+//   out[2n]   = (3*in[4n]   + in[4n+2]   + 2) >> 2  // even rows stay BG / RG
+//   out[2n+1] = (in[4n+1]   + 3*in[4n+3] + 2) >> 2  // odd  rows stay GB / GR
+// A plain (a+b)/2 puts the two output rows of a 2x2 cell at source rows
+// 4n+1 and 4n+2 (spacing 1, 3, 1, 3 ...), which demosaics into zipper /
+// mosaic texture; the 3:1 weights centre them at 4n+0.5 and 4n+2.5.
 // Height must be a multiple of 4 (1024 -> 512, 1080 -> 540).  Phase is
 // preserved so the per-camera BayerConversion still applies.
 inline void BayerVBin2SameColor(const cv::Mat &src, cv::Mat &dst) {
@@ -442,19 +446,26 @@ inline void BayerVBin2SameColor(const cv::Mat &src, cv::Mat &dst) {
     const int iy = ((oy >> 1) << 2) + (oy & 1);
     const unsigned char *a = src.ptr<unsigned char>(iy);
     const unsigned char *b = src.ptr<unsigned char>(iy + 2);
+    const unsigned char *near_row = (oy & 1) ? b : a;
+    const unsigned char *far_row = (oy & 1) ? a : b;
     unsigned char *d = dst.ptr<unsigned char>(oy);
     int x = 0;
 #if defined(CYPERSTEREO_HAVE_NEON)
+    const uint8x8_t three = vdup_n_u8(3);
     for (; x + 16 <= cols; x += 16) {
-      const uint8x16_t va = vld1q_u8(a + x);
-      const uint8x16_t vb = vld1q_u8(b + x);
-      // Rounded halving add is exactly (a+b+1)>>1 without u8 overflow.
-      vst1q_u8(d + x, vrhaddq_u8(va, vb));
+      const uint8x16_t vn = vld1q_u8(near_row + x);
+      const uint8x16_t vf = vld1q_u8(far_row + x);
+      const uint16x8_t lo =
+          vmlal_u8(vmovl_u8(vget_low_u8(vf)), vget_low_u8(vn), three);
+      const uint16x8_t hi =
+          vmlal_u8(vmovl_u8(vget_high_u8(vf)), vget_high_u8(vn), three);
+      // Rounding narrow shift is exactly (3*n+f+2)>>2.
+      vst1q_u8(d + x, vcombine_u8(vrshrn_n_u16(lo, 2), vrshrn_n_u16(hi, 2)));
     }
 #endif
     for (; x < cols; ++x)
       d[x] = static_cast<unsigned char>(
-          (static_cast<unsigned int>(a[x]) + b[x] + 1u) >> 1);
+          (3u * near_row[x] + far_row[x] + 2u) >> 2);
   }
 }
 
@@ -486,12 +497,80 @@ inline void SplitAndVBinHalfResLanes(const cv::Mat &lane2, const cv::Mat &lane3,
   BayerVBin2SameColor(lane3.colRange(w,2*w), quarter[3]);
 }
 
+// IspFrameJob::nr_gain_scale for the SplitAndVBinHalfResLanes images:
+// noise std of the 2x(H) * 2x(V) binned RAW relative to the full-res RAW.
+constexpr double kHalfResNrGainScale = 0.6;
+
 // image5 is half-camera C5 (quarter[2]). Flip it vertically after demosaic:
 // doing it on the RAW would turn RGGB/BGGR into a phase this ISP does not
 // demosaic. The RAW copy is flipped only so preview and saved RAW match.
 inline void MirrorImage5Vertical(cv::Mat &raw, cv::Mat &color) {
   if (!raw.empty()) cv::flip(raw, raw, 0);
   if (!color.empty()) cv::flip(color, color, 0);
+}
+
+// Per half image (SplitAndVBinHalfResLanes order): physical camera, ISP job
+// name, Bayer conversion and AE gain.
+struct SixImageHalves {
+  int camera[4];
+  const char *name[4];
+  BayerConversion bayer[4];
+  double gain[4];
+};
+
+// plane_gain[] is display-plane order C1,C2,C4,C3; c56_gain[] is the V1.6
+// C5/C6 telemetry.
+inline SixImageHalves SelectSixImageHalves(uint32_t hardware_version,
+                                           uint32_t software_version,
+                                           const double plane_gain[4],
+                                           const double c56_gain[2]) {
+  static const char *const kNames[7] = {
+      "", "half-cam1", "half-cam2", "half-cam3", "half-cam4", "half-cam5",
+      "half-cam6"};
+  static const int kPlaneByCamera[4] = {0, 1, 3, 2};
+  SixImageHalves h{};
+  for (int i = 0; i < 4; ++i) {
+    const int c = SixCamHalfImageCamera(static_cast<int>(hardware_version), i);
+    h.camera[i] = c;
+    h.name[i] = kNames[c];
+    h.bayer[i] =
+        SelectCameraBayerConversion(hardware_version, software_version, c);
+    h.gain[i] = c >= 5 ? c56_gain[c - 5] : plane_gain[kPlaneByCamera[c - 1]];
+  }
+  return h;
+}
+
+// USB planes stay C1, C2, C4, C3. V1.6 quad shows them as image1..4 =
+// C1, C2, C3, C4, so the displayed image3 and image4 are exchanged.
+inline bool V16QuadShowsC3ThenC4(int hardware_version, bool six_image) {
+  return !six_image && IsV16BoardHardware(hardware_version);
+}
+
+// Six-image output slots image3..image6 (ROS /cam2../cam5) -> half index.
+// V1.6 is C3h C4h C5h C6h. The default board is C1h C2h C3h C4h.
+inline const int *SixImageHalfOutputOrder(uint32_t hardware_version) {
+  static const int kV16[4] = {0, 1, 2, 3};
+  static const int kDefault[4] = {0, 1, 2, 3};
+  return IsV16BoardHardware(static_cast<int>(hardware_version)) ? kV16
+                                                                 : kDefault;
+}
+
+// Orient the demosaiced halves like the full images of the same sensors.
+// V1.6: C5 (socket J9, half 2) is mounted upside down. Default-board
+// AR0234: C1h/C2h come from the sensors that OrientAr0234Image12 rotates
+// 180 degrees. Both flips run after demosaic so the RAW Bayer phase is
+// never changed.
+inline void OrientSixImageHalves(uint32_t hardware_version, cv::Mat raw[4],
+                                 cv::Mat color[4]) {
+  const int hw = static_cast<int>(hardware_version);
+  if (IsV16BoardHardware(hw)) {
+    MirrorImage5Vertical(raw[2], color[2]);
+  } else if (IsAr0234FamilyHardware(hw)) {
+    for (int i = 0; i < 2; ++i) {
+      if (!raw[i].empty()) cv::flip(raw[i], raw[i], -1);
+      if (!color[i].empty()) cv::flip(color[i], color[i], -1);
+    }
+  }
 }
 
 static constexpr int kMt9FrameWidth = 752;
@@ -529,15 +608,25 @@ struct CameraProfile {
   int gnss_base_col;
 };
 
-// SmartSens serial layout: S0xxxxxx=quad, S1xxxxxx=mono color (C1 only),
-// and S2xxxxxx=stereo.  All use 1280-pixel SC136HGS planes; the UVC
+// SmartSens serial layout: S0xxxxxx=quad, S6xxxxxx=six-camera,
+// S1xxxxxx=mono color (C1 only), and S2xxxxxx=stereo.  All use 1280-pixel
+// SC136HGS planes; the UVC
 // transport is 2560 wide for four byte lanes (C1/C2/C4/C3) and 1280 wide
 // for the two byte lanes (C1/C2).  S1 keeps that lane layout so metadata
 // packed across C1/C2 stays readable; samples process only C1.
 static constexpr CameraProfile kProfileSmartSensQuad{
-    "SmartSens(SC136HGS-quad/S0)", 2, 3, kFx3FrameWidth, kFx3FrameHeight,
+    "SC136HGS(quad/02)", 2, 3, kFx3FrameWidth, kFx3FrameHeight,
     kFx3FrameFps, 4, kSmartSensCamWidth, kFx3FrameHeight - 1,
     kSmartSensLegacyImuSamplesPerFrame, 72};
+
+// S6 six-image SC136HGS: same 2560x1024 transport as the quad. num_cameras
+// counts byte lanes; lanes 2/3 carry four half images. hardware_version is
+// only the starting guess: column 0 (02 default board / 04 V1.6) is latched
+// from the first frame, and the name is refined with it.
+static constexpr CameraProfile kProfileSmartSensSix{
+    "SC136HGS(six)", kSmartSensHardwareVersion, kSmartSensSoftwareVersion7,
+    kFx3FrameWidth, kFx3FrameHeight, kFx3FrameFps, 4, kSmartSensCamWidth,
+    kFx3FrameHeight - 1, kSmartSensLegacyImuSamplesPerFrame, 72};
 
 static constexpr CameraProfile kProfileSmartSensStereo{
     "SmartSens(SC136HGS-stereo/S2)", 2, 3, kFx3FrameWidthStereo,
@@ -549,14 +638,14 @@ static constexpr CameraProfile kProfileSmartSensStereo{
 static constexpr CameraProfile kProfileSmartSens = kProfileSmartSensQuad;
 
 static constexpr CameraProfile kProfileAr0234Quad{
-    "AR0234(quad)", kAr0234HardwareVersion, kAr0234SoftwareVersion7,
+    "AR0234(quad/03)", kAr0234HardwareVersion, kAr0234SoftwareVersion7,
     kAr0234FrameWidth, kAr0234FrameHeight, kFx3FrameFps, 4, kAr0234CamWidth,
     kAr0234FrameHeight - 1, kSmartSensLegacyImuSamplesPerFrame, 72};
 
-// A6 units: same four-lane transport as the quad; num_cameras counts lanes.
-// C3..C6 arrive as half-resolution halves of lanes 2/3 (metadata 05).
+// A6 six-image AR0234: same 3840x1080 transport as the quad. Column 0
+// (03 default board / 05 V1.6) is latched from the first frame.
 static constexpr CameraProfile kProfileAr0234Six{
-    "AR0234(six/A6)", kAr0234SixCamHardwareVersion, kAr0234SoftwareVersion7,
+    "AR0234(six)", kAr0234HardwareVersion, kAr0234SoftwareVersion7,
     kAr0234FrameWidth, kAr0234FrameHeight, kFx3FrameFps, 4, kAr0234CamWidth,
     kAr0234FrameHeight - 1, kSmartSensLegacyImuSamplesPerFrame, 72};
 
@@ -585,12 +674,16 @@ inline bool IsValidCyperstereoSerial(const std::string &serial_num) {
 
 inline const CameraProfile &SelectSmartSensBySerial(
     const std::string &serial_num, const uvc::device *device = nullptr) {
+  const int camera_count = SmartSensCameraCountFromSerial(serial_num);
+  // S6 is an SC136HGS six-image unit even if an old UVC descriptor also
+  // advertises another size. S0 stays the quad. Column 0 (02 / 04) only
+  // names the board; the serial decides the lane layout.
+  if (camera_count == 6) return kProfileSmartSensSix;
   // Older AR0234 units reuse the S-prefixed serials; only the advertised UVC
   // size tells them apart from SC136HGS.
   if (device &&
       uvc::has_frame_size(*device, kAr0234FrameWidth, kAr0234FrameHeight))
     return kProfileAr0234Quad;
-  const int camera_count = SmartSensCameraCountFromSerial(serial_num);
   if (camera_count == 2) return kProfileSmartSensStereo;
   if (camera_count == 4) return kProfileSmartSensQuad;
 
@@ -607,8 +700,8 @@ inline const CameraProfile &SelectSmartSensBySerial(
   return kProfileSmartSensQuad;
 }
 
-// A0 = quad, A6 = six-camera; other A serials fall back to the quad profile.
-// Metadata column 0 (03 / 05) still decides the lane layout of each frame.
+// A0 = quad, A6 = six-image; other A serials fall back to the quad profile.
+// Column 0 (03 / 05) only names the board; the serial decides the lane layout.
 inline const CameraProfile &SelectAr0234BySerial(const std::string &serial_num) {
   if (Ar0234CameraCountFromSerial(serial_num) == 6) return kProfileAr0234Six;
   return kProfileAr0234Quad;
@@ -772,8 +865,9 @@ struct FrameStreamData {
   // each has its own exposure length, so each midpoint differs.
   double   image_midpoint_timestamp[4]{};
 
-  // SC136HGS six-camera (04/07): AE telemetry of the two cameras that exist
-  // only as half images, index 0 = C5, 1 = C6 (metadata columns 132..138).
+  // V1.6 six-image (S6/A6 serial with 04/07 or 05/07): AE telemetry of the
+  // two cameras that exist only as half images, index 0 = C5, 1 = C6
+  // (metadata columns 132..138).
   // C3/C4 use the arrays above (display planes 3/2).  All zero otherwise.
   bool     c56_telemetry_valid{false};
   bool     c56_present[2]{};
@@ -2178,6 +2272,13 @@ class WhiteBalance {
     display_exposure_ = enabled;
     analog_gain_ = analog_gain;
   }
+  // Noise of this camera's RAW relative to an unbinned frame at the same
+  // sensor gain (fast path only). Binned half images average several
+  // same-colour samples, so NR keyed to the full-res noise over-smooths them.
+  void SetNrGainScale(double scale) {
+    nr_gain_scale_ = (scale > 0.0 && scale <= 1.0) ? scale : 1.0;
+  }
+  double NrGainScale() const { return nr_gain_scale_; }
   // Exposure applied by the current LUTs, quantized to Q7 (128 = 1x).
   double DisplayExposure() const { return lut_exposure_q7_ / 128.0; }
 
@@ -3410,6 +3511,7 @@ class WhiteBalance {
   bool green_table_ = false;  // lut_g_ is not ExposeGreen() (roll-off)
   bool display_exposure_ = false;
   double analog_gain_ = 0.0;
+  double nr_gain_scale_ = 1.0;
   bool exposure_init_ = false;
   double exposure_ = 1.0;
   double exposure_log_ = 0.0;
@@ -10876,7 +10978,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
                                    IspPixelFormat output_format =
                                        IspPixelFormat::kBgr888,
                                    double exposure_scale = 1.0,
-                                   const IspNv12Target *nv12 = nullptr) {
+                                   const IspNv12Target *nv12 = nullptr,
+                                   double luma_eps_factor = 1.0) {
 #if !defined(CYPERSTEREO_HAVE_NEON) || !defined(__aarch64__)
   (void)stream_wb;
   (void)stream_bayer_nr;
@@ -10958,14 +11061,16 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
                          cv::BORDER_REPLICATE);
       SuppressFalseColorImpl(&padded_raw, padded_color, sensor_gain,
                              linear_input, apply_tone, raw_bayer, nullptr,
-                             nullptr, false, output_format, exposure_scale);
+                             nullptr, false, output_format, exposure_scale,
+                             nullptr, luma_eps_factor);
     } else {
       cv::copyMakeBorder(color, padded_color, 0, bottom, 0, right,
                          cv::BORDER_REPLICATE);
       SuppressFalseColorImpl(nullptr, padded_color, sensor_gain, linear_input,
                              apply_tone,
                              BayerConversion::kColorBayerRg2Bgr, nullptr,
-                             nullptr, false, output_format, exposure_scale);
+                             nullptr, false, output_format, exposure_scale,
+                             nullptr, luma_eps_factor);
     }
     padded_color(cv::Rect(0, 0, full.width, full.height)).copyTo(color);
     return;
@@ -11041,7 +11146,10 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       stream_wb->DisplayExposure() >= 1.0)
     nr_exposure = (std::min)(8.0, stream_wb->DisplayExposure());
 #endif
-  const float luma_eps_scale = static_cast<float>(nr_exposure);
+  const float luma_eps_scale = static_cast<float>(
+      nr_exposure *
+      ((luma_eps_factor > 0.0 && luma_eps_factor <= 1.0) ? luma_eps_factor
+                                                          : 1.0));
   if (nr_exposure > 1.0) {
     const double t = (std::min)(1.0, nr_exposure - 1.0);
     guided_strength_q8 +=
@@ -12425,8 +12533,14 @@ inline void ApplyFastBalancedISPImplCore(
   const int bayer_code = bayer == BayerConversion::kColorBayerBg2Bgr
       ? cv::COLOR_BayerBG2BGR_EA
       : cv::COLOR_BayerRG2BGR_EA;
+  // NR follows the noise actually present in this RAW; display exposure
+  // keeps the real analog gain. Luma eps is a variance threshold, so it
+  // scales with the square of the noise ratio.
+  const double nr_scale = wb.NrGainScale();
+  const double nr_gain = sensor_gain * nr_scale;
+  const double luma_eps_factor = nr_scale * nr_scale;
   const bool use_bayer_nr = FastBalancedBayerNrEnabled() &&
-                            sensor_gain >= 3.0 && !raw_bayer_nr_done;
+                            nr_gain >= 3.0 && !raw_bayer_nr_done;
   const bool apply_tone = FastBalancedGammaEnabled();
   wb.SetDisplayExposure(apply_tone && GetFastExposureConfig().enabled,
                         sensor_gain);
@@ -12440,13 +12554,13 @@ inline void ApplyFastBalancedISPImplCore(
 
   if (!IspProfiler::Enabled()) {
     if (streamed_wb_front) {
-      SuppressFalseColorImpl(nullptr, color, sensor_gain, true, apply_tone,
+      SuppressFalseColorImpl(nullptr, color, nr_gain, true, apply_tone,
                              bayer, &raw, &wb, use_bayer_nr, output_format,
-                             wb.DisplayExposure(), nv12);
+                             wb.DisplayExposure(), nv12, luma_eps_factor);
       return;
     }
     if (use_bayer_nr) {
-      wb.ApplyWithBayerNr(raw, raw_wb, sensor_gain, bayer);
+      wb.ApplyWithBayerNr(raw, raw_wb, nr_gain, bayer);
     } else if (FastBalancedFusedWbCopyEnabled()) {
       wb.ApplyTo(raw, raw_wb, bayer);
     } else {
@@ -12455,23 +12569,23 @@ inline void ApplyFastBalancedISPImplCore(
       wb.Apply(raw_wb, bayer);
     }
     if (fused_demosaic)
-      SuppressFalseColorImpl(&raw_wb, color, sensor_gain, true, apply_tone,
+      SuppressFalseColorImpl(&raw_wb, color, nr_gain, true, apply_tone,
                              bayer, nullptr, nullptr, false, output_format,
-                             wb.DisplayExposure(), nv12);
+                             wb.DisplayExposure(), nv12, luma_eps_factor);
     else {
       cv::cvtColor(raw_wb, color, bayer_code);
-      SuppressFalseColorImpl(nullptr, color, sensor_gain, true, apply_tone,
+      SuppressFalseColorImpl(nullptr, color, nr_gain, true, apply_tone,
                              bayer, nullptr, nullptr, false, output_format,
-                             wb.DisplayExposure(), nv12);
+                             wb.DisplayExposure(), nv12, luma_eps_factor);
     }
     return;
   }
 
   const auto t0 = std::chrono::steady_clock::now();
   if (streamed_wb_front) {
-    SuppressFalseColorImpl(nullptr, color, sensor_gain, true, apply_tone,
+    SuppressFalseColorImpl(nullptr, color, nr_gain, true, apply_tone,
                            bayer, &raw, &wb, use_bayer_nr, output_format,
-                           wb.DisplayExposure(), nv12);
+                           wb.DisplayExposure(), nv12, luma_eps_factor);
     const auto t3 = std::chrono::steady_clock::now();
     const auto ms = [](std::chrono::steady_clock::duration d) {
       return std::chrono::duration<double, std::milli>(d).count();
@@ -12482,7 +12596,7 @@ inline void ApplyFastBalancedISPImplCore(
     return;
   }
   if (use_bayer_nr) {
-    wb.ApplyWithBayerNr(raw, raw_wb, sensor_gain, bayer);
+    wb.ApplyWithBayerNr(raw, raw_wb, nr_gain, bayer);
   } else if (FastBalancedFusedWbCopyEnabled()) {
     wb.ApplyTo(raw, raw_wb, bayer);
   } else {
@@ -12494,13 +12608,13 @@ inline void ApplyFastBalancedISPImplCore(
   if (!fused_demosaic) cv::cvtColor(raw_wb, color, bayer_code);
   const auto t2 = std::chrono::steady_clock::now();
   if (fused_demosaic)
-    SuppressFalseColorImpl(&raw_wb, color, sensor_gain, true, apply_tone,
+    SuppressFalseColorImpl(&raw_wb, color, nr_gain, true, apply_tone,
                            bayer, nullptr, nullptr, false, output_format,
-                           wb.DisplayExposure(), nv12);
+                           wb.DisplayExposure(), nv12, luma_eps_factor);
   else
-    SuppressFalseColorImpl(nullptr, color, sensor_gain, true, apply_tone,
+    SuppressFalseColorImpl(nullptr, color, nr_gain, true, apply_tone,
                            bayer, nullptr, nullptr, false, output_format,
-                           wb.DisplayExposure(), nv12);
+                           wb.DisplayExposure(), nv12, luma_eps_factor);
   const auto t3 = std::chrono::steady_clock::now();
   const auto ms = [](std::chrono::steady_clock::duration d) {
     return std::chrono::duration<double, std::milli>(d).count();
@@ -12897,13 +13011,18 @@ struct IspFrameJob {
   // Fast modes only: the RAW already carries the FPGA BayerNR.
   bool raw_bayer_nr_done;
   RawMetadataRegion metadata_region;
+  // Fast modes only: RAW noise relative to an unbinned frame, see
+  // WhiteBalance::SetNrGainScale (kHalfResNrGainScale for half images).
+  double nr_gain_scale;
 
   IspFrameJob(
       cv::Mat &r, cv::Mat &o, const char *n, double gain = 1.0,
       BayerConversion b = BayerConversion::kColorBayerRg2Bgr,
-      bool nr_done = false, RawMetadataRegion region = {})
+      bool nr_done = false, RawMetadataRegion region = {},
+      double nr_scale = 1.0)
       : raw(&r), output(&o), name(n), sensor_gain(gain), bayer(b),
-        raw_bayer_nr_done(nr_done), metadata_region(region) {}
+        raw_bayer_nr_done(nr_done), metadata_region(region),
+        nr_gain_scale(nr_scale) {}
 };
 
 namespace detail {
@@ -12944,6 +13063,7 @@ class IspProcessor {
         CV_Assert(jobs[i].raw != nullptr && jobs[i].output != nullptr);
         dispatch[i].raw = jobs[i].raw;
         dispatch[i].output = jobs[i].output;
+        fast_wb_[i].SetNrGainScale(jobs[i].nr_gain_scale);
         dispatch[i].wb = &fast_wb_[i];
         dispatch[i].name = jobs[i].name;
         dispatch[i].sensor_gain = jobs[i].sensor_gain;
@@ -13299,34 +13419,37 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           // mirror+flip phase for C1/C4. Accept the marker, then latch both the
           // live version and its matching slot count for all parsing below.
           // The hardware family fixes the plane size negotiated at open, so
-          // only the software version and the quad/six-image marker of the
-          // same sensor family (02<->04, 03<->05) may change at run time.
+          // only the software version and the board code of the same sensor
+          // family (02<->04, 03<->05) may change at run time. Quad versus
+          // six-image is fixed by the serial (S0/A0 vs S6/A6).
           if (IsSmartSensProfile(prof) &&
               SensorFamilyHardwareVersion(ver0) ==
                   SensorFamilyHardwareVersion(prof.hardware_version) &&
               IsSupportedSmartSensFirmware(ver0, ver1)) {
             if (ver0 != frame_info.profile.hardware_version ||
                 ver1 != frame_info.profile.software_version) {
+              const bool hardware_changed =
+                  ver0 != frame_info.profile.hardware_version;
+              const bool six_image = IsSixImageSerial(fs.serial_num);
               frame_info.profile.hardware_version = ver0;
               frame_info.profile.software_version = ver1;
+              // Leave an S2/S1 name alone; quad and six-image SKUs take the
+              // board from column 0.
+              const int serial_cameras =
+                  SmartSensCameraCountFromSerial(fs.serial_num);
+              const bool lane_sku = serial_cameras != 1 && serial_cameras != 2;
+              if (lane_sku &&
+                  (hardware_changed ||
+                   frame_info.profile.name == kProfileSmartSensSix.name ||
+                   frame_info.profile.name == kProfileAr0234Six.name)) {
+                if (const char *mode = CameraModeName(ver0, six_image))
+                  frame_info.profile.name = mode;
+              }
               std::cout << "[api] SmartSens firmware from metadata: "
                         << ver0 << "/" << ver1;
-              if (IsSmartSensHalfResLaneLayout(ver0, ver1))
-                std::cout << (IsAr0234FamilyHardware(ver0)
-                                  ? " (six-image AR0234)"
-                                  : " (six-image SC136HGS)");
+              if (const char *mode = CameraModeName(ver0, six_image))
+                std::cout << " " << mode;
               std::cout << std::endl;
-              const int serial_cameras =
-                  Ar0234CameraCountFromSerial(fs.serial_num);
-              if (IsAr0234FamilyHardware(ver0) && serial_cameras != 0 &&
-                  (serial_cameras == 6) != IsSixCamHardware(ver0)) {
-                std::cout << "[api] WARNING: serial " << fs.serial_num
-                          << " is a " << serial_cameras
-                          << "-camera AR0234 SKU but the FPGA reports "
-                          << (IsSixCamHardware(ver0) ? "six" : "four")
-                          << "-camera firmware (" << ver0 << "/" << ver1
-                          << "); following the metadata" << std::endl;
-              }
             }
             frame_info.profile.imu_samples_per_frame =
                 smartsens_layout.imu_samples_per_frame;
@@ -13589,7 +13712,11 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             fs.c56_camera_temperature[c] = 0.0;
             fs.c56_camera_gain[c] = 0.0;
           }
-          if (ver0 == kSc136SixCamHardwareVersion &&
+          // C5/C6 exist only on V1.6 six-image units; V1.6 quad carries
+          // pixels in these columns under the same column-0 value.
+          const bool v16_six_image =
+              IsV16BoardHardware(ver0) && IsSixImageSerial(fs.serial_num);
+          if (v16_six_image && ver0 == kSc136V16HardwareVersion &&
               smartsens_layout.has_ae_telemetry &&
               lo_plane->cols >= kSixCamC56EndCol &&
               (meta_u(kSixCamC56MarkerCol) >> 8) == kSixCamC56MarkerHigh) {
@@ -13605,7 +13732,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
                   ((traw >> 8) * 8 + (traw & 0x7)) / 4.0 - 273.15;
               fs.c56_camera_gain[c] = meta_u(kSixCamC56GainCol + c) / 64.0;
             }
-          } else if (ver0 == kAr0234SixCamHardwareVersion &&
+          } else if (v16_six_image && ver0 == kAr0234V16HardwareVersion &&
                      lo_plane->cols >= kAr0234SixCamC56EndCol &&
                      (meta_u(kSixCamC56MarkerCol) >> 8) == kSixCamC56MarkerHigh) {
             const int marker = meta_u(kSixCamC56MarkerCol);
