@@ -1563,6 +1563,7 @@ struct device {
     fx3_stats_have_prev = true;
 
     poll_fx3_prot_stats();
+    poll_fx3_skew_stats();
   }
 
   // XU selector 8 (firmware 2026-11+): USB3 protocol-layer flags of the
@@ -1650,6 +1651,103 @@ struct device {
     for (int i = 0; i < 8; ++i)
       fx3_prot_prev[i] = v[i];
     fx3_prot_have_prev = true;
+  }
+
+  // XU selector 9 (firmware 2026-11-02+): producer-socket skew self-check.
+  // A skew swaps every chunk pair of the frame (888 px band shifts every
+  // ~3.7 rows on AR0234) without changing the frame size, so only the device
+  // can see it.  The per-frame log covers the first frames after the restart
+  // that preceded the first detection (or the latest restart if none), to
+  // find what created the skew.  Layout: uvc.h CY_FX_UVC_XU_SKEW_STATS_*.
+  static constexpr uint8_t kFx3XuSkewStatsSelector = 9;
+  static constexpr int kFx3SkewStatsLen = 64;
+  bool fx3_skew_supported = true;
+  bool fx3_skew_have_prev = false;
+  uint32_t fx3_skew_prev[4] = {0, 0, 0, 0};
+
+  void poll_fx3_skew_stats() {
+    if (!fx3_skew_supported)
+      return;
+    uint8_t data[kFx3SkewStatsLen] = {0};
+    {
+      std::lock_guard<std::mutex> lock(device_mutex);
+      if (fd == -1 || !is_capturing)
+        return;
+      const xu stats_xu{kFx3XuUnit, 0, {}};
+      if (!xu_control_query(stats_xu, kFx3XuSkewStatsSelector, UVC_GET_CUR,
+                            sizeof(data), data)) {
+        if (last_xu_errno == ETIMEDOUT) {
+          fx3_unresponsive = true;
+          return;
+        }
+        std::cout << "[fx3-skew] socket-skew stats XU not available "
+                     "(firmware without selector 9), disabling" << std::endl;
+        fx3_skew_supported = false;
+        return;
+      }
+    }
+    uint32_t v[kFx3SkewStatsLen / 4];
+    for (int i = 0; i < kFx3SkewStatsLen / 4; ++i)
+      v[i] = static_cast<uint32_t>(data[i * 4]) |
+             (static_cast<uint32_t>(data[i * 4 + 1]) << 8) |
+             (static_cast<uint32_t>(data[i * 4 + 2]) << 16) |
+             (static_cast<uint32_t>(data[i * 4 + 3]) << 24);
+    if ((v[0] & 0xFF) != 1) {
+      std::cout << "[fx3-skew] unknown schema word0=0x" << std::hex << v[0]
+                << std::dec << ", disabling" << std::endl;
+      fx3_skew_supported = false;
+      return;
+    }
+    const bool frozen = (v[0] >> 8) & 1;
+    const uint32_t skew_resync = v[0] >> 16;
+    const uint32_t start_gpif_running = v[5] & 0xFFFF;
+    std::cout << "[fx3-skew] skew_resync=" << skew_resync
+              << " suspect_frames=" << v[1] << " zero_events=" << v[2]
+              << " full_buf_ends=" << (v[3] & 0xFFFF)
+              << " gpif_other=" << (v[3] >> 16)
+              << " starts=" << (v[4] & 0xFFFF)
+              << " resyncs=" << (v[4] >> 16)
+              << " start_with_gpif_running=" << start_gpif_running
+              << std::hex << " start_gpif_state=0x" << ((v[5] >> 16) & 0xFF)
+              << " resync_gpif_state=0x" << (v[5] >> 24) << std::dec
+              << " zero_count_bufs=" << (v[7] >> 24);
+    if (skew_resync > 0)
+      std::cout << " last_detect_frame=" << (v[6] & 0xFFFF)
+                << " zero_in_frame=" << (v[6] >> 16);
+    std::cout << std::endl;
+
+    // The frame log only changes on a restart or a detection; print it the
+    // first time, and whenever a skew / unexpected GPIF start shows up.
+    const bool changed = !fx3_skew_have_prev || skew_resync != fx3_skew_prev[0] ||
+                         v[1] != fx3_skew_prev[1] ||
+                         start_gpif_running != fx3_skew_prev[2] ||
+                         (v[3] >> 16) != fx3_skew_prev[3];
+    if (changed) {
+      const uint32_t kind = (v[7] >> 16) & 0xFF;
+      std::cout << "[fx3-skew] " << (frozen ? "FROZEN log (skew detected)"
+                                            : "log of latest restart")
+                << " kind=" << (kind == 1 ? "start" : "resync")
+                << std::hex << "(0x" << kind << std::dec << ")"
+                << " frames_since=" << (v[7] & 0xFFFF) << ":";
+      static const char* const kEnd[8] = {"none", "PART0", "PART1", "FULL0",
+                                          "FULL1", "?5", "?6", "other"};
+      for (int i = 0; i < 8; ++i) {
+        const uint32_t r = v[8 + i];
+        if (r == 0)
+          break;
+        std::cout << " #" << i << "{c=" << (r & 0x3FF)
+                  << " z=" << ((r >> 10) & 0x1FF)
+                  << " end=" << kEnd[(r >> 19) & 7]
+                  << " ends=" << ((r >> 22) & 3)
+                  << " eof=" << (((r >> 24) & 0xFF) * 128) << "}";
+      }
+      std::cout << std::endl;
+    }
+    fx3_skew_prev[0] = skew_resync;
+    fx3_skew_prev[1] = v[1];
+    fx3_skew_prev[2] = start_gpif_running;
+    fx3_skew_prev[3] = v[3] >> 16;
+    fx3_skew_have_prev = true;
   }
 
   void start_streaming() {
