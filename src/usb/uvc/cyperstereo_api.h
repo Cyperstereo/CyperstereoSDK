@@ -500,6 +500,68 @@ inline void SplitAndVBinHalfResLanes(const cv::Mat &lane2, const cv::Mat &lane3,
 // IspFrameJob::nr_gain_scale for the SplitAndVBinHalfResLanes images:
 // noise std of the 2x(H) * 2x(V) binned RAW relative to the full-res RAW.
 constexpr double kHalfResNrGainScale = 0.6;
+// Same for the horizontally binned only halves: sqrt(3^2 + 1^2) / 4.
+constexpr double kHalfResTallNrGainScale = 0.8;
+
+// Default ON: run the ISP on the (cam_width/2) x frame_height halves exactly
+// as the FPGA delivers them (horizontal 2:1 bin only), then area-average the
+// colour image 2:1 vertically, instead of binning the RAW vertically before
+// the demosaic.  Set CYPERSTEREO_HALF_DEMOSAIC_FIRST=0 to restore the RAW
+// vertical bin.  Output row k is centred on source rows 2k+0.5 in both
+// modes, so the image geometry (and any calibration) is unchanged.  ISP cost
+// of the four halves roughly doubles.
+inline bool HalfResDemosaicFirstEnabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("CYPERSTEREO_HALF_DEMOSAIC_FIRST");
+    const bool off =
+        v && (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+              std::strcmp(v, "FALSE") == 0 || std::strcmp(v, "off") == 0 ||
+              std::strcmp(v, "OFF") == 0);
+    return !off;
+  }();
+  return enabled;
+}
+
+// Per-stream state for the four six-image halves.  Usage per frame:
+//   Split(lane2, lane3, raw);                     // raw: binned RAW (always)
+//   ISP job i: IspRaw(raw, i) -> IspColor(color, i), NrGainScale()
+//   Finish(color);                                // color: final half images
+// raw[] always receives the vertically binned RAW so preview, saving and
+// publishing keep their (cam_width/2) x (frame_height/2) RAW.
+struct HalfResIspPlanes {
+  const bool demosaic_first = HalfResDemosaicFirstEnabled();
+  cv::Mat tall_raw[4];
+  cv::Mat tall_color[4];
+
+  void Split(const cv::Mat &lane2, const cv::Mat &lane3, cv::Mat raw[4]) {
+    if (!demosaic_first) {
+      SplitAndVBinHalfResLanes(lane2, lane3, raw);
+      return;
+    }
+    SplitHalfResLanes(lane2, lane3, tall_raw);
+    for (int i = 0; i < 4; ++i) BayerVBin2SameColor(tall_raw[i], raw[i]);
+  }
+  cv::Mat &IspRaw(cv::Mat raw[4], int i) {
+    return demosaic_first ? tall_raw[i] : raw[i];
+  }
+  cv::Mat &IspColor(cv::Mat color[4], int i) {
+    return demosaic_first ? tall_color[i] : color[i];
+  }
+  double NrGainScale() const {
+    return demosaic_first ? kHalfResTallNrGainScale : kHalfResNrGainScale;
+  }
+  // Writes into color[i]'s existing buffer when it already has the output
+  // size and type (ROS message buffers rely on this).
+  void Finish(cv::Mat color[4]) {
+    if (!demosaic_first) return;
+    for (int i = 0; i < 4; ++i) {
+      const cv::Mat &src = tall_color[i];
+      CV_Assert((src.rows & 1) == 0);
+      cv::resize(src, color[i], cv::Size(src.cols, src.rows / 2), 0, 0,
+                 cv::INTER_AREA);
+    }
+  }
+};
 
 // image5 is half-camera C5 (quarter[2]). Flip it vertically after demosaic:
 // doing it on the RAW would turn RGGB/BGGR into a phase this ISP does not

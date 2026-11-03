@@ -129,6 +129,7 @@ public:
         cv::Mat right_front_image(profile.frame_height, profile.cam_width, CV_8U);
         cv::Mat left_color, right_color, left_front_color, right_front_color;
         cv::Mat half_raw[4], half_color[4];
+        HalfResIspPlanes half_planes;
         IspProcessor isp(CameraBgrIspMode()), half_isp(isp.mode());
         std::unique_ptr<SixCameraIspProcessor> six_isp;
         const bool use_six_scheduler = isp.UsesFastBalanced() &&
@@ -206,14 +207,15 @@ public:
                         halves.camera[half_order[3]]);
                     six_announced = true;
                 }
-                SplitAndVBinHalfResLanes(left_front_image, right_front_image, half_raw);
+                half_planes.Split(left_front_image, right_front_image, half_raw);
+                const double half_nr = half_planes.NrGainScale();
                 const IspFrameJob jobs[] = {
                     {left_image, left_color, "cam1", camera_gain[0], SelectDeliveredPlaneBayer(hardware_version, software_version, 0), fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
                     {right_image, right_color, "cam2", camera_gain[1], SelectDeliveredPlaneBayer(hardware_version, software_version, 1), fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
-                    {half_raw[0], half_color[0], halves.name[0], halves.gain[0], halves.bayer[0], false, {}, kHalfResNrGainScale},
-                    {half_raw[1], half_color[1], halves.name[1], halves.gain[1], halves.bayer[1], false, {}, kHalfResNrGainScale},
-                    {half_raw[2], half_color[2], halves.name[2], halves.gain[2], halves.bayer[2], false, {}, kHalfResNrGainScale},
-                    {half_raw[3], half_color[3], halves.name[3], halves.gain[3], halves.bayer[3], false, {}, kHalfResNrGainScale}};
+                    {half_planes.IspRaw(half_raw, 0), half_planes.IspColor(half_color, 0), halves.name[0], halves.gain[0], halves.bayer[0], false, {}, half_nr},
+                    {half_planes.IspRaw(half_raw, 1), half_planes.IspColor(half_color, 1), halves.name[1], halves.gain[1], halves.bayer[1], false, {}, half_nr},
+                    {half_planes.IspRaw(half_raw, 2), half_planes.IspColor(half_color, 2), halves.name[2], halves.gain[2], halves.bayer[2], false, {}, half_nr},
+                    {half_planes.IspRaw(half_raw, 3), half_planes.IspColor(half_color, 3), halves.name[3], halves.gain[3], halves.bayer[3], false, {}, half_nr}};
                 if (use_six_scheduler) {
                     if (!six_isp) six_isp.reset(new SixCameraIspProcessor());
                     six_isp->Apply(jobs);
@@ -221,6 +223,7 @@ public:
                     isp.ApplyParallel(jobs, 2);
                     half_isp.ApplyParallel(jobs + 2, 4);
                 }
+                half_planes.Finish(half_color);
                 OrientSixImageHalves(hardware_version, half_raw, half_color);
                 const cv::Mat *color[6] = {&left_color, &right_color,
                     &half_color[half_order[0]], &half_color[half_order[1]],

@@ -565,6 +565,7 @@ static int run(int argc, char *argv[]) {
       !FastEnvTruthy("CYPERSTEREO_DISABLE_SIX_CAMERA_ISP");
   cv::Mat half_raw[4];
   cv::Mat half_color[4];
+  HalfResIspPlanes half_planes;
   for (int i = 0; i < 4; ++i) {
     half_color[i].create(SmartSensHalfResHeight(profile.frame_height),
                          SmartSensHalfResWidth(profile.cam_width), color_type);
@@ -734,8 +735,12 @@ static int run(int argc, char *argv[]) {
                     << "h/C" << halves.camera[1] << "h/C" << halves.camera[2]
                     << "h/C" << halves.camera[3] << "h "
                     << half_color[0].cols << "x" << half_color[0].rows
-                    << " (RAW vbin " << left_front_image.rows << "->"
-                    << half_color[0].rows << ")" << std::endl;
+                    << (half_planes.demosaic_first
+                            ? " (demosaic " : " (RAW vbin ")
+                    << left_front_image.rows << "->"
+                    << half_color[0].rows
+                    << (half_planes.demosaic_first ? " rows, area)" : ")")
+                    << std::endl;
           half_res_announced = true;
           if (show_preview && n_windows != 6) {
             cv::destroyWindow("image3");
@@ -759,9 +764,14 @@ static int run(int argc, char *argv[]) {
                image2_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
           });
         }
-        SplitAndVBinHalfResLanes(left_front_image, right_front_image, half_raw);
+        half_planes.Split(left_front_image, right_front_image, half_raw);
         const BayerConversion *cam_bayer = halves.bayer;
         const double *cam_gain = halves.gain;
+        const double half_nr = half_planes.NrGainScale();
+        cv::Mat &hr0 = half_planes.IspRaw(half_raw, 0), &hc0 = half_planes.IspColor(half_color, 0);
+        cv::Mat &hr1 = half_planes.IspRaw(half_raw, 1), &hc1 = half_planes.IspColor(half_color, 1);
+        cv::Mat &hr2 = half_planes.IspRaw(half_raw, 2), &hc2 = half_planes.IspColor(half_color, 2);
+        cv::Mat &hr3 = half_planes.IspRaw(half_raw, 3), &hc3 = half_planes.IspColor(half_color, 3);
         // The FPGA leaves the half lanes unfiltered (nr_active = 0), and they
         // carry no metadata row, so the host NR runs and no region is masked.
         if (six_this_frame) {
@@ -773,19 +783,20 @@ static int run(int argc, char *argv[]) {
                fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
               {right_image, right_color, "cam2", isp_camera_gain[1], image2_bayer,
                fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
-              {half_raw[0], half_color[0], halves.name[0], cam_gain[0], cam_bayer[0], false, {}, kHalfResNrGainScale},
-              {half_raw[1], half_color[1], halves.name[1], cam_gain[1], cam_bayer[1], false, {}, kHalfResNrGainScale},
-              {half_raw[2], half_color[2], halves.name[2], cam_gain[2], cam_bayer[2], false, {}, kHalfResNrGainScale},
-              {half_raw[3], half_color[3], halves.name[3], cam_gain[3], cam_bayer[3], false, {}, kHalfResNrGainScale}};
+              {hr0, hc0, halves.name[0], cam_gain[0], cam_bayer[0], false, {}, half_nr},
+              {hr1, hc1, halves.name[1], cam_gain[1], cam_bayer[1], false, {}, half_nr},
+              {hr2, hc2, halves.name[2], cam_gain[2], cam_bayer[2], false, {}, half_nr},
+              {hr3, hc3, halves.name[3], cam_gain[3], cam_bayer[3], false, {}, half_nr}};
           six_isp->Apply(jobs);
         } else {
           half_isp.ApplyParallel({
-              {half_raw[0], half_color[0], halves.name[0], cam_gain[0], cam_bayer[0], false, {}, kHalfResNrGainScale},
-              {half_raw[1], half_color[1], halves.name[1], cam_gain[1], cam_bayer[1], false, {}, kHalfResNrGainScale},
-              {half_raw[2], half_color[2], halves.name[2], cam_gain[2], cam_bayer[2], false, {}, kHalfResNrGainScale},
-              {half_raw[3], half_color[3], halves.name[3], cam_gain[3], cam_bayer[3], false, {}, kHalfResNrGainScale},
+              {hr0, hc0, halves.name[0], cam_gain[0], cam_bayer[0], false, {}, half_nr},
+              {hr1, hc1, halves.name[1], cam_gain[1], cam_bayer[1], false, {}, half_nr},
+              {hr2, hc2, halves.name[2], cam_gain[2], cam_bayer[2], false, {}, half_nr},
+              {hr3, hc3, halves.name[3], cam_gain[3], cam_bayer[3], false, {}, half_nr},
           });
         }
+        half_planes.Finish(half_color);
         OrientSixImageHalves(hardware_version, half_raw, half_color);
         // V1.6: half_isp slots 2/3 are physical C5/C6, same digital exposure
         // as image1.

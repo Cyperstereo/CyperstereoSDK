@@ -341,6 +341,7 @@ void DataFlow() {
   const bool use_six_scheduler = use_fast_balanced &&
       !FastEnvTruthy("CYPERSTEREO_DISABLE_SIX_CAMERA_ISP");
   cv::Mat half_raw[4], half_color[4];
+  HalfResIspPlanes half_planes;
   bool half_res_announced = false;
   std::cout << "ISP mode: "
             << (use_fast_balanced ? "fast-balanced" : "quality-reference")
@@ -496,29 +497,35 @@ void DataFlow() {
                 record.hardware_version, record.software_version,
                 record.camera_gain, record.fpga_bayer_nr, record.raw_telemetry);
             if (half_res_lanes) {
-              SplitAndVBinHalfResLanes(imgs[2], imgs[3], half_raw);
+              half_planes.Split(imgs[2], imgs[3], half_raw);
               const uint32_t hw = record.hardware_version;
               const uint32_t sw = record.software_version;
+              const double half_nr = half_planes.NrGainScale();
+              cv::Mat &hr0 = half_planes.IspRaw(half_raw, 0), &hc0 = half_planes.IspColor(half_color, 0);
+              cv::Mat &hr1 = half_planes.IspRaw(half_raw, 1), &hc1 = half_planes.IspColor(half_color, 1);
+              cv::Mat &hr2 = half_planes.IspRaw(half_raw, 2), &hc2 = half_planes.IspColor(half_color, 2);
+              cv::Mat &hr3 = half_planes.IspRaw(half_raw, 3), &hc3 = half_planes.IspColor(half_color, 3);
               if (six) {
                 if (!six_isp) six_isp.reset(new SixCameraIspProcessor());
                 IspFrameJob jobs[] = {
                   {left_image,left_color,"cam1",record.camera_gain[0],SelectDeliveredPlaneBayer(hw,sw,0),record.fpga_bayer_nr[0],record.raw_telemetry.RegionForPlane(0)},
                   {right_image,right_color,"cam2",record.camera_gain[1],SelectDeliveredPlaneBayer(hw,sw,1),record.fpga_bayer_nr[1],record.raw_telemetry.RegionForPlane(1)},
-                  {half_raw[0],half_color[0],halves.name[0],halves.gain[0],halves.bayer[0], false, {}, kHalfResNrGainScale},
-                  {half_raw[1],half_color[1],halves.name[1],halves.gain[1],halves.bayer[1], false, {}, kHalfResNrGainScale},
-                  {half_raw[2],half_color[2],halves.name[2],halves.gain[2],halves.bayer[2], false, {}, kHalfResNrGainScale},
-                  {half_raw[3],half_color[3],halves.name[3],halves.gain[3],halves.bayer[3], false, {}, kHalfResNrGainScale}};
+                  {hr0,hc0,halves.name[0],halves.gain[0],halves.bayer[0], false, {}, half_nr},
+                  {hr1,hc1,halves.name[1],halves.gain[1],halves.bayer[1], false, {}, half_nr},
+                  {hr2,hc2,halves.name[2],halves.gain[2],halves.bayer[2], false, {}, half_nr},
+                  {hr3,hc3,halves.name[3],halves.gain[3],halves.bayer[3], false, {}, half_nr}};
                 six_isp->Apply(jobs);
               } else half_isp.ApplyParallel({
-                  {half_raw[0], half_color[0], halves.name[0], halves.gain[0],
-                   halves.bayer[0], false, {}, kHalfResNrGainScale},
-                  {half_raw[1], half_color[1], halves.name[1], halves.gain[1],
-                   halves.bayer[1], false, {}, kHalfResNrGainScale},
-                  {half_raw[2], half_color[2], halves.name[2], halves.gain[2],
-                   halves.bayer[2], false, {}, kHalfResNrGainScale},
-                  {half_raw[3], half_color[3], halves.name[3], halves.gain[3],
-                   halves.bayer[3], false, {}, kHalfResNrGainScale},
+                  {hr0, hc0, halves.name[0], halves.gain[0],
+                   halves.bayer[0], false, {}, half_nr},
+                  {hr1, hc1, halves.name[1], halves.gain[1],
+                   halves.bayer[1], false, {}, half_nr},
+                  {hr2, hc2, halves.name[2], halves.gain[2],
+                   halves.bayer[2], false, {}, half_nr},
+                  {hr3, hc3, halves.name[3], halves.gain[3],
+                   halves.bayer[3], false, {}, half_nr},
               });
+              half_planes.Finish(half_color);
               OrientSixImageHalves(hw, half_raw, half_color);
             }
             std::thread t2;
