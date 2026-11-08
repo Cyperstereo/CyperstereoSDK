@@ -503,13 +503,14 @@ constexpr double kHalfResNrGainScale = 0.6;
 // Same for the horizontally binned only halves: sqrt(3^2 + 1^2) / 4.
 constexpr double kHalfResTallNrGainScale = 0.8;
 
-// Default ON: run the ISP on the (cam_width/2) x frame_height halves exactly
-// as the FPGA delivers them (horizontal 2:1 bin only), then area-average the
-// colour image 2:1 vertically, instead of binning the RAW vertically before
-// the demosaic.  Set CYPERSTEREO_HALF_DEMOSAIC_FIRST=0 to restore the RAW
-// vertical bin.  Output row k is centred on source rows 2k+0.5 in both
-// modes, so the image geometry (and any calibration) is unchanged.  ISP cost
-// of the four halves roughly doubles.
+// Default ON: demosaic the (cam_width/2) x frame_height halves exactly as the
+// FPGA delivers them (horizontal 2:1 bin only), then average the demosaiced
+// rows 2:1 and run NR, tone and output at half height (IspFrameJob::
+// half_height), instead of binning the RAW vertically before the demosaic.
+// Set CYPERSTEREO_HALF_DEMOSAIC_FIRST=0 to restore the RAW vertical bin.
+// Output row k is centred on source rows 2k+0.5 in both modes, so the image
+// geometry (and any calibration) is unchanged.  Only the demosaic front end
+// runs at full height.
 inline bool HalfResDemosaicFirstEnabled() {
   static const bool enabled = [] {
     const char *v = std::getenv("CYPERSTEREO_HALF_DEMOSAIC_FIRST");
@@ -524,14 +525,14 @@ inline bool HalfResDemosaicFirstEnabled() {
 
 // Per-stream state for the four six-image halves.  Usage per frame:
 //   Split(lane2, lane3, raw);                     // raw: binned RAW (always)
-//   ISP job i: IspRaw(raw, i) -> IspColor(color, i), NrGainScale()
-//   Finish(color);                                // color: final half images
-// raw[] always receives the vertically binned RAW so preview, saving and
-// publishing keep their (cam_width/2) x (frame_height/2) RAW.
+//   ISP job i: IspRaw(raw, i) -> color[i], NrGainScale(),
+//              half_height = demosaic_first
+// color[i] is the final half image in both modes.  raw[] always receives the
+// vertically binned RAW so preview, saving and publishing keep their
+// (cam_width/2) x (frame_height/2) RAW.
 struct HalfResIspPlanes {
   const bool demosaic_first = HalfResDemosaicFirstEnabled();
   cv::Mat tall_raw[4];
-  cv::Mat tall_color[4];
 
   void Split(const cv::Mat &lane2, const cv::Mat &lane3, cv::Mat raw[4]) {
     if (!demosaic_first) {
@@ -544,22 +545,10 @@ struct HalfResIspPlanes {
   cv::Mat &IspRaw(cv::Mat raw[4], int i) {
     return demosaic_first ? tall_raw[i] : raw[i];
   }
-  cv::Mat &IspColor(cv::Mat color[4], int i) {
-    return demosaic_first ? tall_color[i] : color[i];
-  }
+  // The front end (BayerNR) sees the tall RAW; the ISP lowers NR after the
+  // row average by kHalfHeightPostFrontNrRatio.
   double NrGainScale() const {
     return demosaic_first ? kHalfResTallNrGainScale : kHalfResNrGainScale;
-  }
-  // Writes into color[i]'s existing buffer when it already has the output
-  // size and type (ROS message buffers rely on this).
-  void Finish(cv::Mat color[4]) {
-    if (!demosaic_first) return;
-    for (int i = 0; i < 4; ++i) {
-      const cv::Mat &src = tall_color[i];
-      CV_Assert((src.rows & 1) == 0);
-      cv::resize(src, color[i], cv::Size(src.cols, src.rows / 2), 0, 0,
-                 cv::INTER_AREA);
-    }
   }
 };
 
@@ -11020,6 +11009,7 @@ struct SuppressFalseColorScratch {
   cv::Mat cr_med_h, cb_med_h;
   cv::Mat base_cr_q, base_cb_q;
   cv::Mat g5_tmp_full, g5_tmp_half;
+  cv::Mat y8_tall, cr_tall, cb_tall;  // front output before half_height
 #if (defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)) || \
     defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
   cv::Mat chroma_gauss_ring_cr, chroma_gauss_ring_cb;
@@ -11027,6 +11017,39 @@ struct SuppressFalseColorScratch {
   cv::Mat chroma_down_cr, chroma_down_cb;
 #endif
 };
+
+// dst row k = rounded mean of src rows 2k and 2k+1, byte by byte, so it is
+// valid for every 8-bit interleaved layout (gray, BGR, UYVY).
+inline void VerticalHalveRows(const cv::Mat &src, cv::Mat &dst) {
+  CV_Assert(src.depth() == CV_8U && (src.rows & 1) == 0);
+  CV_Assert(dst.data != src.data);
+  dst.create(src.rows / 2, src.cols, src.type());
+  const int bytes = src.cols * static_cast<int>(src.elemSize());
+  for (int y = 0; y < dst.rows; ++y) {
+    const uchar *a = src.ptr<uchar>(2 * y);
+    const uchar *b = src.ptr<uchar>(2 * y + 1);
+    uchar *d = dst.ptr<uchar>(y);
+    int x = 0;
+#if defined(CYPERSTEREO_HAVE_NEON)
+    for (; x + 16 <= bytes; x += 16)
+      vst1q_u8(d + x, vrhaddq_u8(vld1q_u8(a + x), vld1q_u8(b + x)));
+#elif defined(__SSE2__) || defined(_M_X64)
+    for (; x + 16 <= bytes; x += 16)
+      _mm_storeu_si128(
+          reinterpret_cast<__m128i *>(d + x),
+          _mm_avg_epu8(
+              _mm_loadu_si128(reinterpret_cast<const __m128i *>(a + x)),
+              _mm_loadu_si128(reinterpret_cast<const __m128i *>(b + x))));
+#endif
+    for (; x < bytes; ++x)
+      d[x] = static_cast<uchar>((a[x] + b[x] + 1) >> 1);
+  }
+}
+
+// half_height: noise left after averaging two demosaiced rows, relative to
+// the tall RAW the front end (BayerNR) saw.
+constexpr double kHalfHeightPostFrontNrRatio =
+    kHalfResNrGainScale / kHalfResTallNrGainScale;
 
 inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
                                    double sensor_gain = 1.0,
@@ -11041,12 +11064,19 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
                                        IspPixelFormat::kBgr888,
                                    double exposure_scale = 1.0,
                                    const IspNv12Target *nv12 = nullptr,
-                                   double luma_eps_factor = 1.0) {
+                                   double luma_eps_factor = 1.0,
+                                   bool half_height = false) {
 #if !defined(CYPERSTEREO_HAVE_NEON) || !defined(__aarch64__)
   (void)stream_wb;
   (void)stream_bayer_nr;
 #endif
   CV_Assert(raw_wb == nullptr || stream_raw == nullptr);
+  // half_height: demosaic the RAW at full height, average the front-end
+  // luma/chroma rows 2:1, and run NR, tone and output at half height.
+  const cv::Mat *front_raw = raw_wb ? raw_wb : stream_raw;
+  CV_Assert(!half_height ||
+            (front_raw && (front_raw->rows & 7) == 0 &&
+             (front_raw->cols & 3) == 0));
   CV_Assert(output_format == IspPixelFormat::kBgr888 ||
             output_format == IspPixelFormat::kUyvy422Bt601FullRange);
   const bool output_uyvy =
@@ -11092,9 +11122,9 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
 #endif
 
   const int output_type = output_uyvy ? CV_8UC2 : CV_8UC3;
-  if (raw_wb) color.create(raw_wb->rows, raw_wb->cols, output_type);
-  if (stream_raw)
-    color.create(stream_raw->rows, stream_raw->cols, output_type);
+  if (front_raw)
+    color.create(front_raw->rows >> (half_height ? 1 : 0), front_raw->cols,
+                 output_type);
   // With neither raw source, `color` is the materialized BGR input for the
   // front end.  It is reallocated to CV_8UC2 only after all internal planes
   // have been derived.
@@ -11147,9 +11177,15 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
     // Luma NR saturates at 8x: stronger guided smoothing above it was
     // measured to trade edge contrast for grain one-for-one.
     sensor_gain = (std::min)(sensor_gain, 8.0);
+  }
+  const double front_gain = sensor_gain;
+  if (half_height) {
+    sensor_gain = (std::max)(1.0, sensor_gain * kHalfHeightPostFrontNrRatio);
+    luma_eps_factor *= kHalfHeightPostFrontNrRatio * kHalfHeightPostFrontNrRatio;
+  }
+  if (linear_input)
     gain_t_q8 = static_cast<int>(
         (sensor_gain - 1.0) * (256.0 / 7.0) + 0.5);
-  }
   const FastBalancedToneLuts *tone_luts =
       apply_tone ? &GetFastBalancedToneLuts() : nullptr;
   int guided_strength_q8 =
@@ -11169,31 +11205,46 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   const bool fused_front = UseFusedFront();
   const bool have_chroma =
       raw_wb != nullptr || stream_raw != nullptr || fused_front;
+  cv::Mat &front_y = half_height ? scratch.y8_tall : y8;
+  cv::Mat &front_cr = half_height ? scratch.cr_tall : ch_h[1];
+  cv::Mat &front_cb = half_height ? scratch.cb_tall : ch_h[2];
+  bool front_from_raw = false;
 #if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
   if (stream_raw) {
     CV_Assert(stream_wb != nullptr && !stream_bayer_nr);
-    stream_wb->ApplyStreamedDemosaicFrontAvx2(*stream_raw, y8, ch_h[1],
-                                              ch_h[2], raw_bayer);
+    stream_wb->ApplyStreamedDemosaicFrontAvx2(*stream_raw, front_y, front_cr,
+                                              front_cb, raw_bayer);
+    front_from_raw = true;
   } else if (raw_wb) {
-    FusedDemosaicFrontAvx2(*raw_wb, y8, ch_h[1], ch_h[2], raw_bayer);
+    FusedDemosaicFrontAvx2(*raw_wb, front_y, front_cr, front_cb, raw_bayer);
+    front_from_raw = true;
   } else
 #elif defined(CYPERSTEREO_HAVE_NEON)
 #if defined(__aarch64__)
   if (stream_raw) {
     CV_Assert(stream_wb != nullptr);
     stream_wb->ApplyStreamedDemosaicFrontNeon(
-        *stream_raw, y8, ch_h[1], ch_h[2], sensor_gain,
+        *stream_raw, front_y, front_cr, front_cb, front_gain,
         stream_bayer_nr, raw_bayer);
+    front_from_raw = true;
   } else
 #endif
   if (raw_wb) {
-    FusedDemosaicFrontNeon(*raw_wb, y8, ch_h[1], ch_h[2], raw_bayer);
+    FusedDemosaicFrontNeon(*raw_wb, front_y, front_cr, front_cb, raw_bayer);
+    front_from_raw = true;
   } else
 #endif
   if (fused_front) {
     FusedFrontYCbCr420(color, y8, ch_h[1], ch_h[2]);
   } else {
     cv::cvtColor(color, y8, cv::COLOR_BGR2GRAY);
+  }
+  (void)front_gain;
+  if (half_height) {
+    CV_Assert(front_from_raw);
+    VerticalHalveRows(front_y, y8);
+    VerticalHalveRows(front_cr, ch_h[1]);
+    VerticalHalveRows(front_cb, ch_h[2]);
   }
   const auto detail_t1 = detail_now();
 
@@ -12468,7 +12519,7 @@ inline void ApplyFastBalancedISPImplCore(
     cv::Mat &raw, cv::Mat &color, WhiteBalance &wb, const char *name,
     double sensor_gain, BayerConversion bayer,
     IspPixelFormat output_format, bool raw_bayer_nr_done,
-    const IspNv12Target *nv12);
+    const IspNv12Target *nv12, bool half_height);
 
 // Radial lens-shading gain for the AR0234 + 7761 fisheye module, measured on
 // three cameras from flat-wall RAW frames (relative illumination vs image
@@ -12547,18 +12598,21 @@ inline void ApplyFastBalancedISPImpl(
     double sensor_gain, BayerConversion bayer,
     IspPixelFormat output_format, bool raw_bayer_nr_done = false,
     RawMetadataRegion metadata_region = {},
-    const IspNv12Target *nv12 = nullptr) {
+    const IspNv12Target *nv12 = nullptr, bool half_height = false) {
   // All front ends share one repaired row; the original RAW stays immutable.
   wb.PrepareRawMetadata(raw, metadata_region);
   ApplyFastBalancedISPImplCore(raw, color, wb, name, sensor_gain, bayer,
-                               output_format, raw_bayer_nr_done, nv12);
+                               output_format, raw_bayer_nr_done, nv12,
+                               half_height);
 }
 
+// half_height: `color` (and `nv12`) receive raw.rows / 2 rows, each the mean
+// of two full-height rows. The demosaic still sees every RAW row.
 inline void ApplyFastBalancedISPImplCore(
     cv::Mat &raw, cv::Mat &color, WhiteBalance &wb, const char *name,
     double sensor_gain, BayerConversion bayer,
     IspPixelFormat output_format, bool raw_bayer_nr_done,
-    const IspNv12Target *nv12) {
+    const IspNv12Target *nv12, bool half_height) {
   CV_Assert(output_format == IspPixelFormat::kBgr888 ||
             output_format == IspPixelFormat::kUyvy422Bt601FullRange);
   if (output_format == IspPixelFormat::kUyvy422Bt601FullRange)
@@ -12613,12 +12667,39 @@ inline void ApplyFastBalancedISPImplCore(
 #endif
       (raw.cols & 3) == 0 && (raw.rows & 3) == 0;
   static thread_local cv::Mat raw_wb;
+#if (defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)) || \
+    defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
+  const bool half_front = half_height && fused_demosaic &&
+                          (raw.rows & 7) == 0 && (raw.cols & 3) == 0;
+#else
+  const bool half_front = false;
+#endif
+  if (half_height && !half_front) {
+    // No RAW-reading front end for this geometry/platform: finish at full
+    // height, then average the output rows.
+    static thread_local cv::Mat tall;
+    CV_Assert((raw.rows & 1) == 0);
+    ApplyFastBalancedISPImplCore(raw, tall, wb, name, sensor_gain, bayer,
+                                 output_format, raw_bayer_nr_done, nullptr,
+                                 false);
+    VerticalHalveRows(tall, color);
+#if defined(CYPERSTEREO_HAVE_NEON)
+    if (nv12) {
+      CV_Assert(output_format == IspPixelFormat::kBgr888);
+      for (int y = 0; y + 1 < color.rows; y += 2)
+        PackBgrRowsToNv12(color.ptr<uchar>(y), color.ptr<uchar>(y + 1),
+                          color.cols, y, *nv12);
+    }
+#endif
+    return;
+  }
 
   if (!IspProfiler::Enabled()) {
     if (streamed_wb_front) {
       SuppressFalseColorImpl(nullptr, color, nr_gain, true, apply_tone,
                              bayer, &raw, &wb, use_bayer_nr, output_format,
-                             wb.DisplayExposure(), nv12, luma_eps_factor);
+                             wb.DisplayExposure(), nv12, luma_eps_factor,
+                             half_front);
       return;
     }
     if (use_bayer_nr) {
@@ -12633,7 +12714,8 @@ inline void ApplyFastBalancedISPImplCore(
     if (fused_demosaic)
       SuppressFalseColorImpl(&raw_wb, color, nr_gain, true, apply_tone,
                              bayer, nullptr, nullptr, false, output_format,
-                             wb.DisplayExposure(), nv12, luma_eps_factor);
+                             wb.DisplayExposure(), nv12, luma_eps_factor,
+                             half_front);
     else {
       cv::cvtColor(raw_wb, color, bayer_code);
       SuppressFalseColorImpl(nullptr, color, nr_gain, true, apply_tone,
@@ -12647,7 +12729,8 @@ inline void ApplyFastBalancedISPImplCore(
   if (streamed_wb_front) {
     SuppressFalseColorImpl(nullptr, color, nr_gain, true, apply_tone,
                            bayer, &raw, &wb, use_bayer_nr, output_format,
-                           wb.DisplayExposure(), nv12, luma_eps_factor);
+                           wb.DisplayExposure(), nv12, luma_eps_factor,
+                           half_front);
     const auto t3 = std::chrono::steady_clock::now();
     const auto ms = [](std::chrono::steady_clock::duration d) {
       return std::chrono::duration<double, std::milli>(d).count();
@@ -12672,7 +12755,8 @@ inline void ApplyFastBalancedISPImplCore(
   if (fused_demosaic)
     SuppressFalseColorImpl(&raw_wb, color, nr_gain, true, apply_tone,
                            bayer, nullptr, nullptr, false, output_format,
-                           wb.DisplayExposure(), nv12, luma_eps_factor);
+                           wb.DisplayExposure(), nv12, luma_eps_factor,
+                           half_front);
   else
     SuppressFalseColorImpl(nullptr, color, nr_gain, true, apply_tone,
                            bayer, nullptr, nullptr, false, output_format,
@@ -12811,11 +12895,13 @@ class FastBalancedIspWorker {
               const char *name, double sensor_gain,
               BayerConversion bayer, int big_little_lane = -1,
               IspPixelFormat output_format = IspPixelFormat::kBgr888,
-              bool raw_bayer_nr_done = false, RawMetadataRegion metadata_region = {}) {
+              bool raw_bayer_nr_done = false, RawMetadataRegion metadata_region = {},
+              bool half_height = false) {
     std::unique_lock<std::mutex> lock(mutex_);
     done_.wait(lock, [this] { return !has_job_; });
     job_ = Job{&raw, &color, &wb, name, sensor_gain, bayer,
-               big_little_lane, output_format, raw_bayer_nr_done, metadata_region};
+               big_little_lane, output_format, raw_bayer_nr_done, metadata_region,
+               half_height};
     error_ = nullptr;
     has_job_ = true;
     lock.unlock();
@@ -12842,6 +12928,7 @@ class FastBalancedIspWorker {
     IspPixelFormat output_format;
     bool raw_bayer_nr_done;
     RawMetadataRegion metadata_region;
+    bool half_height;
   };
 
   void Run() {
@@ -12857,7 +12944,8 @@ class FastBalancedIspWorker {
         FastIspBigLittleLaneGuard lane_guard(job.big_little_lane);
         ApplyFastBalancedISPImpl(*job.raw, *job.color, *job.wb, job.name,
                                  job.sensor_gain, job.bayer,
-                                 job.output_format, job.raw_bayer_nr_done, job.metadata_region);
+                                 job.output_format, job.raw_bayer_nr_done, job.metadata_region,
+                                 nullptr, job.half_height);
       } catch (...) {
         error = std::current_exception();
       }
@@ -12926,6 +13014,7 @@ struct FastBalancedIspDispatchJob {
   IspPixelFormat output_format = IspPixelFormat::kBgr888;
   bool raw_bayer_nr_done = false;
   RawMetadataRegion metadata_region;
+  bool half_height = false;
 };
 
 inline void ApplyFastBalancedISPParallelImpl(
@@ -12968,14 +13057,16 @@ inline void ApplyFastBalancedISPParallelImpl(
                            jobs[i].name, jobs[i].sensor_gain, jobs[i].bayer,
                            big_little_batch ? i : -1,
                            jobs[i].output_format,
-                           jobs[i].raw_bayer_nr_done, jobs[i].metadata_region);
+                           jobs[i].raw_bayer_nr_done, jobs[i].metadata_region,
+                           jobs[i].half_height);
   std::exception_ptr caller_error;
   try {
     FastIspBigLittleLaneGuard lane_guard(big_little_batch ? 0 : -1);
     ApplyFastBalancedISPImpl(
         *jobs[0].raw, *jobs[0].output, *jobs[0].wb, jobs[0].name,
         jobs[0].sensor_gain, jobs[0].bayer, jobs[0].output_format,
-        jobs[0].raw_bayer_nr_done, jobs[0].metadata_region);
+        jobs[0].raw_bayer_nr_done, jobs[0].metadata_region, nullptr,
+        jobs[0].half_height);
   } catch (...) {
     caller_error = std::current_exception();
   }
@@ -13076,15 +13167,18 @@ struct IspFrameJob {
   // Fast modes only: RAW noise relative to an unbinned frame, see
   // WhiteBalance::SetNrGainScale (kHalfResNrGainScale for half images).
   double nr_gain_scale;
+  // Output has raw.rows / 2 rows: demosaic at full height, then average
+  // row pairs (HalfResIspPlanes demosaic-first halves).
+  bool half_height;
 
   IspFrameJob(
       cv::Mat &r, cv::Mat &o, const char *n, double gain = 1.0,
       BayerConversion b = BayerConversion::kColorBayerRg2Bgr,
       bool nr_done = false, RawMetadataRegion region = {},
-      double nr_scale = 1.0)
+      double nr_scale = 1.0, bool half = false)
       : raw(&r), output(&o), name(n), sensor_gain(gain), bayer(b),
         raw_bayer_nr_done(nr_done), metadata_region(region),
-        nr_gain_scale(nr_scale) {}
+        nr_gain_scale(nr_scale), half_height(half) {}
 };
 
 namespace detail {
@@ -13133,6 +13227,7 @@ class IspProcessor {
         dispatch[i].output_format = output_format;
         dispatch[i].raw_bayer_nr_done = jobs[i].raw_bayer_nr_done;
         dispatch[i].metadata_region = jobs[i].metadata_region;
+        dispatch[i].half_height = jobs[i].half_height;
       }
       detail::ApplyFastBalancedISPParallelImpl(dispatch.data(), n);
       return;
@@ -13149,13 +13244,18 @@ class IspProcessor {
                 jobs[i].name != nullptr);
       raws[i] = jobs[i].raw;
       regions[i] = jobs[i].metadata_region;
-      outputs[i] = jobs[i].output;
+      // The quality pipeline has no half-height mode: finish at full
+      // height, then average row pairs.
+      outputs[i] = jobs[i].half_height ? &quality_tall_[i] : jobs[i].output;
       names[i] = jobs[i].name;
       sensor_gains[i] = jobs[i].sensor_gain;
       bayers[i] = jobs[i].bayer;
     }
     detail::ApplyQualityReferenceISPParallel(
         raws, outputs, names, sensor_gains, bayers, n, regions);
+    for (int i = 0; i < n; ++i)
+      if (jobs[i].half_height)
+        VerticalHalveRows(quality_tall_[i], *jobs[i].output);
   }
   void ApplyParallel(std::initializer_list<IspFrameJob> jobs) {
     ApplyParallel(jobs.begin(), static_cast<int>(jobs.size()));
@@ -13172,6 +13272,7 @@ class IspProcessor {
  private:
   IspMode mode_;
   std::array<WhiteBalance, 4> fast_wb_{};
+  std::array<cv::Mat, 4> quality_tall_;
 };
 
 inline bool FastBalancedIspEnabled() {

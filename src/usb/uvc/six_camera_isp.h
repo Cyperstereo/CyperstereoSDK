@@ -67,7 +67,8 @@ class SixCameraIspProcessor {
     FastIspBigLittleLaneGuard helper(-1);
     wb_[index].SetNrGainScale(j.nr_gain_scale);
     ApplyFastBalancedISPImpl(*j.raw,*j.output,wb_[index],j.name,j.sensor_gain,
-        j.bayer,output_format_,j.raw_bayer_nr_done,j.metadata_region);
+        j.bayer,output_format_,j.raw_bayer_nr_done,j.metadata_region,
+        nullptr,j.half_height);
   }
   void Loop(int lane) {
     const int cpu=OwnerCpu(lane);

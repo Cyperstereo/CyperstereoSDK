@@ -207,13 +207,14 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < 4; ++i) half_color[half_order[i]] = color[2 + i];
         half_planes.Split(left_front_image, right_front_image, half_raw);
         const double half_nr = half_planes.NrGainScale();
+        const bool half_tall = half_planes.demosaic_first;
         const IspFrameJob jobs[] = {
             {left_image, color[0], "cam1", camera_gain[0], SelectDeliveredPlaneBayer(hardware_version, software_version, 0), fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
             {right_image, color[1], "cam2", camera_gain[1], SelectDeliveredPlaneBayer(hardware_version, software_version, 1), fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
-            {half_planes.IspRaw(half_raw, 0), half_planes.IspColor(half_color, 0), halves.name[0], halves.gain[0], halves.bayer[0], false, {}, half_nr},
-            {half_planes.IspRaw(half_raw, 1), half_planes.IspColor(half_color, 1), halves.name[1], halves.gain[1], halves.bayer[1], false, {}, half_nr},
-            {half_planes.IspRaw(half_raw, 2), half_planes.IspColor(half_color, 2), halves.name[2], halves.gain[2], halves.bayer[2], false, {}, half_nr},
-            {half_planes.IspRaw(half_raw, 3), half_planes.IspColor(half_color, 3), halves.name[3], halves.gain[3], halves.bayer[3], false, {}, half_nr}};
+            {half_planes.IspRaw(half_raw, 0), half_color[0], halves.name[0], halves.gain[0], halves.bayer[0], false, {}, half_nr, half_tall},
+            {half_planes.IspRaw(half_raw, 1), half_color[1], halves.name[1], halves.gain[1], halves.bayer[1], false, {}, half_nr, half_tall},
+            {half_planes.IspRaw(half_raw, 2), half_color[2], halves.name[2], halves.gain[2], halves.bayer[2], false, {}, half_nr, half_tall},
+            {half_planes.IspRaw(half_raw, 3), half_color[3], halves.name[3], halves.gain[3], halves.bayer[3], false, {}, half_nr, half_tall}};
         if (use_six_scheduler) {
           if (!six_isp) six_isp.reset(new SixCameraIspProcessor());
           six_isp->Apply(jobs);
@@ -221,7 +222,6 @@ int main(int argc, char *argv[]) {
           isp.ApplyParallel(jobs, 2);
           half_isp.ApplyParallel(jobs + 2, 4);
         }
-        half_planes.Finish(half_color);
         OrientSixImageHalves(hardware_version, half_raw, half_color);
         for (int i = 0; i < 4; ++i) color[2 + i] = half_color[half_order[i]];
       } else {
