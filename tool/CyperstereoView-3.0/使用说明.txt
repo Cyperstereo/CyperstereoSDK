@@ -1,0 +1,55 @@
+Cyperstereo View 3.0 正式版
+
+本包包含 Windows 程序、Linux 上位机源码，以及可直接用于升级的固件文件。
+不包含 FPGA 工程、FX3 固件工程，也不包含电路说明。
+
+一、Windows
+1. 双击 Windows\CyperstereoView.exe 打开图形界面。
+2. 顶部「连接相机」选择一台相机。多台同时接上时，一次只连接所选的那一台。
+3. 「图像」页可以查看、放大、保存图像，并读取或写入最大曝光、最大增益。写入后需要给相机断电再上电才会生效。
+4. 「固件升级」页可以选择 firmware 目录中的文件，或你自己的 .bit / .img。
+   建议先点「检查连接（不擦写）」。确认后再点「开始升级」。
+   升级不保留旧固件备份。擦写开始后不能取消，请保持供电，看到校验通过后再断电重启。
+5. 命令行（不打开界面）：
+   Windows\cyperstereo-cli.exe list
+   Windows\cyperstereo-cli.exe param info
+   Windows\cyperstereo-cli.exe param set --exposure-ms 15 --gain 4
+   Windows\cyperstereo-cli.exe param reset
+   Windows\cyperstereo-cli.exe fpga check
+   Windows\cyperstereo-cli.exe fpga program firmware\fpga_ar0234_six_aeparam.bit --accept-single-image-risk
+   Windows\cyperstereo-cli.exe fx3 check
+   Windows\cyperstereo-cli.exe fx3 program firmware\fx3_slave_ar0234_aeparam_v1.img --accept-single-image-risk
+   Windows\cyperstereo-cli.exe fx3 prepare firmware\fx3_slave_ar0234_aeparam_v1.img
+   接了多台相机时，在命令后加上 --device 序列号，例如 --device A600001。
+   prepare 只导出一份保留当前序列号的 FX3 镜像，不写入相机。
+
+二、Linux（x86_64 或 aarch64，Ubuntu 20.04+ / Debian 11+）
+1. 解压 Linux\CyperstereoView-3.0-linux.tar.gz。
+2. 在解压出的目录执行：
+   ./linux/build_linux.sh
+   需要 sudo 安装编译依赖。依赖已经装好时可以加 --no-deps。
+   同时安装桌面图标和设备权限：
+   ./linux/build_linux.sh --install
+   安装后重新插拔相机；若提示加入 video 组，注销一次再登录。
+3. 图形界面：
+   ./linux/run_cyperstereo.sh
+   或安装后从应用程序菜单打开 Cyperstereo View。
+4. 命令行不需要 Qt 和 OpenCV，只需要 python3：
+   ./linux/cyperstereo-cli.sh list
+   ./linux/cyperstereo-cli.sh param info
+   ./linux/cyperstereo-cli.sh param set --exposure-ms 15 --gain 4
+   ./linux/cyperstereo-cli.sh param reset
+   ./linux/cyperstereo-cli.sh fpga check
+   ./linux/cyperstereo-cli.sh fpga program firmware/fpga_ar0234_six_aeparam.bit --accept-single-image-risk
+   ./linux/cyperstereo-cli.sh fx3 check
+   ./linux/cyperstereo-cli.sh fx3 program firmware/fx3_slave_ar0234_aeparam_v1.img --accept-single-image-risk
+   ./linux/cyperstereo-cli.sh fx3 prepare firmware/fx3_slave_ar0234_aeparam_v1.img
+   多台相机时同样使用 --device 序列号。
+5. 升级过程中 Linux 会自动阻止休眠。
+
+三、固件文件
+请按相机型号选择。型号不对时程序会拒绝写入，除非在界面勾选强制覆盖，或命令行加上 --force-overwrite。
+
+四、说明
+最大曝光、最大增益写入后，重新上电才生效。
+本版在 Windows 上完成打包和测试。Linux 使用与 Windows 相同的命令，需要在 Linux 电脑上编译后使用。
