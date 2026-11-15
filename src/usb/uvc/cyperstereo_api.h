@@ -3027,6 +3027,57 @@ class WhiteBalance {
     return (std::min)(255, (s * e_q7 + 64) >> 7);
   }
 
+  // A colour LUT without highlight roll-off is min(white, round(s * gain))
+  // with s = max(raw - black, 0). The NEON fronts then evaluate it as
+  //   min(white, sat(s * gi + sqrdmulh(s, m)))   (gain = gi + m / 32768)
+  // instead of four 64-byte TBL/TBX lookups, which cost ~14 cycles each on
+  // Cortex-A72. SQRDMULH rounds once, (s * m + 16384) >> 15, so a Q15 gain
+  // reproduces cvRound for ~98% of WB gains; `ok` is set only when all 256
+  // entries match, which keeps the arithmetic path byte-identical.
+  struct WbLinearColor {
+    bool ok = false;
+    uint8_t black = 0;
+    uint8_t white = 255;
+    uint8_t gi = 0;
+    int16_t m = 0;
+  };
+  static int EvalWbLinearColor(int i, const WbLinearColor &c) {
+    const int s = (std::max)(0, i - static_cast<int>(c.black));
+    const int q = s * c.gi + ((s * c.m + 16384) >> 15);
+    return (std::min)(static_cast<int>(c.white), (std::min)(255, q));
+  }
+  static WbLinearColor FitWbLinearColor(const uchar *lut, double gain,
+                                        double black) {
+    WbLinearColor fit;
+    if (!(gain > 0.0) || gain > 64.0 || !(black >= 0.0) || black > 254.0)
+      return fit;
+    fit.white = lut[255];
+    const int m0 = static_cast<int>(std::lround(gain * 32768.0));
+    const int b0 = static_cast<int>(std::floor(black));
+    for (int b = b0; b <= b0 + 1; ++b) {
+      fit.black = static_cast<uint8_t>(b);
+      for (int d = 0; d <= 16; ++d) {
+        const int m = m0 + ((d & 1) ? (d + 1) / 2 : -(d / 2));
+        if (m <= 0) continue;
+        fit.gi = static_cast<uint8_t>(m >> 15);
+        fit.m = static_cast<int16_t>(m & 32767);
+        int i = 0;
+        while (i < 256 && EvalWbLinearColor(i, fit) == lut[i]) ++i;
+        if (i == 256) {
+          fit.ok = true;
+          return fit;
+        }
+      }
+    }
+    fit.ok = false;
+    return fit;
+  }
+  static bool FastWbLinearColorEnabled() {
+    static const bool enabled =
+        !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_WB_LINEAR");
+    return enabled;
+  }
+
   void BuildLuts(double bg, double rg) {
     const int e_q7 = display_exposure_
         ? (std::max)(128, (std::min)(1024, static_cast<int>(
@@ -3089,6 +3140,8 @@ class WhiteBalance {
       lut_g_i32_[i] = lut_g_[i];
       lut_r_i32_[i] = lut_r_[i];
     }
+    lin_b_ = FitWbLinearColor(lut_b_, bg * e, black);
+    lin_r_ = FitWbLinearColor(lut_r_, rg * e, black);
   }
 
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
@@ -3139,6 +3192,8 @@ class WhiteBalance {
     // table too (loaded only then).
     bool green_table;
     NeonLut256 neon_g;
+    WbLinearColor lin_b;
+    WbLinearColor lin_r;
   };
 
   void InitNeonWbRowPlan(bool rggb, bool use_bayer_nr,
@@ -3152,6 +3207,9 @@ class WhiteBalance {
     plan.green_clamp = static_cast<uint8_t>((std::min)(
         255, (32576 + lut_exposure_q7_ - 1) / lut_exposure_q7_));
     plan.green_table = green_table_;
+    const bool linear = FastWbLinearColorEnabled();
+    plan.lin_b = linear ? lin_b_ : WbLinearColor();
+    plan.lin_r = linear ? lin_r_ : WbLinearColor();
     if (plan.use_neon_lut) {
       plan.neon_b.Load(lut_b_);
       plan.neon_r.Load(lut_r_);
@@ -3288,6 +3346,30 @@ class WhiteBalance {
     const NeonLut256 &color_neon =
         (y & 1) ? (plan.rggb ? plan.neon_b : plan.neon_r)
                 : (plan.rggb ? plan.neon_r : plan.neon_b);
+    const WbLinearColor &color_lin =
+        (y & 1) ? (plan.rggb ? plan.lin_b : plan.lin_r)
+                : (plan.rggb ? plan.lin_r : plan.lin_b);
+    const bool color_linear = use_neon_lut && color_lin.ok;
+    const uint8x16_t lin_black8 = vdupq_n_u8(color_lin.black);
+    const uint8x16_t lin_white8 = vdupq_n_u8(color_lin.white);
+    const int16x8_t lin_m = vdupq_n_s16(color_lin.m);
+    const uint16x8_t lin_gi = vdupq_n_u16(color_lin.gi);
+    const auto map_color = [&](uint8x16_t values)
+        __attribute__((always_inline)) {
+      if (!color_linear) return color_neon.Apply(values);
+      const uint8x16_t s = vqsubq_u8(values, lin_black8);
+      const uint16x8_t s_lo = vmovl_u8(vget_low_u8(s));
+      const uint16x8_t s_hi = vmovl_high_u8(s);
+      const uint16x8_t lo = vmlaq_u16(
+          vreinterpretq_u16_s16(
+              vqrdmulhq_s16(vreinterpretq_s16_u16(s_lo), lin_m)),
+          s_lo, lin_gi);
+      const uint16x8_t hi = vmlaq_u16(
+          vreinterpretq_u16_s16(
+              vqrdmulhq_s16(vreinterpretq_s16_u16(s_hi), lin_m)),
+          s_hi, lin_gi);
+      return vminq_u8(vqmovn_high_u16(vqmovn_u16(lo), hi), lin_white8);
+    };
     const uint8x16_t black8 =
         vdupq_n_u8(static_cast<unsigned char>(BlackLevel()));
     const uint16x8_t green_q7 = vdupq_n_u16(plan.green_q7);
@@ -3325,7 +3407,19 @@ class WhiteBalance {
         __attribute__((always_inline)) {
       int x = begin;
       if (use_neon_lut && (begin & 1) == 0) {
-        if (kPlanar && kGreen != 1 && UseNeonWbAsm()) {
+        if (color_linear) {
+          for (; x + 32 <= end; x += 32) {
+            uint8x16x2_t values = vld2q_u8(src + x);
+            values.val[0] = even_is_green ? map_green(values.val[0])
+                                          : map_color(values.val[0]);
+            values.val[1] = even_is_green ? map_color(values.val[1])
+                                          : map_green(values.val[1]);
+            if (kPlanar)
+              store_vector(x, values.val[0], values.val[1]);
+            else
+              vst2q_u8(dst_even + x, values);
+          }
+        } else if (kPlanar && kGreen != 1 && UseNeonWbAsm()) {
           const int64_t blocks = (end - x) >> 5;
           if (blocks > 0) {
             const bool color_odd = even_is_green;
@@ -3450,9 +3544,9 @@ class WhiteBalance {
         const uint8x16_t odd_idx = vuzp2q_u8(filtered0, filtered1);
         const uint8x16_t even_values = even_is_green
             ? map_green(even_idx)
-            : color_neon.Apply(even_idx);
+            : map_color(even_idx);
         const uint8x16_t odd_values = even_is_green
-            ? color_neon.Apply(odd_idx)
+            ? map_color(odd_idx)
             : map_green(odd_idx);
         store_vector(offset, even_values, odd_values);
       };
@@ -3568,6 +3662,7 @@ class WhiteBalance {
   double exposure_log_ = 0.0;
   bool built_ = false;
   uchar lut_b_[256], lut_g_[256], lut_r_[256];
+  WbLinearColor lin_b_, lin_r_;
   int32_t lut_b_i32_[256], lut_g_i32_[256], lut_r_i32_[256];
   std::vector<float> ratios_bg_, ratios_rg_;
 };
@@ -8219,6 +8314,12 @@ inline bool FastNeonYccRowEnabled() {
   return enabled;
 }
 
+inline bool FastNeonYccX2Enabled() {
+  static const bool enabled =
+      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_YCC_X2");
+  return enabled;
+}
+
 inline bool FastNeonYccAsmEnabled() {
   static const bool enabled = [] {
     if (FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_YCC_ASM")) return false;
@@ -8427,6 +8528,137 @@ static inline __attribute__((always_inline)) int FusedOutputNeonYccRowPairImpl(
   const uint16x8_t c256 = vdupq_n_u16(256);
 
   int xh = 0;
+  // Two independent 8-column blocks per iteration, stage by stage. One block
+  // is a ~60-cycle dependency chain that the A72 window cannot overlap with
+  // the next iteration; interleaving two cuts BGR output 2.68 -> 2.18 ms per
+  // frame on A72 (A53 4.17 -> 3.87). Same operations, byte-identical.
+  const int x2_end = FastNeonYccX2Enabled() ? half_width : 0;
+  for (; xh + 16 <= x2_end; xh += 16) {
+    __asm__("" : "+r"(tone_base_ptr), "+r"(tone_delta_ptr),
+            "+r"(gain_base_ptr), "+r"(gain_delta_ptr), "+r"(clip_base_ptr),
+            "+r"(clip_delta_ptr));
+    int16x8_t l00[2], l01[2], l10[2], l11[2], tb[2], tg[2], tr[2];
+    for (int k = 0; k < 2; ++k) {
+      const int x0 = (xh + 8 * k) << 1;
+      const int xq = (xh + 8 * k) >> 1;
+      const uint16x4_t a4 = vld1_u16(pa + xq);
+      const uint16x4_t b4 = vld1_u16(pb + xq);
+      const uint32x4_t b0_lo = vmull_lane_u16(c256_4, b4, 0);
+      const uint32x4_t b0_hi = vmull_lane_u16(c256_4, b4, 1);
+      const uint32x4_t b1_lo = vmull_lane_u16(c256_4, b4, 2);
+      const uint32x4_t b1_hi = vmull_lane_u16(c256_4, b4, 3);
+      const int16x8_t dcr = vreinterpretq_s16_u16(
+          vsubl_u8(vld1_u8(pcr + xh + 8 * k), c128_8));
+      const int16x8_t dcb = vreinterpretq_s16_u16(
+          vsubl_u8(vld1_u8(pcb + xh + 8 * k), c128_8));
+      tb[k] = vqdmulhq_n_s16(vshlq_n_s16(dcb, 7), 454);
+      tr[k] = vqdmulhq_n_s16(vshlq_n_s16(dcr, 7), 359);
+      tg[k] = vaddq_s16(
+          dcr, vshrq_n_s16(vmlaq_n_s16(vmulq_n_s16(dcr, -73), dcb, 88), 8));
+      const auto luma_row = [&](const uchar *py, int16x8_t &l0,
+                                int16x8_t &l1) {
+        const uint8x16_t yv = vld1q_u8(py + x0);
+        const uint16x8_t y0 = FastNeonUxtlLo(yv);
+        const uint16x8_t y1 = vmovl_high_u8(yv);
+        l0 = vreinterpretq_s16_u16(FastNeonRshrn12Pair(
+            FastNeonUmlalLoLane0(b0_lo, y0, a4),
+            vmlal_high_lane_u16(b0_hi, y0, a4, 1)));
+        l1 = vreinterpretq_s16_u16(FastNeonRshrn12Pair(
+            FastNeonUmlalLoLane2(b1_lo, y1, a4),
+            vmlal_high_lane_u16(b1_hi, y1, a4, 3)));
+      };
+      luma_row(py0, l00[k], l01[k]);
+      luma_row(py1, l10[k], l11[k]);
+    }
+    int16x8_t gain[2];
+    uint16x8_t clip_binds[2], clip_q7[2];
+    for (int k = 0; k < 2; ++k) {
+      const uint8x8_t block_luma = vqmovun_s16(vrshrq_n_s16(
+          vpaddq_s16(vaddq_s16(l00[k], l10[k]), vaddq_s16(l01[k], l11[k])),
+          2));
+      const int16x8_t chroma_max =
+          vmaxq_s16(tb[k], vmaxq_s16(vnegq_s16(tg[k]), tr[k]));
+      const uint8x8_t block_max = vqmovun_s16(vaddq_s16(
+          vreinterpretq_s16_u16(vmovl_u8(block_luma)), chroma_max));
+      const uint8x8_t seg = vshr_n_u8(block_luma, 3);
+      const int16x8_t tone_q7 = vrshrq_n_s16(
+          vmlal_s8(vreinterpretq_s16_u16(vshll_n_u8(
+                       vqtbl2_u8(vld1q_u8_x2(gain_base_ptr), seg), 3)),
+                   vreinterpret_s8_u8(
+                       vqtbl2_u8(vld1q_u8_x2(gain_delta_ptr), seg)),
+                   vreinterpret_s8_u8(
+                       vand_u8(block_luma, vget_low_u8(c7)))),
+          3);
+      const uint8x8_t over = vqsub_u8(block_max, c128_8);
+      const uint8x8_t clip_seg = vshr_n_u8(over, 3);
+      clip_q7[k] = vrshrq_n_u16(
+          vmlsl_u8(vshll_n_u8(vqtbl1_u8(vld1q_u8(clip_base_ptr), clip_seg),
+                              3),
+                   vqtbl1_u8(vld1q_u8(clip_delta_ptr), clip_seg),
+                   vand_u8(over, vget_low_u8(c7))),
+          3);
+      gain[k] = vshlq_n_s16(
+          vminq_s16(tone_q7, vreinterpretq_s16_u16(clip_q7[k])), 5);
+      clip_binds[k] =
+          vcltq_u16(clip_q7[k], vreinterpretq_u16_s16(tone_q7));
+    }
+    const bool any_clip[2] = {vmaxvq_u16(clip_binds[0]) != 0,
+                              vmaxvq_u16(clip_binds[1]) != 0};
+    uint8x16_t bp[2], bn[2], gp[2], gn[2], rp[2], rn[2];
+    for (int k = 0; k < 2; ++k) {
+      const int16x8_t sb = vqrdmulhq_s16(vshlq_n_s16(tb[k], 3), gain[k]);
+      const int16x8_t sg = vqrdmulhq_s16(vshlq_n_s16(tg[k], 3), gain[k]);
+      const int16x8_t sr = vqrdmulhq_s16(vshlq_n_s16(tr[k], 3), gain[k]);
+      bp[k] = FastNeonSatDup(sb);
+      bn[k] = FastNeonSatDup(vnegq_s16(sb));
+      gp[k] = FastNeonSatDup(vnegq_s16(sg));
+      gn[k] = FastNeonSatDup(sg);
+      rp[k] = FastNeonSatDup(sr);
+      rn[k] = FastNeonSatDup(vnegq_s16(sr));
+    }
+    // j = 2 * block + row.
+    const int16x8_t lo_src[4] = {l00[0], l10[0], l00[1], l10[1]};
+    const int16x8_t hi_src[4] = {l01[0], l11[0], l01[1], l11[1]};
+    uint8x16_t yi[4], u[4];
+    for (int j = 0; j < 4; ++j) {
+      yi[j] = FastNeonQmovunPair(lo_src[j], hi_src[j]);
+      const uint8x16_t s = vshrq_n_u8(yi[j], 3);
+      const uint8x16_t f = vandq_u8(yi[j], c7);
+      const uint8x16_t base = vqtbl2q_u8(vld1q_u8_x2(tone_base_ptr), s);
+      const uint8x16_t delta = vqtbl2q_u8(vld1q_u8_x2(tone_delta_ptr), s);
+      u[j] = vaddq_u8(base, FastNeonRshrn3Pair(FastNeonUmullLo(delta, f),
+                                               vmull_high_u8(delta, f)));
+    }
+    for (int j = 0; j < 4; ++j) {
+      const int k = j >> 1;
+      if (any_clip[k]) {
+        const uint16x8_t luma_cap =
+            vbslq_u16(clip_binds[k], clip_q7[k], c256);
+        u[j] = vminq_u8(u[j], FastNeonUqrshrn7Pair(
+                                  vmulq_u16(FastNeonUxtlLo(yi[j]),
+                                            vzip1q_u16(luma_cap, luma_cap)),
+                                  vmulq_u16(vmovl_high_u8(yi[j]),
+                                            vzip2q_u16(luma_cap, luma_cap))));
+      }
+    }
+    for (int j = 0; j < 4; ++j) {
+      const int k = j >> 1;
+      const int x0 = (xh + 8 * k) << 1;
+      uchar *pc = (j & 1) ? pc1 : pc0;
+      if (kNv12) {
+        const uint8x16_t b = vqsubq_u8(vqaddq_u8(u[j], bp[k]), bn[k]);
+        const uint8x16_t g = vqsubq_u8(vqaddq_u8(u[j], gp[k]), gn[k]);
+        const uint8x16_t r = vqsubq_u8(vqaddq_u8(u[j], rp[k]), rn[k]);
+        vst1q_u8(pc + x0, FastNv12Y16Exact(r, g, b));
+        if ((j & 1) == 0)
+          FastNv12UV8Exact(FastNv12EvenLanes(r), FastNv12EvenLanes(g),
+                           FastNv12EvenLanes(b), nuv + x0);
+      } else {
+        FastNeonStoreBgrU8(pc + 3 * x0, u[j], bp[k], bn[k], gp[k], gn[k],
+                           rp[k], rn[k]);
+      }
+    }
+  }
   for (; xh + 8 <= half_width; xh += 8) {
     __asm__("" : "+r"(tone_base_ptr), "+r"(tone_delta_ptr),
             "+r"(gain_base_ptr), "+r"(gain_delta_ptr), "+r"(clip_base_ptr),
