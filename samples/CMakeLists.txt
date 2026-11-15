@@ -300,6 +300,8 @@ option(CYPERSTEREO_BUILD_ISP_TESTS "Build Linux ISP bit-exact regression/benchma
 if(CYPERSTEREO_BUILD_ISP_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(isp_opt_bench isp_opt_bench.cc)
   target_link_libraries(isp_opt_bench Cyperlib ${OpenCV_LIBRARIES})
+  add_executable(isp_quad_bench isp_quad_bench.cc)
+  target_link_libraries(isp_quad_bench Cyperlib ${OpenCV_LIBRARIES})
 endif()
 
 # The deployed Windows x64 platform (Intel family 6 model 158) supports AVX2.

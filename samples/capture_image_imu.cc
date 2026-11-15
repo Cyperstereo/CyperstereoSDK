@@ -535,6 +535,41 @@ static int run(int argc, char *argv[]) {
   
   TicToc t_frame;
   int count = 0;
+  // Steady-state frame timing. The first frames pay thread/cache startup,
+  // so they are excluded. isp_wall is the parallel ISP block; frame_work is
+  // everything after the frame is available; frame_period includes the wait
+  // for the next USB frame.
+  struct FrameTimeAcc {
+    double isp{0}, work{0}, period{0};
+    double isp_max{0}, work_max{0};
+    int n{0};
+    int skipped{0};
+    void Add(double isp_ms, double work_ms, double period_ms) {
+      if (skipped < 30) {
+        ++skipped;
+        return;
+      }
+      isp += isp_ms;
+      work += work_ms;
+      period += period_ms;
+      if (isp_ms > isp_max) isp_max = isp_ms;
+      if (work_ms > work_max) work_max = work_ms;
+      if (++n % 100 == 0) Print(false);
+    }
+    void Print(bool final) const {
+      if (n <= 0) return;
+      std::cout << std::fixed << std::setprecision(2)
+                << "[frame-time]" << (final ? " final" : "")
+                << "  isp_wall " << (isp / n)
+                << " ms  frame_work " << (work / n)
+                << " ms  frame_period " << (period / n)
+                << " ms  isp_max " << isp_max
+                << "  work_max " << work_max
+                << "  n=" << n
+                << "  warmup_skipped=" << skipped << std::endl;
+    }
+  } frame_time;
+  TicToc period_clock;
 
   const bool is_smartsens = cyperstereo::IsSmartSensProfile(profile);
 
@@ -624,6 +659,10 @@ static int run(int argc, char *argv[]) {
       break;
 
     int preview_key = -1;
+    const double period_ms = period_clock.toc();
+    period_clock.tic();
+    TicToc frame_work;
+    double isp_ms = 0.0;
 
     double image_timestamp = 0.0;
     double exposure_time[4]{};
@@ -824,7 +863,7 @@ static int run(int argc, char *argv[]) {
              image2_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
         });
       }
-      //std::cout << "proc(wb+cvt) " << proc.toc() << std::endl;
+      isp_ms = proc.toc();
       
       // Six-image mode shows/saves C1, C2 and the four half images; otherwise
       // the four full planes.
@@ -897,6 +936,28 @@ static int run(int argc, char *argv[]) {
             WriteRawTelemetryCsv(telemetry_file, raw_telemetry);
             if (!telemetry_file) std::cerr << "[save] telemetry write failed" << std::endl;
           }
+          // Exact quad ISP job inputs, replayable offline by isp_quad_bench.
+          static const bool dump_isp_jobs =
+              std::getenv("CYPERSTEREO_DUMP_ISP_JOBS") != nullptr;
+          if (dump_isp_jobs && !half_res_lanes && process_cameras >= 4) {
+            const cv::Mat *job_raw[4] = {&left_image, &right_image,
+                                         &left_front_image, &right_front_image};
+            const BayerConversion job_bayer[4] = {image1_bayer, image2_bayer,
+                                                  image3_bayer, image4_bayer};
+            std::ofstream jobs_file("isp_jobs_" + std::to_string(count) + ".txt");
+            for (int i = 0; i < 4; ++i) {
+              const std::string file = "isp_raw_" + std::to_string(count) +
+                                       "_cam" + std::to_string(i + 1) + ".png";
+              cv::imwrite(file, *job_raw[i]);
+              const RawMetadataRegion region = raw_telemetry.RegionForPlane(i);
+              jobs_file << file << ' ' << std::setprecision(9)
+                        << isp_camera_gain[i] << ' '
+                        << static_cast<int>(job_bayer[i]) << ' '
+                        << (fpga_bayer_nr[i] ? 1 : 0) << ' ' << region.row
+                        << ' ' << region.first_col << ' ' << region.end_col
+                        << '\n';
+            }
+          }
           std::cout << "[save] raw_/color_image*_" << count
                     << ".png written" << std::endl;
         }
@@ -931,9 +992,11 @@ static int run(int argc, char *argv[]) {
         exposure_time, exposure_lines, camera_gain, digital_gain,
         camera_temperature, c56, imu_data, gnss_data, frame_info, t_frame,
         capture_log);
+    frame_time.Add(isp_ms, frame_work.toc(), period_ms);
     ++count;
     if (max_frames > 0 && count >= max_frames) break;
   }
+  frame_time.Print(true);
   stream.Stop();
   if (show_preview)
     cv::destroyAllWindows();

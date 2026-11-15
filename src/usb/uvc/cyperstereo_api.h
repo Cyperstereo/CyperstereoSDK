@@ -8220,8 +8220,17 @@ inline bool FastNeonYccRowEnabled() {
 }
 
 inline bool FastNeonYccAsmEnabled() {
-  static const bool enabled =
-      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_YCC_ASM");
+  static const bool enabled = [] {
+    if (FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_YCC_ASM")) return false;
+#if defined(CYPERSTEREO_RK3576)
+    // Cortex-A72 runs the intrinsic row kernel faster than the A78-scheduled
+    // asm (BGR output 3.4 vs 4.1 ms per camera, four cameras in parallel);
+    // CYPERSTEREO_FAST_NEON_YCC_ASM=1 selects the asm anyway.
+    return FastEnvTruthy("CYPERSTEREO_FAST_NEON_YCC_ASM");
+#else
+    return true;
+#endif
+  }();
   return enabled;
 }
 
@@ -10494,6 +10503,179 @@ static __attribute__((noinline)) int FastBlendRowNeon(
   }
   return x;
 }
+
+// FastReconstructRowPairNeon for a single row, written to `dst` instead of
+// in place, followed by the scalar reference for any right tail.
+static __attribute__((noinline)) void FastReconstructRowNeon(
+    const uchar *__restrict src, uchar *__restrict dst,
+    const uchar *__restrict base_q, const uchar *__restrict keep_q,
+    int width, int quarter_width, int base_q7) {
+  const int16x8_t bq7 = vdupq_n_s16(static_cast<int16_t>(base_q7));
+  const int32x4_t offset = vdupq_n_s32(-128 * base_q7);
+  const int16x8_t c128 = vdupq_n_s16(128);
+  int x = 0;
+  for (; x + 16 <= width; x += 16) {
+    const int xq = x >> 1;
+    const uint8x16_t base16 = FastNeonLoadRepeat2(base_q + xq);
+    const uint8x16_t keep16 = FastNeonLoadRepeat2(keep_q + xq);
+    const int16x8_t base_lo =
+        vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(base16)));
+    const int16x8_t base_hi = vreinterpretq_s16_u16(vmovl_high_u8(base16));
+    const int16x8_t gain_lo = vsubq_s16(
+        bq7, vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(keep16))));
+    const int16x8_t gain_hi =
+        vsubq_s16(bq7, vreinterpretq_s16_u16(vmovl_high_u8(keep16)));
+    const int32x4_t c0 =
+        vmlal_s16(offset, vget_low_s16(base_lo), vget_low_s16(gain_lo));
+    const int32x4_t c1 = vmlal_high_s16(offset, base_lo, gain_lo);
+    const int32x4_t c2 =
+        vmlal_s16(offset, vget_low_s16(base_hi), vget_low_s16(gain_hi));
+    const int32x4_t c3 = vmlal_high_s16(offset, base_hi, gain_hi);
+    const uint8x16_t v = vld1q_u8(src + x);
+    const uint16x8_t p_lo = FastNeonUmullLo(v, keep16);
+    const uint16x8_t p_hi = vmull_high_u8(v, keep16);
+    const int16x8_t r_lo = FastNeonRoundAway7Pair(
+        FastNeonAddwLo(c0, p_lo),
+        vreinterpretq_s32_u32(
+            vaddw_high_u16(vreinterpretq_u32_s32(c1), p_lo)));
+    const int16x8_t r_hi = FastNeonRoundAway7Pair(
+        FastNeonAddwLo(c2, p_hi),
+        vreinterpretq_s32_u32(
+            vaddw_high_u16(vreinterpretq_u32_s32(c3), p_hi)));
+    vst1q_u8(dst + x, FastNeonQmovunPair(vaddq_s16(r_lo, c128),
+                                         vaddq_s16(r_hi, c128)));
+  }
+  for (; x < width; ++x) {
+    const int xq = (std::min)(x >> 1, quarter_width - 1);
+    const int base = base_q[xq];
+    const int delta = (base - 128) * base_q7 +
+                      (static_cast<int>(src[x]) - base) * keep_q[xq];
+    const int rounded = delta >= 0 ? (delta + 64) >> 7
+                                   : -((-delta + 64) >> 7);
+    dst[x] = cv::saturate_cast<uchar>(128 + rounded);
+  }
+}
+
+// 3x3 median of one row with replicate border columns (the caller clamps the
+// rows), byte-identical to FastMedian3U8Neon; width % 16 == 0, width >= 32.
+// Each 16-column block's vertical triples are sorted once and shared with
+// both neighbours through EXT; the median is med3(max of lows, med3 of mids,
+// min of highs), the identity FastMedian3RowAvx2 uses, at 24 instead of 38
+// min/max per vector.
+static __attribute__((noinline)) void FastMedian3RowSortedNeon(
+    const uchar *__restrict row0, const uchar *__restrict row1,
+    const uchar *__restrict row2, uchar *__restrict output, int width) {
+  const auto sort3 = [](const uchar *a, const uchar *b, const uchar *c,
+                        uint8x16_t &lo, uint8x16_t &mi, uint8x16_t &hi) {
+    const uint8x16_t va = vld1q_u8(a), vb = vld1q_u8(b), vc = vld1q_u8(c);
+    const uint8x16_t ab_lo = vminq_u8(va, vb), ab_hi = vmaxq_u8(va, vb);
+    lo = vminq_u8(ab_lo, vc);
+    const uint8x16_t t = vmaxq_u8(ab_lo, vc);
+    mi = vminq_u8(ab_hi, t);
+    hi = vmaxq_u8(ab_hi, t);
+  };
+  const auto med3 = [](uint8x16_t a, uint8x16_t b, uint8x16_t c) {
+    return vmaxq_u8(vminq_u8(a, b), vminq_u8(vmaxq_u8(a, b), c));
+  };
+  uint8x16_t lo_c, mi_c, hi_c;
+  sort3(row0, row1, row2, lo_c, mi_c, hi_c);
+  // Lane 0 of the first block and lane 15 of the last see a stand-in
+  // neighbour; both border pixels are rewritten by the scalar path below.
+  uint8x16_t lo_p = lo_c, mi_p = mi_c, hi_p = hi_c;
+  for (int x = 0; x < width; x += 16) {
+    uint8x16_t lo_n = lo_c, mi_n = mi_c, hi_n = hi_c;
+    if (x + 16 < width)
+      sort3(row0 + x + 16, row1 + x + 16, row2 + x + 16, lo_n, mi_n, hi_n);
+    const uint8x16_t max_lo = vmaxq_u8(
+        lo_c, vmaxq_u8(vextq_u8(lo_p, lo_c, 15), vextq_u8(lo_c, lo_n, 1)));
+    const uint8x16_t min_hi = vminq_u8(
+        hi_c, vminq_u8(vextq_u8(hi_p, hi_c, 15), vextq_u8(hi_c, hi_n, 1)));
+    const uint8x16_t mid = med3(vextq_u8(mi_p, mi_c, 15), mi_c,
+                                vextq_u8(mi_c, mi_n, 1));
+    vst1q_u8(output + x, med3(max_lo, mid, min_hi));
+    lo_p = lo_c; mi_p = mi_c; hi_p = hi_c;
+    lo_c = lo_n; mi_c = mi_n; hi_c = hi_n;
+  }
+  output[0] = FastMedian9U8Scalar(row0[0], row0[0], row0[1], row1[0],
+                                  row1[0], row1[1], row2[0], row2[0],
+                                  row2[1]);
+  const int right = width - 1;
+  output[right] = FastMedian9U8Scalar(
+      row0[right - 1], row0[right], row0[right], row1[right - 1],
+      row1[right], row1[right], row2[right - 1], row2[right], row2[right]);
+}
+
+// Per-thread row rings of the streamed NEON chroma tail: four quarter rows
+// of gate maps, four reconstructed half rows per chroma plane, and the final
+// chroma row handed to the output kernel.  Slots carry the row they hold and
+// a per-call epoch, so a helper thread never reuses rows of another frame.
+struct FastNeonChromaTailRing {
+  uint64_t epoch = 0;
+  int half_stride = 0;
+  int quarter_stride = 0;
+  int gate_row[4] = {-1, -1, -1, -1};
+  int recon_row[4] = {-1, -1, -1, -1};
+  std::vector<uchar> gate, recon, final_rows;
+  std::vector<int16_t> hd_keep;
+  void Reset(uint64_t call_epoch, int half_width, int quarter_width) {
+    if (epoch == call_epoch) return;
+    epoch = call_epoch;
+    half_stride = (half_width + 63) & ~63;
+    quarter_stride = (quarter_width + 63) & ~63;
+    gate.resize(static_cast<size_t>(quarter_stride) * 16);
+    recon.resize(static_cast<size_t>(half_stride) * 8);
+    final_rows.resize(static_cast<size_t>(half_stride) * 2);
+    hd_keep.resize(static_cast<size_t>(quarter_width) + 8);
+    for (int &r : gate_row) r = -1;
+    for (int &r : recon_row) r = -1;
+  }
+  // map: 0 residual keep, 1 blend, 2 hue protect, 3 hue minimum keep.
+  uchar *Gate(int slot, int map) {
+    return gate.data() + static_cast<size_t>(4 * slot + map) * quarter_stride;
+  }
+  uchar *Recon(int slot, int channel) {
+    return recon.data() + static_cast<size_t>(2 * slot + channel) * half_stride;
+  }
+  uchar *Final(int channel) {
+    return final_rows.data() + static_cast<size_t>(channel) * half_stride;
+  }
+};
+
+inline FastNeonChromaTailRing &GetFastNeonChromaTailRing() {
+  static thread_local FastNeonChromaTailRing ring;
+  return ring;
+}
+
+inline uint64_t NextFastNeonChromaTailEpoch() {
+  static std::atomic<uint64_t> counter{0};
+  return ++counter;
+}
+
+// Row pairs of software prefetch ahead of the streamed tail (0 = off).
+inline int FastNeonStreamedTailPrefetch() {
+  static const int distance = [] {
+    const char *value = std::getenv("CYPERSTEREO_FAST_TAIL_PREFETCH");
+    if (!value) return 1;
+    const int parsed = std::atoi(value);
+    return parsed < 0 ? 0 : (parsed > 8 ? 8 : parsed);
+  }();
+  return distance;
+}
+
+inline void FastPrefetchL2(const void *address, size_t bytes) {
+  const char *p = static_cast<const char *>(address);
+  for (size_t offset = 0; offset < bytes; offset += 64)
+    __builtin_prefetch(p + offset, 0, 2);
+}
+
+// Gate, reconstruct, median3, blend/hue, highlight fade and the BGR output
+// as one streamed pass over half-grid rows (default on; =1 restores the
+// separate full-plane passes, which are byte-identical).
+inline bool FastNeonStreamedTailEnabled() {
+  static const bool enabled =
+      !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_NEON_STREAMED_TAIL");
+  return enabled;
+}
 #endif
 
 // The colour protection of the chroma gate is keyed on how saturated the wide
@@ -11653,7 +11835,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   cv::Mat *gate_hue = &hue_protect_q8;
   cv::Mat *gate_min_keep = &hue_min_keep_q8;
   const bool flat_chroma_nr = linear_input && FastFlatChromaEnabled();
-  FastParallelForRows(quarter.height, "gate", [&](int y) {
+  const auto gate_row = [&](int y, uchar *pr, uchar *pblend, uchar *phue,
+                            uchar *pmin) {
     const int hy = y << 1;
     const uchar *src_cr0 = gate_source_cr->ptr<uchar>(hy);
     const uchar *src_cr1 = gate_source_cr->ptr<uchar>(hy + 1);
@@ -11664,10 +11847,6 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
         gate_mean_luma->ptr<float>(y);  // box3 quarter luma ~ 12px LP
     const uchar *pbase_cr = gate_base_cr->ptr<uchar>(y);
     const uchar *pbase_cb = gate_base_cb->ptr<uchar>(y);
-    uchar *pr = gate_residual->ptr<uchar>(y);
-    uchar *pblend = gate_blend->ptr<uchar>(y);
-    uchar *phue = gate_hue->ptr<uchar>(y);
-    uchar *pmin = gate_min_keep->ptr<uchar>(y);
     int x = 0;
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
     for (; x + 8 <= quarter.width; x += 8) {
@@ -11766,7 +11945,30 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       phue[x] = static_cast<uchar>(hue_q8);
       pmin[x] = static_cast<uchar>(protect * 216 / 255);
     }
-  });
+  };
+#if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
+  // The streamed tail keeps every intermediate in per-thread rings and
+  // renders BGR rows directly, so it needs the exact 2x grid, the YCC row
+  // kernel covering the whole width, and no alternative output target.
+  const bool streamed_tail =
+      FastNeonStreamedTailEnabled() && FastNeonTailRowsEnabled() &&
+      !FastSkipChromaMedian() && !output_uyvy && nv12 == nullptr &&
+      tone_luts != nullptr && tone_luts->y_tone_segments_ok &&
+      UseNeonOutput() && FastToneYccEnabled() && FastNeonYccRowEnabled() &&
+      full.width == 2 * half.width &&
+      full.height == 2 * half.height && half.width == 2 * quarter.width &&
+      half.height == 2 * quarter.height && (half.width & 15) == 0 &&
+      half.width >= 34 && y8.size() == full && a_q16.size() == quarter &&
+      b_q16.size() == quarter;
+#else
+  const bool streamed_tail = false;
+#endif
+  if (!streamed_tail) {
+    FastParallelForRows(quarter.height, "gate", [&](int y) {
+      gate_row(y, gate_residual->ptr<uchar>(y), gate_blend->ptr<uchar>(y),
+               gate_hue->ptr<uchar>(y), gate_min_keep->ptr<uchar>(y));
+    });
+  }
   const bool highlight_nr = linear_input && FastHighlightEnabled();
   const auto detail_t3 = detail_now();
   // Reconstruct the filtered chroma candidate on the half grid, then remove
@@ -11820,7 +12022,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   cv::Mat *const reconstruct_planes[2] = {&cr_h, &cb_h};
   const cv::Mat *const reconstruct_bases[2] = {&base_cr_q, &base_cb_q};
   const cv::Mat *const reconstruct_keep = &residual_keep_q8;
-  FastParallelForRows(fused_chroma_tail ? 0 : half.height / 2, "reconstruct",
+  FastParallelForRows(fused_chroma_tail || streamed_tail ? 0 : half.height / 2,
+                      "reconstruct",
                       [&](int pair_row) {
     const int y = pair_row << 1;
     const int yq = (std::min)(y >> 1, quarter.height - 1);
@@ -11900,7 +12103,7 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       }
     }
   });
-  if (!fused_chroma_tail && (half.height & 1) != 0) {
+  if (!fused_chroma_tail && !streamed_tail && (half.height & 1) != 0) {
     const int reconstruction_y = half.height - 1;
     const int yq = (std::min)(reconstruction_y >> 1,
                               quarter.height - 1);
@@ -11920,7 +12123,7 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       }
     }
   }
-  if (!fused_chroma_tail && !FastSkipChromaMedian()) {
+  if (!fused_chroma_tail && !streamed_tail && !FastSkipChromaMedian()) {
 #if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
     FastMedian3U8Neon(cr_h, cr_med_h);
     FastMedian3U8Neon(cb_h, cb_med_h);
@@ -11987,13 +12190,12 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   const cv::Mat *blend_min_map = &hue_min_keep_q8;
   const cv::Mat *blend_base_cr = &base_cr_q;
   const cv::Mat *blend_base_cb = &base_cb_q;
-  const auto blend_row = [&](int y, uchar *dst_cr, uchar *dst_cb) {
+  const auto blend_row_maps = [&](int y, uchar *dst_cr, uchar *dst_cb,
+                                  const uchar *pblend, const uchar *phue,
+                                  const uchar *pmin) {
     const uchar *src_cr = blend_source_cr->ptr<uchar>(y);
     const uchar *src_cb = blend_source_cb->ptr<uchar>(y);
     const int yq = (std::min)(y >> 1, quarter.height - 1);
-    const uchar *pblend = blend_map->ptr<uchar>(yq);
-    const uchar *phue = blend_hue_map->ptr<uchar>(yq);
-    const uchar *pmin = blend_min_map->ptr<uchar>(yq);
     const uchar *pbase_cr = blend_base_cr->ptr<uchar>(yq);
     const uchar *pbase_cb = blend_base_cb->ptr<uchar>(yq);
     int x = 0;
@@ -12157,6 +12359,12 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
       dst_cr[x] = static_cast<uchar>(128 + cr);
       dst_cb[x] = static_cast<uchar>(128 + cb);
     }
+  };
+  const auto blend_row = [&](int y, uchar *dst_cr, uchar *dst_cb) {
+    const int yq = (std::min)(y >> 1, quarter.height - 1);
+    blend_row_maps(y, dst_cr, dst_cb, blend_map->ptr<uchar>(yq),
+                   blend_hue_map->ptr<uchar>(yq),
+                   blend_min_map->ptr<uchar>(yq));
   };
   // Once green clips, the colour of what is left is wrong (a lamp's rim
   // turns blue under a warm WB), so fade chroma to neutral as the local
@@ -12343,8 +12551,10 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   }
 #endif
   cv::Mat *const blend_planes[2] = {&cr_h, &cb_h};
-  FastParallelForRows(fused_chroma_tail ? 0 : (half.height + 1) / 2, "blend",
-                      [&](int pair) {
+  FastParallelForRows(fused_chroma_tail || streamed_tail
+                          ? 0
+                          : (half.height + 1) / 2,
+                      "blend", [&](int pair) {
     static thread_local std::vector<int16_t> hd_scratch;
     hd_scratch.resize(static_cast<size_t>(quarter.width) + 8);
     int16_t *const hd_keep = hd_scratch.data();
@@ -12382,6 +12592,135 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
                               ms(detail_t5 - detail_t4),
                               ms(detail_t6 - detail_t5)});
   };
+#if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
+  if (streamed_tail) {
+    // Half row y needs reconstructed rows y-1..y+1 and gate row y/2; the
+    // reconstructed rows need gate rows (y-1)/2..(y+1)/2.  Four ring slots
+    // per kind therefore never evict a row still in use, and rows missing
+    // from a helper's ring (at a shard start) are simply recomputed.
+    color.create(full, CV_8UC3);
+    const uint64_t epoch = NextFastNeonChromaTailEpoch();
+    const cv::Mat *const tail_src[2] = {&cr_h, &cb_h};
+    const cv::Mat *const tail_base[2] = {&base_cr_q, &base_cb_q};
+    const cv::Mat *const out_y = &y8;
+    const cv::Mat *const out_a = &a_q16;
+    const cv::Mat *const out_b = &b_q16;
+    cv::Mat *const out_color = &color;
+    const auto output_row_pair = FastNeonYccAsmEnabled()
+                                     ? FusedOutputNeonYccRowPairAsm
+                                     : FusedOutputNeonYccRowPair;
+    const int prefetch_distance = FastNeonStreamedTailPrefetch();
+    // Detail profiling only: per-part time (summed over helper threads) so
+    // the streamed stage still reports gate / reconstruct / blend / output.
+    std::atomic<int64_t> part_ns[3] = {{0}, {0}, {0}};
+    const auto timed = [&](int part, const auto &body) {
+      if (!detail_profile) {
+        body();
+        return;
+      }
+      const auto start = DetailClock::now();
+      body();
+      part_ns[part].fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              DetailClock::now() - start).count(),
+          std::memory_order_relaxed);
+    };
+    FastParallelForRows(half.height / 2, "output", [&](int pair) {
+      FastNeonChromaTailRing &ring = GetFastNeonChromaTailRing();
+      ring.Reset(epoch, half.width, quarter.width);
+      const auto ensure_gate = [&](int q) {
+        const int slot = q & 3;
+        if (ring.gate_row[slot] != q) {
+          timed(0, [&] {
+            gate_row(q, ring.Gate(slot, 0), ring.Gate(slot, 1),
+                     ring.Gate(slot, 2), ring.Gate(slot, 3));
+          });
+          ring.gate_row[slot] = q;
+        }
+        return slot;
+      };
+      const auto ensure_recon = [&](int r) {
+        const int slot = r & 3;
+        if (ring.recon_row[slot] != r) {
+          const int q = r >> 1;
+          const uchar *keep = ring.Gate(ensure_gate(q), 0);
+          timed(1, [&] {
+            for (int c = 0; c < 2; ++c)
+              FastReconstructRowNeon(tail_src[c]->ptr<uchar>(r),
+                                     ring.Recon(slot, c),
+                                     tail_base[c]->ptr<uchar>(q), keep,
+                                     half.width, quarter.width, base_q7);
+          });
+          ring.recon_row[slot] = r;
+        }
+        return slot;
+      };
+      if (prefetch_distance > 0 && pair + prefetch_distance < quarter.height) {
+        const int q = pair + prefetch_distance;
+        const size_t hw = static_cast<size_t>(half.width);
+        const size_t qw = static_cast<size_t>(quarter.width);
+        for (int r = 2 * q; r < 2 * q + 2; ++r) {
+          FastPrefetchL2(gate_source_cr->ptr<uchar>(r), hw);
+          FastPrefetchL2(gate_source_cb->ptr<uchar>(r), hw);
+          FastPrefetchL2(tail_src[0]->ptr<uchar>(r), hw);
+          FastPrefetchL2(tail_src[1]->ptr<uchar>(r), hw);
+        }
+        for (int r = 4 * q; r < 4 * q + 4; ++r)
+          FastPrefetchL2(out_y->ptr<uchar>(r), 2 * hw);
+        FastPrefetchL2(gate_mean_luma->ptr<float>(q), qw * sizeof(float));
+        FastPrefetchL2(gate_texture->ptr<uchar>(q), qw);
+        FastPrefetchL2(tail_base[0]->ptr<uchar>(q), qw);
+        FastPrefetchL2(tail_base[1]->ptr<uchar>(q), qw);
+        FastPrefetchL2(out_a->ptr<ushort>(q), qw * sizeof(ushort));
+        FastPrefetchL2(out_b->ptr<ushort>(q), qw * sizeof(ushort));
+      }
+      int16_t *const hd_keep = ring.hd_keep.data();
+      const bool hd_any = highlight_nr && highlight_keep_row(pair, hd_keep);
+      uchar *const final_cr = ring.Final(0);
+      uchar *const final_cb = ring.Final(1);
+      const ushort *const pa = out_a->ptr<ushort>(pair);
+      const ushort *const pb = out_b->ptr<ushort>(pair);
+      for (int y = pair << 1; y < (pair << 1) + 2; ++y) {
+        const int up = ensure_recon(y > 0 ? y - 1 : 0);
+        const int cc = ensure_recon(y);
+        const int dn = ensure_recon(y + 1 < half.height ? y + 1 : y);
+        const int gs = ensure_gate(y >> 1);
+        timed(1, [&] {
+          FastMedian3RowSortedNeon(ring.Recon(up, 0), ring.Recon(cc, 0),
+                                   ring.Recon(dn, 0), final_cr, half.width);
+          FastMedian3RowSortedNeon(ring.Recon(up, 1), ring.Recon(cc, 1),
+                                   ring.Recon(dn, 1), final_cb, half.width);
+        });
+        timed(2, [&] {
+          blend_row_maps(y, final_cr, final_cb, ring.Gate(gs, 1),
+                         ring.Gate(gs, 2), ring.Gate(gs, 3));
+          if (hd_any) desaturate_row(hd_keep, final_cr, final_cb);
+        });
+        const int fy = y << 1;
+        output_row_pair(
+            out_y->ptr<uchar>(fy), out_y->ptr<uchar>(fy + 1), pa, pb,
+            final_cr, final_cb, out_color->ptr<uchar>(fy),
+            out_color->ptr<uchar>(fy + 1), half.width, *tone_luts);
+      }
+    });
+    if (detail_profile) {
+      const auto detail_t6 = DetailClock::now();
+      const auto ms = [](DetailClock::duration duration) {
+        return std::chrono::duration<double, std::milli>(duration).count();
+      };
+      const double gate_ms = part_ns[0].load() * 1e-6;
+      const double reconstruct_ms = part_ns[1].load() * 1e-6;
+      const double blend_ms = part_ns[2].load() * 1e-6;
+      AddFastPostDetailProfile(
+          full.width, full.height,
+          {ms(detail_t1 - detail_t0), ms(detail_t2 - detail_t1),
+           ms(detail_t2a - detail_t2), ms(detail_t2b - detail_t2a),
+           ms(detail_t2c - detail_t2b), gate_ms, reconstruct_ms, blend_ms,
+           ms(detail_t6 - detail_t2c) - gate_ms - reconstruct_ms - blend_ms});
+    }
+    return;
+  }
+#endif
   if (output_uyvy) {
     FusedOutputDisplayUyvy422(y8, a_q16, b_q16, cr_h, cb_h, color, tone_luts);
     report_detail();
@@ -13022,9 +13361,9 @@ inline void ApplyFastBalancedISPParallelImpl(
   constexpr int kMaxWorkers = 3;
   if (n <= 0) return;
   CV_Assert(jobs != nullptr);
-#if defined(CYPERSTEREO_RK3588)
+#if defined(CYPERSTEREO_RK3588) || defined(CYPERSTEREO_RK3576)
   // jobs[0] runs on the caller at CPU4. The three persistent workers process
-  // jobs[1..3] on CPU5..7, respectively.
+  // jobs[1..3] on CPU5..7 (Cortex-A76 on RK3588, Cortex-A72 on RK3576).
   static FastBalancedIspWorker worker1(5);
   static FastBalancedIspWorker worker2(6);
   static FastBalancedIspWorker worker3(7);
@@ -13049,7 +13388,7 @@ inline void ApplyFastBalancedISPParallelImpl(
     }
     bool enabled_;
   } multi_camera_guard(n > 1);
-#if defined(CYPERSTEREO_RK3588)
+#if defined(CYPERSTEREO_RK3588) || defined(CYPERSTEREO_RK3576)
   ScopedThreadAffinity caller_affinity(n > 1 ? 4 : -1);
 #endif
   for (int i = 1; i < n; ++i)
