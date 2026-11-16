@@ -2748,40 +2748,47 @@ class WhiteBalance {
   // strongly colored patches (blue dusk window, orange cloth) cannot skew
   // it. Gains are also clamped to a plausible illuminant range.
   void EstimateGains(const cv::Mat &raw, BayerConversion bayer) {
-    const int lo = static_cast<int>(BlackLevel()) + 24;
-    const int hi = 250;
     ratios_bg_.clear();
     ratios_rg_.clear();
     int n_total = 0;
-    for (int y = 0; y + 1 < raw.rows; y += kEstStep) {
-      const uchar *r0 = raw_rows_.Row(raw, y);
-      const uchar *r1 = raw_rows_.Row(raw, y + 1);
-      for (int x = 0; x + 1 < raw.cols; x += kEstStep) {
-        const bool rggb = bayer == BayerConversion::kColorBayerBg2Bgr;
-        int b = rggb ? r1[x + 1] : r0[x];
-        int g0 = r0[x + 1];
-        int g1 = r1[x];
-        int r = rggb ? r0[x] : r1[x + 1];
-        int g = (g0 + g1) >> 1;
-        ++n_total;
-        // Reject samples where ANY channel is at/near sensor clipping: a
-        // clipped channel flattens the ratio toward 1.0, and large bright
-        // areas (a white desk under the lamp fills ~1/4 of the night frame)
-        // would drag the median toward "no correction", leaving a blue cast
-        // on the walls the estimator should have neutralized.
-        if (b >= 250 || g0 >= 250 || g1 >= 250 || r >= 250) continue;
-        int luma = (b + 2 * g + r) >> 2;
-        if (luma < lo || luma > hi) continue;
-        double bb = b - BlackLevel();
-        double gg = g - BlackLevel();
-        double rr = r - BlackLevel();
-        // Reject samples where any channel is too close to the black level:
-        // the ratio would be dominated by noise.
-        if (bb < 4.0 || gg < 4.0 || rr < 4.0) continue;
-        ratios_bg_.push_back(static_cast<float>(gg / bb));
-        ratios_rg_.push_back(static_cast<float>(gg / rr));
-      }
+    for (int y = 0; y + 1 < raw.rows; y += kEstStep)
+      AccumulateGainRows(raw_rows_.Row(raw, y), raw_rows_.Row(raw, y + 1),
+                         raw.cols, bayer, n_total);
+    FinishGains(raw, bayer, n_total);
+  }
+
+  void AccumulateGainRows(const uchar *r0, const uchar *r1, int cols,
+                          BayerConversion bayer, int &n_total) {
+    const int lo = static_cast<int>(BlackLevel()) + 24;
+    const int hi = 250;
+    for (int x = 0; x + 1 < cols; x += kEstStep) {
+      const bool rggb = bayer == BayerConversion::kColorBayerBg2Bgr;
+      int b = rggb ? r1[x + 1] : r0[x];
+      int g0 = r0[x + 1];
+      int g1 = r1[x];
+      int r = rggb ? r0[x] : r1[x + 1];
+      int g = (g0 + g1) >> 1;
+      ++n_total;
+      // Reject samples where ANY channel is at/near sensor clipping: a
+      // clipped channel flattens the ratio toward 1.0, and large bright
+      // areas (a white desk under the lamp fills ~1/4 of the night frame)
+      // would drag the median toward "no correction", leaving a blue cast
+      // on the walls the estimator should have neutralized.
+      if (b >= 250 || g0 >= 250 || g1 >= 250 || r >= 250) continue;
+      int luma = (b + 2 * g + r) >> 2;
+      if (luma < lo || luma > hi) continue;
+      double bb = b - BlackLevel();
+      double gg = g - BlackLevel();
+      double rr = r - BlackLevel();
+      // Reject samples where any channel is too close to the black level:
+      // the ratio would be dominated by noise.
+      if (bb < 4.0 || gg < 4.0 || rr < 4.0) continue;
+      ratios_bg_.push_back(static_cast<float>(gg / bb));
+      ratios_rg_.push_back(static_cast<float>(gg / rr));
     }
+  }
+
+  void FinishGains(const cv::Mat &raw, BayerConversion bayer, int n_total) {
     // Small or entirely clipped/dark inputs can have no accepted samples
     // while integer division makes the relative threshold zero. Never
     // take the median of an empty vector; retain the prior/unity gains.
@@ -2852,32 +2859,92 @@ class WhiteBalance {
   }
 
   // RAW luma histogram over the white-balance sample grid.
-  void MeterExposure(const cv::Mat &raw, BayerConversion bayer) {
-    const bool rggb = bayer == BayerConversion::kColorBayerBg2Bgr;
-    int n_total = 0;
-    uint32_t hist[kMeterBins] = {};
-    // AR0234 fisheye: meter the central 2/3 x 3/4 (1280x812 of 1920x1080),
-    // the part inside the image circle with relative illumination above
-    // ~0.6, like the sensor AE ROI.  The black corners otherwise pull the
-    // log-average down and the dark face is metered against them.
+  // AR0234 fisheye: meter the central 2/3 x 3/4 (1280x812 of 1920x1080),
+  // the part inside the image circle with relative illumination above
+  // ~0.6, like the sensor AE ROI.  The black corners otherwise pull the
+  // log-average down and the dark face is metered against them.
+  struct MeterRoi {
+    int y0, y1, x0, x1;
+  };
+  static MeterRoi MeterRegion(const cv::Mat &raw) {
     const bool roi = FastIspAr0234Profile().load();
     const int y0 = roi ? (raw.rows / 8) & ~1 : 0;
-    const int y1 = roi ? raw.rows - y0 : raw.rows;
     const int x0 = roi ? (raw.cols / 6) & ~1 : 0;
-    const int x1 = roi ? raw.cols - x0 : raw.cols;
-    for (int y = y0; y + 1 < y1; y += kEstStep) {
+    return {y0, roi ? raw.rows - y0 : raw.rows, x0,
+            roi ? raw.cols - x0 : raw.cols};
+  }
+
+  // `hist` holds four kMeterBins sub-histograms. Consecutive samples rotate
+  // over them so that runs of equal bins do not serialize on the store ->
+  // load of one counter.
+  void AccumulateMeterRows(const uchar *r0, const uchar *r1,
+                           const MeterRoi &roi, BayerConversion bayer,
+                           uint32_t *hist, int &n_total) {
+    const bool rggb = bayer == BayerConversion::kColorBayerBg2Bgr;
+    const int black = static_cast<int>(BlackLevel());
+    for (int x = roi.x0; x + 1 < roi.x1; x += kEstStep) {
+      const int b = rggb ? r1[x + 1] : r0[x];
+      const int r = rggb ? r0[x] : r1[x + 1];
+      const int meter = ((b + r0[x + 1] + r1[x] + r + 2) >> 2) - black;
+      ++hist[(n_total & 3) * kMeterBins +
+             (std::max)(0, (std::min)(meter, kMeterBins - 1))];
+      ++n_total;
+    }
+  }
+
+  void FinishMeter(const uint32_t *hist, int n_total) {
+    uint32_t sum[kMeterBins];
+    for (int i = 0; i < kMeterBins; ++i)
+      sum[i] = hist[i] + hist[kMeterBins + i] + hist[2 * kMeterBins + i] +
+               hist[3 * kMeterBins + i];
+    UpdateExposure(sum, n_total);
+  }
+
+  void MeterExposure(const cv::Mat &raw, BayerConversion bayer) {
+    int n_total = 0;
+    uint32_t hist[4 * kMeterBins] = {};
+    const MeterRoi roi = MeterRegion(raw);
+    for (int y = roi.y0; y + 1 < roi.y1; y += kEstStep)
+      AccumulateMeterRows(raw_rows_.Row(raw, y), raw_rows_.Row(raw, y + 1),
+                          roi, bayer, hist, n_total);
+    FinishMeter(hist, n_total);
+  }
+
+  // EstimateGains and MeterExposure in one walk over the sampled row pairs
+  // (the meter rows are a subset whenever its ROI starts on the sample
+  // grid), prefetching the next pair: each pair is a fresh DRAM stream that
+  // the hardware prefetcher only picks up after several misses.
+  void FusedFrameStats(const cv::Mat &raw, BayerConversion bayer, bool gains,
+                       bool meter) {
+    const MeterRoi roi = MeterRegion(raw);
+    if (meter && roi.y0 % kEstStep != 0) {
+      if (gains) EstimateGains(raw, bayer);
+      MeterExposure(raw, bayer);
+      return;
+    }
+    if (gains) {
+      ratios_bg_.clear();
+      ratios_rg_.clear();
+    }
+    int gain_total = 0, meter_total = 0;
+    uint32_t hist[4 * kMeterBins] = {};
+    const int y_end = gains ? raw.rows : roi.y1;
+    for (int y = gains ? 0 : roi.y0; y + 1 < y_end; y += kEstStep) {
+      if (y + kEstStep + 1 < y_end) {
+        for (int r = y + kEstStep; r < y + kEstStep + 2; ++r) {
+          const uchar *ahead = raw.ptr<uchar>(r);
+          for (int x = 0; x < raw.cols; x += 64)
+            __builtin_prefetch(ahead + x, 0, 3);
+        }
+      }
       const uchar *r0 = raw_rows_.Row(raw, y);
       const uchar *r1 = raw_rows_.Row(raw, y + 1);
-      for (int x = x0; x + 1 < x1; x += kEstStep) {
-        const int b = rggb ? r1[x + 1] : r0[x];
-        const int r = rggb ? r0[x] : r1[x + 1];
-        const int meter = ((b + r0[x + 1] + r1[x] + r + 2) >> 2) -
-                          static_cast<int>(BlackLevel());
-        ++hist[(std::max)(0, (std::min)(meter, kMeterBins - 1))];
-        ++n_total;
-      }
+      if (gains) AccumulateGainRows(r0, r1, raw.cols, bayer, gain_total);
+      if (meter && y >= roi.y0 && y + 1 < roi.y1)
+        AccumulateMeterRows(r0, r1, roi, bayer, hist, meter_total);
     }
-    UpdateExposure(hist, n_total);
+    if (gains) FinishGains(raw, bayer, gain_total);
+    if (meter) FinishMeter(hist, meter_total);
   }
 
   void UpdateExposure(const uint32_t *hist, int n_total) {
@@ -2990,10 +3057,14 @@ class WhiteBalance {
 
   void UpdateFrameStats(const cv::Mat &raw, BayerConversion bayer) {
     MeasureAr0234Black(raw);
-    if ((frame_idx_++ & 1) == 0 || b_gain_ <= 0.0)
-      EstimateGains(raw, bayer);
-    if (display_exposure_ && GetFastExposureConfig().enabled)
-      MeterExposure(raw, bayer);
+    const bool gains = (frame_idx_++ & 1) == 0 || b_gain_ <= 0.0;
+    const bool meter = display_exposure_ && GetFastExposureConfig().enabled;
+    if (FastFusedFrameStatsEnabled()) {
+      if (gains || meter) FusedFrameStats(raw, bayer, gains, meter);
+      return;
+    }
+    if (gains) EstimateGains(raw, bayer);
+    if (meter) MeterExposure(raw, bayer);
   }
 
   void PrepareLutsForFrame(const cv::Mat &raw, BayerConversion bayer) {
@@ -3075,6 +3146,11 @@ class WhiteBalance {
   static bool FastWbLinearColorEnabled() {
     static const bool enabled =
         !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_WB_LINEAR");
+    return enabled;
+  }
+  static bool FastFusedFrameStatsEnabled() {
+    static const bool enabled =
+        !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_FUSED_STATS");
     return enabled;
   }
 
@@ -3194,7 +3270,17 @@ class WhiteBalance {
     NeonLut256 neon_g;
     WbLinearColor lin_b;
     WbLinearColor lin_r;
+    // BayerNR correction c + round_away((f - c) * strength / 256) as a
+    // 16-entry table indexed by (f - c) & 15, valid when |f - c| <= 7.
+    bool nr_table;
+    uint8_t nr_delta[16];
   };
+
+  static bool FastBayerNrTableEnabled() {
+    static const bool enabled =
+        !FastEnvTruthy("CYPERSTEREO_FAST_DISABLE_BAYER_NR_TABLE");
+    return enabled;
+  }
 
   void InitNeonWbRowPlan(bool rggb, bool use_bayer_nr,
                          const BayerNrParams &nr,
@@ -3203,6 +3289,20 @@ class WhiteBalance {
     plan.use_bayer_nr = use_bayer_nr;
     plan.use_neon_lut = UseNeonWbLut();
     plan.nr = nr;
+    // Accepted neighbours differ from the centre by at most the threshold
+    // T = base + (2 or 3), so f - c lies in [floor((4 - 4T) / 8),
+    // floor((4T + 4) / 8)], within [-7, 7] for T <= 14. A strength <= 256
+    // keeps c + delta between c and f, so the sum needs no saturation.
+    plan.nr_table = FastBayerNrTableEnabled() && nr.threshold_base >= 0 &&
+                    nr.threshold_base + 3 <= 14 && nr.strength_q8 >= 0 &&
+                    nr.strength_q8 <= 256 &&
+                    (nr.threshold_signal_q8 == 2 ||
+                     nr.threshold_signal_q8 == 3);
+    for (int i = 0; i < 16; ++i) {
+      const int product = (i < 8 ? i : i - 16) * nr.strength_q8;
+      plan.nr_delta[i] = static_cast<uint8_t>(
+          (product + (product < 0 ? 127 : 128)) >> 8);
+    }
     plan.green_q7 = static_cast<uint16_t>(lut_exposure_q7_);
     plan.green_clamp = static_cast<uint8_t>((std::min)(
         255, (32576 + lut_exposure_q7_ - 1) / lut_exposure_q7_));
@@ -3470,9 +3570,14 @@ class WhiteBalance {
       const int16x8_t zero_s16 = vdupq_n_s16(0);
       const int16x8_t pos_round_s16 = vdupq_n_s16(128);
       const int16x8_t neg_round_s16 = vdupq_n_s16(127);
+      const bool nr_table = plan.nr_table;
+      const uint8x16_t nr_delta = vld1q_u8(plan.nr_delta);
+      const uint8x16_t four8 = vdupq_n_u8(4);
+      const uint8x16_t mask15 = vdupq_n_u8(15);
       // Native u8 filter. The rounded threshold changes at exactly the same
       // signal values as ((signal*slope+128)>>8), avoiding a u16 widen.
-      const auto filter16 = [&](int offset) {
+      const auto filter16 = [&](int offset)
+        __attribute__((always_inline)) {
         const uint8x16_t center = vld1q_u8(src + offset);
         const uint8x16_t signal = vqsubq_u8(center, black8);
         uint8x16_t threshold_extra;
@@ -3497,6 +3602,24 @@ class WhiteBalance {
         const uint8x16_t right = accepted(vld1q_u8(src + offset + 2));
         const uint8x16_t above = accepted(vld1q_u8(up + offset));
         const uint8x16_t below = accepted(vld1q_u8(down + offset));
+        if (nr_table) {
+          // (4c + l + r + a + b + 4) >> 3 by a rounding narrow, then the
+          // strength blend through the per-frame delta table.
+          const uint16x8_t sum_lo = vmlal_u8(
+              vaddq_u16(vaddl_u8(vget_low_u8(left), vget_low_u8(right)),
+                        vaddl_u8(vget_low_u8(above), vget_low_u8(below))),
+              vget_low_u8(center), vget_low_u8(four8));
+          const uint16x8_t sum_hi = vmlal_high_u8(
+              vaddq_u16(vaddl_high_u8(left, right),
+                        vaddl_high_u8(above, below)),
+              center, four8);
+          const uint8x16_t filtered =
+              vrshrn_high_n_u16(vrshrn_n_u16(sum_lo, 3), sum_hi, 3);
+          return vaddq_u8(
+              center,
+              vqtbl1q_u8(nr_delta,
+                         vandq_u8(vsubq_u8(filtered, center), mask15)));
+        }
         const uint16x8_t center_lo = vmovl_u8(vget_low_u8(center));
         const uint16x8_t center_hi = vmovl_high_u8(center);
         uint16x8_t sum_lo = vshlq_n_u16(center_lo, 2);
@@ -3537,7 +3660,8 @@ class WhiteBalance {
             vqmovun_s16(vaddq_s16(vreinterpretq_s16_u16(center_hi),
                                    product_hi)));
       };
-      const auto filter_and_store32 = [&](int offset) {
+      const auto filter_and_store32 = [&](int offset)
+        __attribute__((always_inline)) {
         const uint8x16_t filtered0 = filter16(offset);
         const uint8x16_t filtered1 = filter16(offset + 16);
         const uint8x16_t even_idx = vuzp1q_u8(filtered0, filtered1);

@@ -103,8 +103,7 @@ static inline void Gauss3HRow(const uint8_t *source, uint16_t *destination,
     return (int)source[Reflect101(x, width)];
   };
   destination[0] = (uint16_t)(at(-1) + 2 * at(0) + at(1));
-  int x = 1;
-  for (; x + 17 <= width; x += 16) {
+  const auto block16 = [&](int x) {
     const uint8x16_t m1 = vld1q_u8(source + x - 1);
     const uint8x16_t c0 = vld1q_u8(source + x);
     const uint8x16_t p1 = vld1q_u8(source + x + 1);
@@ -113,6 +112,14 @@ static inline void Gauss3HRow(const uint8_t *source, uint16_t *destination,
                         vshll_n_u8(vget_low_u8(c0), 1)));
     vst1q_u16(destination + x + 8,
               vaddq_u16(vaddl_high_u8(m1, p1), vshll_high_n_u8(c0, 1)));
+  };
+  int x = 1;
+  for (; x + 17 <= width; x += 16) block16(x);
+  // The interior remainder as one block overlapping the last one (same
+  // values rewritten) instead of per-pixel reflected taps.
+  if (x < width - 1 && width >= 18) {
+    block16(width - 17);
+    x = width - 1;
   }
   for (; x < width; ++x)
     destination[x] = (uint16_t)(at(x - 1) + 2 * at(x) + at(x + 1));
@@ -149,7 +156,7 @@ static inline void Box7HRow(const uint8_t *source, uint16_t *destination,
     for (int k = -3; k <= 3; ++k) sum += source[Reflect(x + k, width)];
     destination[x] = (uint16_t)sum;
   }
-  for (; x + 19 <= width; x += 16) {
+  const auto block16 = [&](int x) {
     const uint8x16_t m3 = vld1q_u8(source + x - 3);
     const uint8x16_t m2 = vld1q_u8(source + x - 2);
     const uint8x16_t m1 = vld1q_u8(source + x - 1);
@@ -171,6 +178,12 @@ static inline void Box7HRow(const uint8_t *source, uint16_t *destination,
     hi = vaddw_u8(hi, vget_high_u8(c0));
     vst1q_u16(destination + x, lo);
     vst1q_u16(destination + x + 8, hi);
+  };
+  for (; x + 19 <= width; x += 16) block16(x);
+  // Overlapping final interior block; only the reflected edge stays scalar.
+  if (x < width - 3 && width >= 22) {
+    block16(width - 19);
+    x = width - 3;
   }
   for (; x < width; ++x) {
     unsigned sum = 0;
