@@ -2725,10 +2725,13 @@ class WhiteBalance {
   // Four-A76 fast path: WB/BayerNR rows live only in a four-row ring and feed
   // the fused EA/front stage immediately. It is single-threaded by design;
   // the outer four-camera scheduler already assigns one A76 to each camera.
+  // rows_done(ctx, n), when given, runs after y8 rows [0, n) are final; it is
+  // skipped when the front is split across big.LITTLE helpers.
   void ApplyStreamedDemosaicFrontNeon(
       const cv::Mat &raw, cv::Mat &y8, cv::Mat &cr_h, cv::Mat &cb_h,
       double sensor_gain, bool use_bayer_nr,
-      BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr);
+      BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr,
+      void (*rows_done)(void *, int) = nullptr, void *rows_ctx = nullptr);
 #endif
 #if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
   // WB rows live only in an eight-row ring and feed the fused AVX2 EA/front
@@ -5728,7 +5731,8 @@ inline void FusedDemosaicFrontNeon(
 #if defined(__aarch64__)
 inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
     const cv::Mat &raw, cv::Mat &y8, cv::Mat &cr_h, cv::Mat &cb_h,
-    double sensor_gain, bool use_bayer_nr, BayerConversion bayer) {
+    double sensor_gain, bool use_bayer_nr, BayerConversion bayer,
+    void (*rows_done)(void *, int), void *rows_ctx) {
   CV_Assert(raw.type() == CV_8UC1);
   const int width = raw.cols;
   const int height = raw.rows;
@@ -5790,6 +5794,7 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
           ring_row(after_y), width, replicate_top, replicate_bottom,
           swap_red_blue, y8.ptr<uchar>(r0), y8.ptr<uchar>(r1),
           cr_h.ptr<uchar>(yh), cb_h.ptr<uchar>(yh));
+      if (rows_done) rows_done(rows_ctx, r1 + 1);
     }
     return;
   }
@@ -5797,6 +5802,7 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
   // Planar production path. Four rows still occupy exactly 4*W bytes;
   // each row's first W/2 bytes hold even CFA columns and its second half odd
   // columns. Advancing an output pair retains two rows and replaces two.
+  bool notify_rows = false;
   const auto process_range = [&](int begin_pair, int end_pair) {
   static thread_local cv::Mat wb_planar_ring;
   wb_planar_ring.create(4, width, CV_8UC1);
@@ -5843,14 +5849,17 @@ inline void WhiteBalance::ApplyStreamedDemosaicFrontNeon(
         planar_row(after_y), width, replicate_top, replicate_bottom,
         swap_red_blue, y8.ptr<uchar>(r0), y8.ptr<uchar>(r1),
         cr_h.ptr<uchar>(yh), cb_h.ptr<uchar>(yh), front_rows);
+    if (notify_rows) rows_done(rows_ctx, r1 + 1);
   }
   };
   const int lane = FastIspBigLittleLane();
-  if (lane >= 0 && FastIspBigLittleStageEnabled("front"))
+  if (lane >= 0 && FastIspBigLittleStageEnabled("front")) {
     GetFastIspLittleLaneHelper(lane).RunRanges(
         half_height, FastIspBigLittleStageWeight("front"), process_range);
-  else
+  } else {
+    notify_rows = rows_done != nullptr;
     process_range(0, half_height);
+  }
 }
 #endif  // __aarch64__
 #endif  // CYPERSTEREO_HAVE_NEON
@@ -6063,25 +6072,66 @@ inline void PoolLumaAbs4Neon(const ushort *colsum, uchar *output,
 // path; paired adjacent rows share four horizontal-sum loads.
 // two_rows (CYPERSTEREO_FAST_LUMA_LITE) pools the band-pass energy over the
 // top 4x2 of each cell only; yq8/sq16 are unchanged.
-inline void FusedLumaChainNeon(const cv::Mat &y8, cv::Mat &hf_q8,
-                               cv::Mat &colsum, cv::Mat &yq8, cv::Mat &sq16,
-                               cv::Mat &ring, bool two_rows = false) {
-  const int W = y8.cols, H = y8.rows, qW = W / 4, qH = H / 4;
-  hf_q8.create(qH, qW, CV_8U);
-  colsum.create(1, W, CV_16U);
-  yq8.create(qH, qW, CV_8U);
-  sq16.create(qH, qW, CV_16U);
-  ring.create(8, W, CV_16U);
-  ushort *rr[8];
-  for (int i = 0; i < 8; ++i) rr[i] = ring.ptr<ushort>(i);
-  ushort *cs = colsum.ptr<ushort>(0);
+//
+// The stream form lets the front feed rows as it writes them: Advance(n)
+// emits every quarter row whose source rows all lie below row n, so the y8
+// rows are consumed while still cached instead of re-read from DRAM.
+class FusedLumaChainStreamNeon {
+ public:
+  void Begin(const cv::Mat &y8, cv::Mat &hf_q8, cv::Mat &colsum,
+             cv::Mat &yq8, cv::Mat &sq16, cv::Mat &ring, bool two_rows) {
+    y8_ = &y8;
+    hf_q8_ = &hf_q8;
+    yq8_ = &yq8;
+    sq16_ = &sq16;
+    W_ = y8.cols;
+    H_ = y8.rows;
+    qW_ = W_ / 4;
+    qH_ = H_ / 4;
+    two_rows_ = two_rows;
+    hf_q8.create(qH_, qW_, CV_8U);
+    colsum.create(1, W_, CV_16U);
+    yq8.create(qH_, qW_, CV_8U);
+    sq16.create(qH_, qW_, CV_16U);
+    ring.create(8, W_, CV_16U);
+    for (int i = 0; i < 8; ++i) rr_[i] = ring.ptr<ushort>(i);
+    cs_ = colsum.ptr<ushort>(0);
+    next_h_ = 0;
+    next_yq_ = 0;
+  }
 
-  int next_h = 0;
+  void Advance(int rows_ready) {
+    while (next_yq_ < qH_) {
+      const int need =
+          (std::min)(4 * next_yq_ + (two_rows_ ? 3 : 5), H_ - 1);
+      if (need >= rows_ready) return;
+      EmitQuarterRow(next_yq_++);
+    }
+  }
+
+ private:
+  void EmitQuarterRow(int yq);
+
+  const cv::Mat *y8_ = nullptr;
+  cv::Mat *hf_q8_ = nullptr, *yq8_ = nullptr, *sq16_ = nullptr;
+  ushort *rr_[8] = {};
+  ushort *cs_ = nullptr;
+  int W_ = 0, H_ = 0, qW_ = 0, qH_ = 0;
+  int next_h_ = 0, next_yq_ = 0;
+  bool two_rows_ = false;
+};
+
+inline void FusedLumaChainStreamNeon::EmitQuarterRow(int yq) {
+  const cv::Mat &y8 = *y8_;
+  const int W = W_, H = H_, qW = qW_;
+  const bool two_rows = two_rows_;
+  ushort *const *rr = rr_;
+  ushort *cs = cs_;
   const auto fill_h = [&](int upto) {
-    for (; next_h <= upto && next_h < H; ++next_h)
-      Gauss5HRowNeon(y8.ptr<uchar>(next_h), rr[next_h & 7], W);
+    for (; next_h_ <= upto && next_h_ < H; ++next_h_)
+      Gauss5HRowNeon(y8.ptr<uchar>(next_h_), rr[next_h_ & 7], W);
   };
-  for (int yq = 0; yq < qH; ++yq) {
+  {
     std::memset(cs, 0, W * sizeof(ushort));
     {
       // TBL returns zero for the out-of-range lanes; only the low four
@@ -6091,8 +6141,8 @@ inline void FusedLumaChainNeon(const cv::Mat &y8, cv::Mat &hf_q8,
           0, 4, 8, 12, 255, 255, 255, 255,
           255, 255, 255, 255, 255, 255, 255, 255};
       const uint8x16_t every_fourth = vld1q_u8(kEveryFourthBytes);
-      uchar *quarter_luma = yq8.ptr<uchar>(yq);
-      ushort *quarter_square = sq16.ptr<ushort>(yq);
+      uchar *quarter_luma = yq8_->ptr<uchar>(yq);
+      ushort *quarter_square = sq16_->ptr<ushort>(yq);
       const auto reflect_y = [&](int y) {
         return y < 0 ? -y : (y >= H ? 2 * H - 2 - y : y);
       };
@@ -6160,9 +6210,35 @@ inline void FusedLumaChainNeon(const cv::Mat &y8, cv::Mat &hf_q8,
         }
       }
     }
-    uchar *po = hf_q8.ptr<uchar>(yq);
+    uchar *po = hf_q8_->ptr<uchar>(yq);
     PoolLumaAbs4Neon(cs, po, qW, two_rows);
   }
+}
+
+// Feed the luma chain from the streamed front (default on).
+inline bool FastFrontLumaStreamEnabled() {
+  static const bool enabled =
+      std::getenv("CYPERSTEREO_FAST_DISABLE_FRONT_LUMA_STREAM") == nullptr;
+  return enabled;
+}
+
+// Front row pairs produced between luma chain updates. A72: 1 -> 8 pairs
+// lowers the four-camera stage sum 12.94 -> 12.78 ms.
+inline int FastFrontStreamBatchPairs() {
+  static const int pairs = [] {
+    const char *value = std::getenv("CYPERSTEREO_FAST_FRONT_STREAM_BATCH");
+    const int parsed = value ? std::atoi(value) : 8;
+    return parsed < 1 ? 1 : (parsed > 256 ? 256 : parsed);
+  }();
+  return pairs;
+}
+
+inline void FusedLumaChainNeon(const cv::Mat &y8, cv::Mat &hf_q8,
+                               cv::Mat &colsum, cv::Mat &yq8, cv::Mat &sq16,
+                               cv::Mat &ring, bool two_rows = false) {
+  FusedLumaChainStreamNeon stream;
+  stream.Begin(y8, hf_q8, colsum, yq8, sq16, ring, two_rows);
+  stream.Advance(y8.rows);
 }
 #endif  // defined(__aarch64__)
 #endif
@@ -11747,6 +11823,10 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   cv::Mat &front_cr = half_height ? scratch.cr_tall : ch_h[1];
   cv::Mat &front_cb = half_height ? scratch.cb_tall : ch_h[2];
   bool front_from_raw = false;
+  bool front_luma_streamed = false;
+#if defined(CYPERSTEREO_HAVE_NEON) && defined(__aarch64__)
+  FusedLumaChainStreamNeon luma_stream;
+#endif
 #if defined(CYPERSTEREO_HAVE_AVX2_OUTPUT)
   if (stream_raw) {
     CV_Assert(stream_wb != nullptr && !stream_bayer_nr);
@@ -11761,9 +11841,34 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
 #if defined(__aarch64__)
   if (stream_raw) {
     CV_Assert(stream_wb != nullptr);
+    front_luma_streamed = !half_height && FastFrontLumaStreamEnabled() &&
+                          !FastSkipLumaNr() && UseNeonGauss5() &&
+                          UseNeonGuided() && UseFusedLumaChain();
+    // Feeding the luma chain in batches of pairs keeps each kernel's rings
+    // resident in L1 between switches, while the batch itself stays in L2.
+    struct LumaFeed {
+      FusedLumaChainStreamNeon *luma;
+      int batch_rows;
+      int fed_rows;
+    } feed = {&luma_stream, 2 * FastFrontStreamBatchPairs(), 0};
+    if (front_luma_streamed) {
+      y8.create(stream_raw->size(), CV_8U);
+      luma_stream.Begin(y8, hf_q8, colsum, yq8, sq_q, g5_tmp_full,
+                        FastLumaLiteEnabled());
+    }
     stream_wb->ApplyStreamedDemosaicFrontNeon(
         *stream_raw, front_y, front_cr, front_cb, front_gain,
-        stream_bayer_nr, raw_bayer);
+        stream_bayer_nr, raw_bayer,
+        front_luma_streamed
+            ? +[](void *ctx, int rows) {
+                auto *f = static_cast<LumaFeed *>(ctx);
+                if (rows - f->fed_rows < f->batch_rows) return;
+                f->fed_rows = rows;
+                f->luma->Advance(rows);
+              }
+            : nullptr,
+        &feed);
+    if (front_luma_streamed) luma_stream.Advance(y8.rows);
     front_from_raw = true;
   } else
 #endif
@@ -11778,6 +11883,7 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
     cv::cvtColor(color, y8, cv::COLOR_BGR2GRAY);
   }
   (void)front_gain;
+  (void)front_luma_streamed;
   if (half_height) {
     CV_Assert(front_from_raw);
     VerticalHalveRows(front_y, y8);
@@ -11848,8 +11954,9 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
     guided_strength_fused = true;
     quarter_texture_fused = true;
   } else if (UseNeonGauss5() && UseNeonGuided() && UseFusedLumaChain()) {
-    FusedLumaChainNeon(y8, hf_q8, colsum, yq8, sq_q, g5_tmp_full,
-                       FastLumaLiteEnabled());
+    if (!front_luma_streamed)
+      FusedLumaChainNeon(y8, hf_q8, colsum, yq8, sq_q, g5_tmp_full,
+                         FastLumaLiteEnabled());
     if (UseStreamedGuidedStatsNeon()) {
       GuidedStatsStreamedNeon(yq8, sq_q, a_q16, b_q16, mean_i,
                               guided_strength_q8, 20.0f * luma_eps_scale);
