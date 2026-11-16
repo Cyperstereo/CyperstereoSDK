@@ -238,23 +238,107 @@ static inline void EmitBox7Row(int output_y, int qheight, int qwidth,
   }
 }
 
-// Returns 0 on success. Dimensions must be even and at least 8x8.
+// Resumable form: Advance(n) emits every quarter row whose source rows all
+// lie below row n, so a producer can feed the planes as it writes them.
+// Begin returns 0 on success. Dimensions must be even and at least 8x8.
 // kGauss3 swaps the 5x5 Gaussian for [1 2 1] x [1 2 1] (lighter NR).
 template <bool kGauss3>
-inline int ChromaGaussAreaBox7NeonT(
-    const uint8_t *source_cr, uint64_t source_cr_step,
-    const uint8_t *source_cb, uint64_t source_cb_step,
-    uint8_t *gauss_cr, uint64_t gauss_cr_step,
-    uint8_t *gauss_cb, uint64_t gauss_cb_step,
-    uint8_t *base_cr, uint64_t base_cr_step,
-    uint8_t *base_cb, uint64_t base_cb_step,
-    int width, int height, Scratch scratch) {
-  if (!source_cr || !source_cb || !gauss_cr || !gauss_cb || !base_cr ||
-      !base_cb || !scratch.gauss_h_cr || !scratch.gauss_h_cb ||
-      !scratch.box_h_cr || !scratch.box_h_cb || !scratch.down_cr ||
-      !scratch.down_cb || width < 8 || height < 8 || (width & 1) ||
-      (height & 1))
-    return -1;
+class ChromaGaussAreaBox7StreamNeonT {
+ public:
+  int Begin(const uint8_t *source_cr, uint64_t source_cr_step,
+            const uint8_t *source_cb, uint64_t source_cb_step,
+            uint8_t *gauss_cr, uint64_t gauss_cr_step,
+            uint8_t *gauss_cb, uint64_t gauss_cb_step,
+            uint8_t *base_cr, uint64_t base_cr_step,
+            uint8_t *base_cb, uint64_t base_cb_step,
+            int width, int height, Scratch scratch) {
+    if (!source_cr || !source_cb || !gauss_cr || !gauss_cb || !base_cr ||
+        !base_cb || !scratch.gauss_h_cr || !scratch.gauss_h_cb ||
+        !scratch.box_h_cr || !scratch.box_h_cb || !scratch.down_cr ||
+        !scratch.down_cb || width < 8 || height < 8 || (width & 1) ||
+        (height & 1))
+      return -1;
+    source_cr_ = source_cr;
+    source_cb_ = source_cb;
+    gauss_cr_ = gauss_cr;
+    gauss_cb_ = gauss_cb;
+    base_cr_ = base_cr;
+    base_cb_ = base_cb;
+    source_cr_step_ = source_cr_step;
+    source_cb_step_ = source_cb_step;
+    gauss_cr_step_ = gauss_cr_step;
+    gauss_cb_step_ = gauss_cb_step;
+    base_cr_step_ = base_cr_step;
+    base_cb_step_ = base_cb_step;
+    width_ = width;
+    height_ = height;
+    scratch_ = scratch;
+    next_horizontal_ = 0;
+    next_quarter_ = 0;
+    return 0;
+  }
+
+  void Advance(int rows_ready) {
+    const int qheight = height_ / 2;
+    const int reach = kGauss3 ? 1 : 2;
+    while (next_quarter_ < qheight) {
+      const int y1 = 2 * next_quarter_ + 1;
+      const int through = y1 + reach < height_ ? y1 + reach : height_ - 1;
+      if (through >= rows_ready) return;
+      EmitQuarterRow(next_quarter_++);
+      if (next_quarter_ == qheight) {
+        const int qwidth = width_ / 2;
+        int output_y = qheight > 3 ? qheight - 3 : 0;
+        for (; output_y < qheight; ++output_y)
+          EmitBox7Row(output_y, qheight, qwidth,
+                      scratch_.box_h_cr, scratch_.box_h_cb,
+                      base_cr_ + (uint64_t)output_y * base_cr_step_,
+                      base_cb_ + (uint64_t)output_y * base_cb_step_);
+      }
+    }
+  }
+
+  // Rows of the half-grid Gaussian planes that are final.
+  int FilteredRowsDone() const { return 2 * next_quarter_; }
+  // Rows of the quarter-grid base planes that are final.
+  int BaseRowsDone() const {
+    const int qheight = height_ / 2;
+    if (next_quarter_ == qheight) return qheight;
+    return next_quarter_ > 3 ? next_quarter_ - 3 : 0;
+  }
+
+ private:
+  void EmitQuarterRow(int quarter_y);
+
+  const uint8_t *source_cr_ = nullptr, *source_cb_ = nullptr;
+  uint8_t *gauss_cr_ = nullptr, *gauss_cb_ = nullptr;
+  uint8_t *base_cr_ = nullptr, *base_cb_ = nullptr;
+  uint64_t source_cr_step_ = 0, source_cb_step_ = 0;
+  uint64_t gauss_cr_step_ = 0, gauss_cb_step_ = 0;
+  uint64_t base_cr_step_ = 0, base_cb_step_ = 0;
+  int width_ = 0, height_ = 0;
+  Scratch scratch_ = {};
+  int next_horizontal_ = 0, next_quarter_ = 0;
+};
+
+template <bool kGauss3>
+inline void ChromaGaussAreaBox7StreamNeonT<kGauss3>::EmitQuarterRow(
+    int quarter_y) {
+  const uint8_t *const source_cr = source_cr_;
+  const uint8_t *const source_cb = source_cb_;
+  uint8_t *const gauss_cr = gauss_cr_;
+  uint8_t *const gauss_cb = gauss_cb_;
+  uint8_t *const base_cr = base_cr_;
+  uint8_t *const base_cb = base_cb_;
+  const uint64_t source_cr_step = source_cr_step_;
+  const uint64_t source_cb_step = source_cb_step_;
+  const uint64_t gauss_cr_step = gauss_cr_step_;
+  const uint64_t gauss_cb_step = gauss_cb_step_;
+  const uint64_t base_cr_step = base_cr_step_;
+  const uint64_t base_cb_step = base_cb_step_;
+  const int width = width_;
+  const int height = height_;
+  const Scratch scratch = scratch_;
   const int qwidth = width / 2;
   const int qheight = height / 2;
   const auto ghcr = [&](int row) {
@@ -270,8 +354,8 @@ inline int ChromaGaussAreaBox7NeonT(
     return scratch.box_h_cb + (uint64_t)(row & 7) * qwidth;
   };
 
-  int next_horizontal = 0;
-  for (int quarter_y = 0; quarter_y < qheight; ++quarter_y) {
+  int next_horizontal = next_horizontal_;
+  {
     const int y0 = 2 * quarter_y;
     const int y1 = y0 + 1;
     const int reach = kGauss3 ? 1 : 2;
@@ -381,12 +465,25 @@ inline int ChromaGaussAreaBox7NeonT(
                   base_cb + (uint64_t)output_y * base_cb_step);
     }
   }
-  int output_y = qheight > 3 ? qheight - 3 : 0;
-  for (; output_y < qheight; ++output_y)
-    EmitBox7Row(output_y, qheight, qwidth,
-                scratch.box_h_cr, scratch.box_h_cb,
-                base_cr + (uint64_t)output_y * base_cr_step,
-                base_cb + (uint64_t)output_y * base_cb_step);
+  next_horizontal_ = next_horizontal;
+}
+
+template <bool kGauss3>
+inline int ChromaGaussAreaBox7NeonT(
+    const uint8_t *source_cr, uint64_t source_cr_step,
+    const uint8_t *source_cb, uint64_t source_cb_step,
+    uint8_t *gauss_cr, uint64_t gauss_cr_step,
+    uint8_t *gauss_cb, uint64_t gauss_cb_step,
+    uint8_t *base_cr, uint64_t base_cr_step,
+    uint8_t *base_cb, uint64_t base_cb_step,
+    int width, int height, Scratch scratch) {
+  ChromaGaussAreaBox7StreamNeonT<kGauss3> stream;
+  const int status = stream.Begin(
+      source_cr, source_cr_step, source_cb, source_cb_step, gauss_cr,
+      gauss_cr_step, gauss_cb, gauss_cb_step, base_cr, base_cr_step, base_cb,
+      base_cb_step, width, height, scratch);
+  if (status != 0) return status;
+  stream.Advance(height);
   return 0;
 }
 

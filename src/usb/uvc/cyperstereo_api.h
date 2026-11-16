@@ -6109,6 +6109,8 @@ class FusedLumaChainStreamNeon {
     }
   }
 
+  int QuarterRowsDone() const { return next_yq_; }
+
  private:
   void EmitQuarterRow(int yq);
 
@@ -6478,27 +6480,83 @@ inline void GuidedStatsFromDecimNeon(const cv::Mat &yq8, const cv::Mat &sq16,
 // constants/order; the smoothed coefficient still rounds float(sum)/9 before
 // the integer strength equation.  The u16 horizontal ring is lossless:
 // 3*max(a)=12288 and 3*max(b)<=12240.
-inline void GuidedStatsStreamedNeon(const cv::Mat &yq8,
-                                    const cv::Mat &sq16,
-                                    cv::Mat &a_q16, cv::Mat &b_q16,
-                                    cv::Mat &mean_i, int strength_q8,
-                                    float eps = 20.0f) {
-  const float eps81 = 81.0f * eps;
-  static thread_local cv::Mat v16_row, v32_row, a_row, b_row;
-  static thread_local cv::Mat hs_a_ring, hs_b_ring;
-  const int qW = yq8.cols, qH = yq8.rows;
-  CV_Assert(qW >= 2 && qH >= 2);
-  CV_Assert(strength_q8 >= 0 && strength_q8 <= 256);
-  const cv::Size quarter(qW, qH);
-  v16_row.create(1, qW, CV_16U);
-  v32_row.create(1, qW, CV_32S);
-  a_row.create(1, qW, CV_16U);
-  b_row.create(1, qW, CV_16U);
-  hs_a_ring.create(3, qW, CV_16U);
-  hs_b_ring.create(3, qW, CV_16U);
-  a_q16.create(quarter, CV_16U);
-  b_q16.create(quarter, CV_16U);
-  mean_i.create(quarter, CV_32F);
+//
+// Advance(n) consumes the quarter rows [0, n) of yq8/sq16 that are final, so
+// the strip pipeline can interleave it with the luma chain.
+class GuidedStatsStreamNeon {
+ public:
+  void Begin(const cv::Mat &yq8, const cv::Mat &sq16, cv::Mat &a_q16,
+             cv::Mat &b_q16, cv::Mat &mean_i, int strength_q8,
+             float eps = 20.0f) {
+    static thread_local cv::Mat v16_row, v32_row, a_row, b_row;
+    static thread_local cv::Mat hs_a_ring, hs_b_ring;
+    const int qW = yq8.cols, qH = yq8.rows;
+    CV_Assert(qW >= 2 && qH >= 2);
+    CV_Assert(strength_q8 >= 0 && strength_q8 <= 256);
+    const cv::Size quarter(qW, qH);
+    v16_row.create(1, qW, CV_16U);
+    v32_row.create(1, qW, CV_32S);
+    a_row.create(1, qW, CV_16U);
+    b_row.create(1, qW, CV_16U);
+    hs_a_ring.create(3, qW, CV_16U);
+    hs_b_ring.create(3, qW, CV_16U);
+    a_q16.create(quarter, CV_16U);
+    b_q16.create(quarter, CV_16U);
+    mean_i.create(quarter, CV_32F);
+    yq8_ = &yq8;
+    sq16_ = &sq16;
+    a_q16_ = &a_q16;
+    b_q16_ = &b_q16;
+    mean_i_ = &mean_i;
+    v16_row_ = &v16_row;
+    v32_row_ = &v32_row;
+    a_row_ = &a_row;
+    b_row_ = &b_row;
+    hs_a_ring_ = &hs_a_ring;
+    hs_b_ring_ = &hs_b_ring;
+    qW_ = qW;
+    qH_ = qH;
+    strength_q8_ = strength_q8;
+    eps81_ = 81.0f * eps;
+    next_y_ = 0;
+    finished_ = false;
+  }
+
+  void Advance(int rows_ready);
+
+  int MeanRowsDone() const { return next_y_; }
+  int CoeffRowsDone() const {
+    return finished_ ? qH_ : (next_y_ > 0 ? next_y_ - 1 : 0);
+  }
+
+ private:
+  const cv::Mat *yq8_ = nullptr, *sq16_ = nullptr;
+  cv::Mat *a_q16_ = nullptr, *b_q16_ = nullptr, *mean_i_ = nullptr;
+  cv::Mat *v16_row_ = nullptr, *v32_row_ = nullptr;
+  cv::Mat *a_row_ = nullptr, *b_row_ = nullptr;
+  cv::Mat *hs_a_ring_ = nullptr, *hs_b_ring_ = nullptr;
+  int qW_ = 0, qH_ = 0, strength_q8_ = 0;
+  float eps81_ = 0.0f;
+  int next_y_ = 0;
+  bool finished_ = false;
+};
+
+inline void GuidedStatsStreamNeon::Advance(int rows_ready) {
+  if (finished_) return;
+  const cv::Mat &yq8 = *yq8_;
+  const cv::Mat &sq16 = *sq16_;
+  cv::Mat &a_q16 = *a_q16_;
+  cv::Mat &b_q16 = *b_q16_;
+  cv::Mat &mean_i = *mean_i_;
+  cv::Mat &v16_row = *v16_row_;
+  cv::Mat &v32_row = *v32_row_;
+  cv::Mat &a_row = *a_row_;
+  cv::Mat &b_row = *b_row_;
+  cv::Mat &hs_a_ring = *hs_a_ring_;
+  cv::Mat &hs_b_ring = *hs_b_ring_;
+  const int qW = qW_, qH = qH_;
+  const int strength_q8 = strength_q8_;
+  const float eps81 = eps81_;
 
   const float32x4_t k1620 = vdupq_n_f32(eps81);
   const float32x4_t k4096f = vdupq_n_f32(4096.0f);
@@ -6569,7 +6627,10 @@ inline void GuidedStatsStreamedNeon(const cv::Mat &yq8,
     }
   };
 
-  for (int y = 0; y < qH; ++y) {
+  while (next_y_ < qH) {
+    const int y = next_y_;
+    if ((y < qH - 1 ? y + 1 : qH - 1) >= rows_ready) return;
+    ++next_y_;
     const uchar *r0 = yq8.ptr<uchar>(y > 0 ? y - 1 : 0);
     const uchar *r1 = yq8.ptr<uchar>(y);
     const uchar *r2 = yq8.ptr<uchar>(y < qH - 1 ? y + 1 : qH - 1);
@@ -6701,6 +6762,17 @@ inline void GuidedStatsStreamedNeon(const cv::Mat &yq8,
                 hs_b_ring.ptr<ushort>((qH - 2) % 3),
                 hs_b_ring.ptr<ushort>((qH - 1) % 3),
                 hs_b_ring.ptr<ushort>((qH - 1) % 3));
+  finished_ = true;
+}
+
+inline void GuidedStatsStreamedNeon(const cv::Mat &yq8,
+                                    const cv::Mat &sq16,
+                                    cv::Mat &a_q16, cv::Mat &b_q16,
+                                    cv::Mat &mean_i, int strength_q8,
+                                    float eps = 20.0f) {
+  GuidedStatsStreamNeon stream;
+  stream.Begin(yq8, sq16, a_q16, b_q16, mean_i, strength_q8, eps);
+  stream.Advance(yq8.rows);
 }
 
 inline void GuidedStatsIntNeon(const cv::Mat &y_bl, cv::Mat &a_q16,
@@ -13088,7 +13160,7 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
               DetailClock::now() - start).count(),
           std::memory_order_relaxed);
     };
-    FastParallelForRows(half.height / 2, "output", [&](int pair) {
+    const auto tail_pair = [&](int pair) {
       FastNeonChromaTailRing &ring = GetFastNeonChromaTailRing();
       ring.Reset(epoch, half.width, quarter.width);
       const auto ensure_gate = [&](int q) {
@@ -13165,7 +13237,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
             final_cr, final_cb, out_color->ptr<uchar>(fy),
             out_color->ptr<uchar>(fy + 1), half.width, *tone_luts);
       }
-    });
+    };
+    FastParallelForRows(half.height / 2, "output", tail_pair);
     if (detail_profile) {
       const auto detail_t6 = DetailClock::now();
       const auto ms = [](DetailClock::duration duration) {
