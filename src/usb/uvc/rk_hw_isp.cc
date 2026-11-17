@@ -13,13 +13,27 @@
 // Demosaic, DPCC, GIC and the colour-space stages use the fixed configs in
 // rkisp/rk_hw_isp_tuning.inc; YNR/CNR take the row of the tuning's ISO
 // ladder that matches the frame's NR gain (NrLevel). There is no hardware
-// BayerNR stand-in: batches that would need the software BayerNR (NR gain
-// >= CYPERSTEREO_RKISP_MAX_NR_GAIN, default 3, and no FPGA BayerNR) stay on
-// the CPU.
+// BayerNR stand-in: an image that needs the software BayerNR (NR gain
+// >= CYPERSTEREO_RKISP_MAX_NR_GAIN, default 3, and no FPGA BayerNR) gets it
+// on the CPU, fused with the WB LUT as in the software ISP, and the ISP
+// takes that linear RAW with identity BLS/AWB/GOC.
+//
+// Six-image halves are (cam_width/2) x frame_height RAW, demosaiced
+// at that size, then the linear rows are averaged 2:1 and toned at half
+// height (IspFrameJob::half_height). They always take the CPU WB above, so
+// two of them share one frame side by side (PackGap() reflected columns
+// apart, fewer up to the 1920 selfpath width) and the six images run as one
+// batch in the full images' geometry, four frames like the quad. A half of
+// the other CFA phase is placed one row and column in, so the frames split
+// evenly between the two virtual ISPs. YNR for a half uses the software
+// post-average NR gain (kHalfHeightPostFrontNrRatio). A batch larger than
+// HwBudgetPixels() (AR0234 quad and six) leaves frames to the software ISP,
+// which runs them concurrently with the core.
 //
 // One virtual ISP (rkisp-virN) serves one CFA phase, the first two free ones
 // are taken for RGGB and BGGR. They share the hardware core, which runs
-// them back to back.
+// them back to back. An open ISP is kept for any frame that fits it. The
+// core runs at 594 MHz instead of the driver's 396 MHz (CoreMhz()).
 #include "cyperstereo_api.h"
 
 #if defined(CYPERSTEREO_RK3576) && defined(__linux__)
@@ -359,9 +373,13 @@ class VirtualIsp {
   VirtualIsp &operator=(const VirtualIsp &) = delete;
   ~VirtualIsp() { Close(); }
 
+  // Smaller frames are padded, so an open size at or above w x h serves.
   bool IsOpen(int w, int h, IspPixelFormat f) const {
-    return out_ >= 0 && w == w_ && h == h_ && f == format_;
+    return out_ >= 0 && w <= w_ && h <= h_ && f == format_;
   }
+  int width() const { return w_; }
+  int height() const { return h_; }
+  IspPixelFormat format() const { return format_; }
 
   bool Open(const Devices &dev, int w, int h, bool rggb, IspPixelFormat f) {
     Close();
@@ -413,15 +431,16 @@ class VirtualIsp {
     return true;
   }
 
-  // Starts the ISP on one frame; Collect() returns it.
-  bool Submit(const cv::Mat &raw, const WhiteBalance &rows, const Color &c) {
+  // The RAW buffer of the next Submit(): width() x h_ bytes, rd_stride()
+  // apart. Its previous frame has been collected.
+  uint8_t *RawBuffer() { return static_cast<uint8_t *>(rd_bufs_[rd_next_].ptr); }
+  size_t rd_stride() const { return rd_bpl_; }
+
+  // Starts the ISP on RawBuffer(); Collect() returns the frame.
+  bool Submit(const Color &c) {
     ReclaimParams();
     const uint32_t id = frame_id_++;
     if (!QueueParams(c, id, false)) return false;
-    uint8_t *rd = static_cast<uint8_t *>(rd_bufs_[rd_next_].ptr);
-    for (int y = 0; y < h_; ++y)
-      std::memcpy(rd + static_cast<size_t>(y) * rd_bpl_, rows.RawRow(raw, y),
-                  w_);
     if (!QueueImage(rawrd_, kOut, rd_next_, rd_bpl_ * h_)) return false;
     rd_next_ = (rd_next_ + 1) % static_cast<int>(rd_bufs_.size());
     isp2x_csi_trigger tg{};
@@ -432,23 +451,57 @@ class VirtualIsp {
     return true;
   }
 
-  // Copies the frame out, applying `tone` (nullptr = linear output).
-  bool Collect(cv::Mat &out, const FastBalancedToneLuts *tone) {
+  // One image of a frame: the w x h output at (x, y) into `out`.
+  // `half` averages each pair of linear rows first (six-image demosaic-first
+  // halves): tone then sees the half-height image, as the software path tones
+  // after its row average.
+  struct Region {
+    cv::Mat *out;
+    int x, y, w, h;
+    bool half;
+  };
+
+  // Copies the frame's images out, applying `tone` (nullptr = linear).
+  bool Collect(const Region *regions, int n, const FastBalancedToneLuts *tone) {
     const int oi = DequeueImage(out_, kCap, 2000);
     if (oi < 0) return Fail("output timeout");
     const bool uyvy = format_ == IspPixelFormat::kUyvy422Bt601FullRange;
-    // Selfpath "RGB24" stores B, G, R in memory order.
-    out.create(h_, w_, uyvy ? CV_8UC2 : CV_8UC3);
-    const uint8_t *src = static_cast<const uint8_t *>(out_bufs_[oi].ptr);
-    const size_t row_bytes = static_cast<size_t>(w_) * (uyvy ? 2 : 3);
-    for (int y = 0; y < h_; ++y) {
-      const uint8_t *s = src + static_cast<size_t>(y) * out_bpl_;
-      if (!tone)
-        std::memcpy(out.ptr(y), s, row_bytes);
-      else if (uyvy)
-        ToneRowUyvy(s, out.ptr(y), w_, *tone);
-      else
-        ToneRowBgr(s, out.ptr(y), w_, *tone);
+    const int bpp = uyvy ? 2 : 3;
+    for (int r = 0; r < n; ++r) {
+      const Region &g = regions[r];
+      // Selfpath "RGB24" stores B, G, R in memory order.
+      const int rows = g.half ? g.h / 2 : g.h;
+      g.out->create(rows, g.w, uyvy ? CV_8UC2 : CV_8UC3);
+      const uint8_t *src = static_cast<const uint8_t *>(out_bufs_[oi].ptr) +
+                           static_cast<size_t>(g.y) * out_bpl_ +
+                           static_cast<size_t>(g.x) * bpp;
+      const size_t row_bytes = static_cast<size_t>(g.w) * bpp;
+      if (g.half) row_.resize(row_bytes);
+      for (int y = 0; y < rows; ++y) {
+        const uint8_t *s;
+        if (!g.half) {
+          s = src + static_cast<size_t>(y) * out_bpl_;
+        } else {
+          const uint8_t *a = src + static_cast<size_t>(2 * y) * out_bpl_;
+          const uint8_t *b = src + static_cast<size_t>(2 * y + 1) * out_bpl_;
+          int x = 0;
+#if defined(__ARM_NEON)
+          for (; x + 16 <= static_cast<int>(row_bytes); x += 16)
+            vst1q_u8(row_.data() + x,
+                     vrhaddq_u8(vld1q_u8(a + x), vld1q_u8(b + x)));
+#endif
+          for (; x < static_cast<int>(row_bytes); ++x)
+            row_[x] = static_cast<uint8_t>((a[x] + b[x] + 1) >> 1);
+          s = row_.data();
+        }
+        uint8_t *d = g.out->ptr(y);
+        if (!tone)
+          std::memcpy(d, s, row_bytes);
+        else if (uyvy)
+          ToneRowUyvy(s, d, g.w, *tone);
+        else
+          ToneRowBgr(s, d, g.w, *tone);
+      }
     }
     if (!QueueImage(out_, kCap, oi, 0)) return false;
     DequeueImage(rawrd_, kOut, 100);
@@ -456,12 +509,15 @@ class VirtualIsp {
   }
 
   void Close() {
-    int t = kCap;
-    if (out_ >= 0) Xioctl(out_, VIDIOC_STREAMOFF, &t);
+    // Params must go off first. Stopping the capture node waits inside
+    // rkisp_stop_3a_run until the params node is already off, and that wait
+    // is a 1s timeout when userspace is blocked in the capture STREAMOFF.
+    int t = kMeta;
+    if (params_ >= 0) Xioctl(params_, VIDIOC_STREAMOFF, &t);
     t = kOut;
     if (rawrd_ >= 0) Xioctl(rawrd_, VIDIOC_STREAMOFF, &t);
-    t = kMeta;
-    if (params_ >= 0) Xioctl(params_, VIDIOC_STREAMOFF, &t);
+    t = kCap;
+    if (out_ >= 0) Xioctl(out_, VIDIOC_STREAMOFF, &t);
     for (auto *v : {&out_bufs_, &rd_bufs_, &par_bufs_}) {
       for (auto &b : *v)
         if (b.ptr) munmap(b.ptr, b.len);
@@ -492,6 +548,27 @@ class VirtualIsp {
     return false;
   }
 
+ public:
+  // Sets a closed virtual ISP's input size, which the driver's clock estimate
+  // reads at the next ForceEnum.
+  static bool SetInputSize(const Devices &dev, int w, int h) {
+    VirtualIsp v;
+    v.w_ = w;
+    v.h_ = h;
+    v.subdev_ = open(dev.subdev.c_str(), O_RDWR);
+    const bool ok = v.subdev_ >= 0 && v.SetPad(0, MEDIA_BUS_FMT_SRGGB8_1X8);
+    return ok;
+  }
+  // Re-reads every virtual ISP's input size; only while none is streaming.
+  static bool ForceEnum(const Devices &dev) {
+    const int fd = open(dev.subdev.c_str(), O_RDWR);
+    if (fd < 0) return false;
+    const bool ok = Xioctl(fd, RKISP_CMD_MULTI_DEV_FORCE_ENUM, nullptr) == 0;
+    close(fd);
+    return ok;
+  }
+
+ private:
   bool SetPad(uint32_t pad, uint32_t code) {
     v4l2_subdev_format f{};
     f.which = V4L2_SUBDEV_FORMAT_ACTIVE;
@@ -655,6 +732,7 @@ class VirtualIsp {
   uint32_t out_bpl_ = 0, rd_bpl_ = 0;
   int rd_next_ = 0;
   uint32_t frame_id_ = 0;
+  std::vector<uint8_t> row_;  // averaged row for half-height output
   // YNR/CNR state of the last queued parameters.
   int nr_level_ = 0;
   uint16_t nr_gain_q4_ = 16;
@@ -749,6 +827,84 @@ std::atomic<bool> backend_requested{[] {
 }()};
 std::atomic<bool> last_batch_on_hardware{false};
 
+// Half images are packed two to a frame, PackGap() reflected columns apart,
+// so the six-image halves share the full images' geometry: 2 x 640 + 32
+// against 1280 opens the ISP once at 1312 and full frames are padded. Past
+// 16 columns the gap no longer changes the halves' edges.
+// CYPERSTEREO_RKISP_PACK_GAP sets the gap (multiple of 4, up to 256),
+// CYPERSTEREO_RKISP_PACK=0 gives every half its own padded frame.
+int PackGap() {
+  static const int v = [] {
+    const char *e = std::getenv("CYPERSTEREO_RKISP_PACK_GAP");
+    const int g = e ? std::atoi(e) : 32;
+    return (std::max)(0, (std::min)(256, g)) & ~3;
+  }();
+  return v;
+}
+
+bool PackHalves() {
+  static const bool v = [] {
+    const char *e = std::getenv("CYPERSTEREO_RKISP_PACK");
+    return !(e && std::strcmp(e, "0") == 0);
+  }();
+  return v;
+}
+
+// ISP core clock to ask the driver for, default 594 MHz; 0 leaves the
+// driver's choice (396 MHz for these sizes), 702 is the top step. With rawrd
+// input the driver sizes the clock from the streaming virtual ISPs, (sum of
+// their enumerated w x h) x 30 fps x (1 + 0.25 per ISP), against
+// 400/400/500/600/702 MHz steps (594 = GPLL / 2, 702 = SPLL); ApplyBatch
+// makes the enumerated sizes large enough for the requested step. 702 is no
+// faster for these batches. CYPERSTEREO_RKISP_CORE_MHZ.
+int CoreMhz() {
+  static const int v = [] {
+    const char *e = std::getenv("CYPERSTEREO_RKISP_CORE_MHZ");
+    const int m = e ? std::atoi(e) : 594;
+    return m >= 700 ? 702 : m >= 590 ? 594 : 0;
+  }();
+  return v;
+}
+
+// Hardware frame pixels per batch (frames x padded width x height). The core
+// at 396 MHz takes ~3.7 ms per megapixel, so the default 6.4 MP is ~24 ms
+// and leaves the live stream room within 33 ms. SC136HGS batches (4 x
+// 1312 x 1026) fit; AR0234's (4 x 1920 x 1080) do not. A faster core
+// (CoreMhz()) keeps the same budget: the halves' CPU front end, not the core,
+// then bounds an all-hardware batch, so the offload still shortens it.
+// CYPERSTEREO_RKISP_HW_BUDGET_MP sets it, 0 = no limit.
+double HwBudgetPixels() {
+  static const double v = [] {
+    const char *e = std::getenv("CYPERSTEREO_RKISP_HW_BUDGET_MP");
+    const double mp = e ? std::atof(e) : 6.4;
+    return mp > 0.0 ? mp * 1e6 : 1e18;
+  }();
+  return v;
+}
+
+// Column of a w-wide image that stands in for column c outside it: mirror
+// about the edge pixel with the even period 2w - 2, which keeps the CFA phase.
+int ReflectColumn(int c, int w) {
+  const int p = 2 * w - 2;
+  int m = c % p;
+  if (m < 0) m += p;
+  return m < w ? m : p - m;
+}
+
+constexpr int kMaxBatch = 8;
+constexpr int kSelfPathMaxWidth = 1920;
+constexpr int kMainPathMaxWidth = 4096;
+
+// Images of one hardware frame, side by side. A half image whose CFA phase
+// is not the frame's sits one row and one column in (`shift`), which turns
+// RGGB into BGGR and back; frames are then two rows taller.
+struct Frame {
+  int job[2];
+  bool shift[2] = {false, false};
+  int x[2] = {0, 0}, y[2] = {0, 0};
+  int count = 0;
+};
+
 bool ApplyBatch(const FastBalancedIspDispatchJob *jobs, int n) {
   static std::mutex mutex;
   static VirtualIsp isp[2];  // [0] RGGB, [1] BGGR
@@ -756,18 +912,120 @@ bool ApplyBatch(const FastBalancedIspDispatchJob *jobs, int n) {
   static std::vector<Devices> virtual_isps;
   static bool disabled = false;
   std::lock_guard<std::mutex> lock(mutex);
-  if (disabled || n <= 0) return false;
+  if (disabled || n <= 0 || n > kMaxBatch) return false;
+  // Full images share one width, half images another; all share the height.
+  int full_w = 0, half_w = 0;
+  const int h = jobs[0].raw->rows;
+  bool cpu_front[kMaxBatch], bayer_nr[kMaxBatch];
   for (int i = 0; i < n; ++i) {
     const FastBalancedIspDispatchJob &j = jobs[i];
-    const bool nr_high = FastBalancedBayerNrEnabled() &&
-                         !j.raw_bayer_nr_done &&
-                         j.sensor_gain * j.wb->NrGainScale() >= MaxNrGain();
-    if (j.half_height || nr_high || j.raw->type() != CV_8UC1 ||
-        (j.raw->cols & 1) || (j.raw->rows & 1) ||
-        j.raw->size() != jobs[0].raw->size() ||
+    if (j.raw->type() != CV_8UC1 || j.raw->cols < 4 || (j.raw->cols & 1) ||
+        j.raw->rows != h || (h & 1) || h < 2 ||
         j.output_format != jobs[0].output_format)
       return false;
+    int &w = j.half_height ? half_w : full_w;
+    if (w && w != j.raw->cols) return false;
+    w = j.raw->cols;
+    // No hardware BayerNR stand-in: the software one runs on the CPU, fused
+    // with the WB LUT, and the ISP takes that linear RAW with an identity
+    // BLS/AWB/GOC. Half images always take that route so two cameras can
+    // share a frame.
+    bayer_nr[i] = FastBalancedBayerNrEnabled() && !j.raw_bayer_nr_done &&
+                  j.sensor_gain * j.wb->NrGainScale() >= MaxNrGain();
+    cpu_front[i] = bayer_nr[i] || j.half_height;
   }
+  // The selfpath (BGR) takes frames up to 1920 wide: AR0234's 960-wide halves
+  // pack only without a gap.
+  const int max_w =
+      jobs[0].output_format == IspPixelFormat::kBgr888 ? kSelfPathMaxWidth
+                                                       : kMainPathMaxWidth;
+  if (full_w > max_w || half_w > max_w) return false;
+  const bool pack = PackHalves() && 2 * half_w <= max_w;
+  const int gap = pack ? (std::min)(PackGap(), (max_w - 2 * half_w) & ~3) : 0;
+  const int w = (std::max)(full_w, half_w ? (pack ? 2 * half_w + gap : half_w)
+                                          : 0);
+  // Frames per phase: full images alone, half images in pairs. A shifted
+  // UYVY image would pair chroma across two of its columns, so only BGR
+  // shifts.
+  const auto phase = [&](int i) {
+    return jobs[i].bayer == BayerConversion::kColorBayerBg2Bgr ? 0 : 1;
+  };
+  const bool can_shift =
+      pack && gap >= 4 && jobs[0].output_format == IspPixelFormat::kBgr888;
+  std::vector<Frame> frames[2];
+  std::vector<int> halves[2];
+  for (int i = 0; i < n; ++i) {
+    if (jobs[i].half_height) {
+      halves[phase(i)].push_back(i);
+      continue;
+    }
+    Frame f;
+    f.job[0] = i;
+    f.count = 1;
+    frames[phase(i)].push_back(f);
+  }
+  if (can_shift) {
+    // A frame has one YNR/CNR strength, so pair the halves of nearest NR
+    // gain, then even out the frames of the two virtual ISPs (the core runs
+    // them back to back).
+    std::vector<int> l(halves[0]);
+    l.insert(l.end(), halves[1].begin(), halves[1].end());
+    std::stable_sort(l.begin(), l.end(), [&](int a, int b) {
+      return jobs[a].sensor_gain * jobs[a].wb->NrGainScale() <
+             jobs[b].sensor_gain * jobs[b].wb->NrGainScale();
+    });
+    for (size_t i = 0; i < l.size(); i += 2) {
+      Frame f;
+      f.job[0] = l[i];
+      f.count = i + 1 < l.size() ? 2 : 1;
+      if (f.count == 2) f.job[1] = l[i + 1];
+      const int native = phase(f.job[0]);
+      const int k = frames[native].size() <= frames[1 - native].size()
+                        ? native : 1 - native;
+      for (int s = 0; s < f.count; ++s) f.shift[s] = phase(f.job[s]) != k;
+      frames[k].push_back(f);
+    }
+  } else {
+    for (int k = 0; k < 2; ++k) {
+      const std::vector<int> &l = halves[k];
+      for (size_t i = 0; i < l.size(); i += pack ? 2 : 1) {
+        Frame f;
+        f.job[0] = l[i];
+        f.count = pack && i + 1 < l.size() ? 2 : 1;
+        if (f.count == 2) f.job[1] = l[i + 1];
+        frames[k].push_back(f);
+      }
+    }
+  }
+  // Past the budget the core alone would not keep 30 fps (AR0234: four
+  // 1920x1080 frames take ~31 ms): the software ISP takes frames off the
+  // busier virtual ISP, half pairs first, on CPU6/7 while the core runs.
+  std::vector<int> software;
+  {
+    const double budget = HwBudgetPixels();
+    const double frame_px = static_cast<double>(w) * (h + 2);
+    for (;;) {
+      const size_t total = frames[0].size() + frames[1].size();
+      if (total <= 1 || total * frame_px <= budget) break;
+      const int k = frames[0].size() >= frames[1].size() ? 0 : 1;
+      std::vector<Frame> &fr = frames[k];
+      size_t pick = fr.size() - 1;
+      for (size_t i = 0; i < fr.size(); ++i)
+        if (fr[i].count == 2) pick = i;
+      for (int s = 0; s < fr[pick].count; ++s)
+        software.push_back(fr[pick].job[s]);
+      fr.erase(fr.begin() + static_cast<std::ptrdiff_t>(pick));
+    }
+  }
+  bool shifted = false;
+  for (std::vector<Frame> &fr : frames)
+    for (Frame &f : fr)
+      for (int s = 0; s < f.count; ++s) {
+        f.x[s] = (s ? half_w + gap : 0) + (f.shift[s] ? (s ? -1 : 1) : 0);
+        f.y[s] = f.shift[s] ? 1 : 0;
+        shifted |= f.shift[s];
+      }
+  const int frame_h = h + (shifted ? 2 : 0);
   const auto give_up = [](const char *what, const std::string &why) {
     std::fprintf(stderr,
                  "[rkisp] %s%s%s; using the software ISP from now on\n", what,
@@ -779,7 +1037,6 @@ bool ApplyBatch(const FastBalancedIspDispatchJob *jobs, int n) {
   // Statistics and the RAW and output copies are CPU work: keep them on an
   // A72 like the software path's caller.
   ScopedThreadAffinity caller_affinity(4);
-  const int w = jobs[0].raw->cols, h = jobs[0].raw->rows;
   if (virtual_isps.empty()) {
     for (int v = 0; v < 8; ++v) {
       Devices d;
@@ -787,11 +1044,33 @@ bool ApplyBatch(const FastBalancedIspDispatchJob *jobs, int n) {
       virtual_isps.push_back(d);
     }
   }
+  // CoreMhz(): the driver sizes the clock from the input sizes it last
+  // enumerated, which it re-reads only on RKISP_CMD_MULTI_DEV_FORCE_ENUM (or
+  // when the ISP powers up) and only while no virtual ISP streams. Before the
+  // first open every virtual ISP is given a large input size and enumerated;
+  // Open() then sets the real size, which the estimate does not see.
+  if (CoreMhz() && !isp[0].IsOpen(2, 2, isp[0].format()) &&
+      !isp[1].IsOpen(2, 2, isp[1].format())) {
+    const int phases = (std::max)(1, !frames[0].empty() + !frames[1].empty());
+    const double target = CoreMhz() == 702 ? 800.0 : 550.0;
+    const double each = target / (1.0 + 0.25 * phases) / 30.0 * 1e6 / phases;
+    const int pw = 3840;
+    const int rows = (static_cast<int>(std::ceil(each / pw)) + 1) & ~1;
+    const int ph = (std::max)(frame_h, (std::min)(3504, rows));
+    for (const Devices &d : virtual_isps)
+      VirtualIsp::SetInputSize(d, (std::max)(pw, w), ph);
+    if (!virtual_isps.empty() && !VirtualIsp::ForceEnum(virtual_isps[0]))
+      std::fprintf(stderr,
+                   "[rkisp] ISP clock left to the driver: sizes not re-read "
+                   "(%s; another ISP client is streaming)\n",
+                   std::strerror(errno));
+  }
+  // An open ISP at least as wide is kept (narrower frames are padded), so a
+  // six-image stream opens once. The two phases must be reconfigured one
+  // after the other: stopping both at once deadlocks in rkisp_stop_3a_run.
   for (int k = 0; k < 2; ++k) {
-    const bool used = std::any_of(jobs, jobs + n, [&](const auto &j) {
-      return (j.bayer == BayerConversion::kColorBayerBg2Bgr) == (k == 0);
-    });
-    if (!used || isp[k].IsOpen(w, h, jobs[0].output_format)) continue;
+    if (frames[k].empty() || isp[k].IsOpen(w, frame_h, jobs[0].output_format))
+      continue;
     // A virtual ISP held by another client (e.g. rkaiq_3A waiting for a
     // sensor) refuses the formats with EBUSY; try the next one.
     std::string why = "no rkisp-vir media device";
@@ -799,7 +1078,7 @@ bool ApplyBatch(const FastBalancedIspDispatchJob *jobs, int n) {
     for (int v = 0; v < static_cast<int>(virtual_isps.size()) && !opened;
          ++v) {
       if (v == bound[1 - k]) continue;
-      opened = isp[k].Open(virtual_isps[v], w, h, k == 0,
+      opened = isp[k].Open(virtual_isps[v], w, frame_h, k == 0,
                            jobs[0].output_format);
       if (opened)
         bound[k] = v;
@@ -808,49 +1087,131 @@ bool ApplyBatch(const FastBalancedIspDispatchJob *jobs, int n) {
     }
     if (!opened) return give_up("no usable virtual ISP", why);
   }
+  static Worker worker(5);
 
   const bool apply_tone = FastBalancedGammaEnabled();
   const bool exposure = apply_tone && GetFastExposureConfig().enabled;
   const FastBalancedToneLuts *tone =
       apply_tone ? &GetFastBalancedToneLuts() : nullptr;
 
-  // Each virtual ISP is driven by its own thread with up to two frames in
-  // flight, so one camera's tone/copy overlaps the core working on another.
-  const auto run = [&](int k) {
-    int pending[2], count = 0;
-    for (int i = 0; i < n; ++i) {
-      const FastBalancedIspDispatchJob &j = jobs[i];
-      if ((j.bayer == BayerConversion::kColorBayerBg2Bgr) != (k == 0))
-        continue;
-      if (count == 2) {
-        if (!isp[k].Collect(*jobs[pending[0]].output, tone)) return false;
-        pending[0] = pending[1];
-        count = 1;
-      }
+  // Writes frame f into the phase's RAW buffer and starts the ISP on it.
+  const auto submit = [&](VirtualIsp &v, const Frame &f) {
+    uint8_t *buf = v.RawBuffer();
+    const size_t stride = v.rd_stride();
+    const int fw = v.width(), fh = v.height();
+    Color c;
+    double nr_sum = 0.0;
+    for (int s = 0; s < f.count; ++s) {
+      const FastBalancedIspDispatchJob &j = jobs[f.job[s]];
       WhiteBalance &wb = *j.wb;
       wb.PrepareRawMetadata(*j.raw, j.metadata_region);
       wb.SetDisplayExposure(exposure, j.sensor_gain);
-      const WhiteBalance::LinearStage st =
-          wb.PrepareLinearStage(*j.raw, j.bayer);
-      Color c;
-      c.black = st.black;
-      c.r_gain = st.r_gain;
-      c.g_gain = st.g_gain;
-      c.b_gain = st.b_gain;
-      c.exposure = st.exposure;
-      c.knee = st.knee;
-      SelectNr(j.sensor_gain * wb.NrGainScale(), c);
-      if (!isp[k].Submit(*j.raw, wb, c)) return false;
-      pending[count++] = i;
+      const double nr_gain = j.sensor_gain * wb.NrGainScale();
+      // Half-height YNR matches the software post-average NR gain, not the
+      // tall-RAW BayerNR gain.
+      nr_sum += j.half_height
+                    ? (std::max)(1.0, nr_gain * kHalfHeightPostFrontNrRatio)
+                    : nr_gain;
+      uint8_t *dst = buf + static_cast<size_t>(f.y[s]) * stride + f.x[s];
+      const int cols = j.raw->cols;
+      if (cpu_front[f.job[s]]) {
+        cv::Mat linear(h, cols, CV_8UC1, dst, stride);
+        if (bayer_nr[f.job[s]])
+          wb.ApplyWithBayerNr(*j.raw, linear, nr_gain, j.bayer);
+        else
+          wb.ApplyTo(*j.raw, linear, j.bayer);
+      } else {
+        const WhiteBalance::LinearStage st =
+            wb.PrepareLinearStage(*j.raw, j.bayer);
+        c.black = st.black;
+        c.r_gain = st.r_gain;
+        c.g_gain = st.g_gain;
+        c.b_gain = st.b_gain;
+        c.exposure = st.exposure;
+        c.knee = st.knee;
+        for (int y = 0; y < h; ++y)
+          std::memcpy(dst + static_cast<size_t>(y) * stride,
+                      wb.RawRow(*j.raw, y), cols);
+      }
+      // Rows above and below the image reflect it.
+      for (int y = 0; y < fh; ++y) {
+        if (y >= f.y[s] && y < f.y[s] + h) continue;
+        std::memcpy(buf + static_cast<size_t>(y) * stride + f.x[s],
+                    dst + static_cast<size_t>(ReflectColumn(y - f.y[s], h)) *
+                              stride,
+                    cols);
+      }
     }
-    for (int p = 0; p < count; ++p)
-      if (!isp[k].Collect(*jobs[pending[p]].output, tone)) return false;
+    // Columns outside the images reflect the nearest one.
+    int end[2];
+    for (int s = 0; s < f.count; ++s) end[s] = f.x[s] + jobs[f.job[s]].raw->cols;
+    std::vector<int> pad;  // (column, source column) pairs
+    for (int x = 0; x < fw; ++x) {
+      int best = -1, dist = 0;
+      for (int s = 0; s < f.count; ++s) {
+        const int d = x < f.x[s] ? f.x[s] - x : x >= end[s] ? x - end[s] + 1 : 0;
+        if (best < 0 || d < dist) best = s, dist = d;
+      }
+      if (dist == 0) continue;
+      pad.push_back(x);
+      pad.push_back(f.x[best] + ReflectColumn(x - f.x[best],
+                                              end[best] - f.x[best]));
+    }
+    for (int y = 0; y < fh && !pad.empty(); ++y) {
+      uint8_t *row = buf + static_cast<size_t>(y) * stride;
+      for (size_t p = 0; p < pad.size(); p += 2) row[pad[p]] = row[pad[p + 1]];
+    }
+    SelectNr(nr_sum / f.count, c);
+    return v.Submit(c);
+  };
+  const auto collect = [&](VirtualIsp &v, const Frame &f) {
+    VirtualIsp::Region r[2];
+    for (int s = 0; s < f.count; ++s) {
+      const FastBalancedIspDispatchJob &j = jobs[f.job[s]];
+      r[s] = {j.output, f.x[s], f.y[s], j.raw->cols, h, j.half_height};
+    }
+    return v.Collect(r, f.count, tone);
+  };
+  // Each virtual ISP is driven by its own thread with up to two frames in
+  // flight, so one frame's tone/copy overlaps the core working on another.
+  const auto run = [&](int k) {
+    const std::vector<Frame> &fr = frames[k];
+    for (size_t i = 0; i < fr.size(); ++i) {
+      if (i >= 2 && !collect(isp[k], fr[i - 2])) return false;
+      if (!submit(isp[k], fr[i])) return false;
+    }
+    for (size_t i = fr.size() > 2 ? fr.size() - 2 : 0; i < fr.size(); ++i)
+      if (!collect(isp[k], fr[i])) return false;
     return true;
   };
-  static Worker worker(5);
-  worker.Start([&] { return run(1); });
+  static Worker software_worker6(6), software_worker7(7);
+  Worker *const software_worker[2] = {&software_worker6, &software_worker7};
+  const int lanes = (std::min)(2, static_cast<int>(software.size()));
+  for (int l = 0; l < lanes; ++l)
+    software_worker[l]->Start([&, l] {
+      // One job per core: no intra-frame stage threads on the ISP's CPUs.
+      GetFastIspStagePool().BeginMultiCameraBatch();
+      bool ok = true;
+      try {
+        for (size_t i = l; i < software.size(); i += 2) {
+          const FastBalancedIspDispatchJob &j = jobs[software[i]];
+          ApplyFastBalancedISPImpl(*j.raw, *j.output, *j.wb, j.name,
+                                   j.sensor_gain, j.bayer, j.output_format,
+                                   j.raw_bayer_nr_done, j.metadata_region,
+                                   nullptr, j.half_height);
+        }
+      } catch (...) {
+        ok = false;
+      }
+      GetFastIspStagePool().EndMultiCameraBatch();
+      return ok;
+    });
+  if (!frames[1].empty()) worker.Start([&] { return run(1); });
   const bool ok0 = run(0);
-  const bool ok1 = worker.Wait();
+  const bool ok1 = frames[1].empty() || worker.Wait();
+  bool software_ok = true;
+  for (int l = 0; l < lanes; ++l) software_ok &= software_worker[l]->Wait();
+  if (!software_ok) return false;
   if (!ok0) return give_up("rkisp RGGB", isp[0].error());
   if (!ok1) return give_up("rkisp BGGR", isp[1].error());
   return true;

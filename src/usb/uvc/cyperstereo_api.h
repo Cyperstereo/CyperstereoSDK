@@ -14145,23 +14145,7 @@ class IspProcessor {
 
     if (UsesFastBalanced()) {
       std::array<detail::FastBalancedIspDispatchJob, 4> dispatch{};
-      const IspPixelFormat output_format =
-          UsesUyvy422() ? IspPixelFormat::kUyvy422Bt601FullRange
-                        : IspPixelFormat::kBgr888;
-      for (int i = 0; i < n; ++i) {
-        CV_Assert(jobs[i].raw != nullptr && jobs[i].output != nullptr);
-        dispatch[i].raw = jobs[i].raw;
-        dispatch[i].output = jobs[i].output;
-        fast_wb_[i].SetNrGainScale(jobs[i].nr_gain_scale);
-        dispatch[i].wb = &fast_wb_[i];
-        dispatch[i].name = jobs[i].name;
-        dispatch[i].sensor_gain = jobs[i].sensor_gain;
-        dispatch[i].bayer = jobs[i].bayer;
-        dispatch[i].output_format = output_format;
-        dispatch[i].raw_bayer_nr_done = jobs[i].raw_bayer_nr_done;
-        dispatch[i].metadata_region = jobs[i].metadata_region;
-        dispatch[i].half_height = jobs[i].half_height;
-      }
+      FillDispatch(jobs, n, dispatch.data());
       detail::ApplyFastBalancedISPParallelImpl(dispatch.data(), n);
       return;
     }
@@ -14194,6 +14178,34 @@ class IspProcessor {
     ApplyParallel(jobs.begin(), static_cast<int>(jobs.size()));
   }
 
+  // ApplyParallel(jobs) here and ApplyParallel(other_jobs) on `other` (e.g.
+  // the SC136HGS six-image full planes and half images, which keep separate
+  // WB histories). On the RK3576 ISP39 both run as one hardware batch.
+  void ApplyParallelWith(const IspFrameJob *jobs, int n, IspProcessor &other,
+                         const IspFrameJob *other_jobs, int other_n) {
+    if (ApplyHardwareWith(jobs, n, other, other_jobs, other_n)) return;
+    ApplyParallel(jobs, n);
+    other.ApplyParallel(other_jobs, other_n);
+  }
+
+  // The hardware half of ApplyParallelWith: false, with nothing processed,
+  // when there is no hardware ISP or it does not take the batch.
+  bool ApplyHardwareWith(const IspFrameJob *jobs, int n, IspProcessor &other,
+                         const IspFrameJob *other_jobs, int other_n) {
+#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+    if (UsesFastBalanced() && other.mode_ == mode_ && n > 0 && n <= 4 &&
+        other_n > 0 && other_n <= 4 && detail::RkHwIspBackendRequested()) {
+      std::array<detail::FastBalancedIspDispatchJob, 8> dispatch{};
+      FillDispatch(jobs, n, dispatch.data());
+      other.FillDispatch(other_jobs, other_n, dispatch.data() + n);
+      return detail::ApplyRkHwIspParallel(dispatch.data(), n + other_n);
+    }
+#else
+    (void)jobs; (void)n; (void)other; (void)other_jobs; (void)other_n;
+#endif
+    return false;
+  }
+
   // Digital exposure the fast-balanced path applied to job slot `i` in the
   // last ApplyParallel call (BGR or UYVY); 1 when disabled (quality path,
   // Gamma off, CYPERSTEREO_FAST_EXPOSURE=off). Read it between calls only.
@@ -14203,6 +14215,27 @@ class IspProcessor {
   }
 
  private:
+  void FillDispatch(const IspFrameJob *jobs, int n,
+                    detail::FastBalancedIspDispatchJob *dispatch) {
+    const IspPixelFormat output_format =
+        UsesUyvy422() ? IspPixelFormat::kUyvy422Bt601FullRange
+                      : IspPixelFormat::kBgr888;
+    for (int i = 0; i < n; ++i) {
+      CV_Assert(jobs[i].raw != nullptr && jobs[i].output != nullptr);
+      dispatch[i].raw = jobs[i].raw;
+      dispatch[i].output = jobs[i].output;
+      fast_wb_[i].SetNrGainScale(jobs[i].nr_gain_scale);
+      dispatch[i].wb = &fast_wb_[i];
+      dispatch[i].name = jobs[i].name;
+      dispatch[i].sensor_gain = jobs[i].sensor_gain;
+      dispatch[i].bayer = jobs[i].bayer;
+      dispatch[i].output_format = output_format;
+      dispatch[i].raw_bayer_nr_done = jobs[i].raw_bayer_nr_done;
+      dispatch[i].metadata_region = jobs[i].metadata_region;
+      dispatch[i].half_height = jobs[i].half_height;
+    }
+  }
+
   IspMode mode_;
   std::array<WhiteBalance, 4> fast_wb_{};
   std::array<cv::Mat, 4> quality_tall_;

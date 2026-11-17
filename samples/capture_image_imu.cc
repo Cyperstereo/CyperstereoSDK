@@ -840,16 +840,8 @@ static int run(int argc, char *argv[]) {
             }
           }
         }
-        six_this_frame = use_six_scheduler &&
+        const bool ar0234_six = use_six_scheduler &&
             IsAr0234FamilyHardware(static_cast<int>(hardware_version));
-        if (!six_this_frame) {
-          isp.ApplyParallel({
-              {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
-               fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
-              {right_image, right_color, "cam2", isp_camera_gain[1],
-               image2_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
-          });
-        }
         half_planes.Split(left_front_image, right_front_image, half_raw);
         const BayerConversion *cam_bayer = halves.bayer;
         const double *cam_gain = halves.gain;
@@ -861,27 +853,63 @@ static int run(int argc, char *argv[]) {
         cv::Mat &hr3 = half_planes.IspRaw(half_raw, 3), &hc3 = half_color[3];
         // The FPGA leaves the half lanes unfiltered (nr_active = 0), and they
         // carry no metadata row, so the host NR runs and no region is masked.
-        if (six_this_frame) {
-          if (!six_isp) six_isp.reset(new SixCameraIspProcessor(
-              use_uyvy422 ? IspPixelFormat::kUyvy422Bt601FullRange
-                          : IspPixelFormat::kBgr888));
-          const IspFrameJob jobs[] = {
-              {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
-               fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
-              {right_image, right_color, "cam2", isp_camera_gain[1], image2_bayer,
-               fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
-              {hr0, hc0, halves.name[0], cam_gain[0], cam_bayer[0], false, {}, half_nr, half_tall},
-              {hr1, hc1, halves.name[1], cam_gain[1], cam_bayer[1], false, {}, half_nr, half_tall},
-              {hr2, hc2, halves.name[2], cam_gain[2], cam_bayer[2], false, {}, half_nr, half_tall},
-              {hr3, hc3, halves.name[3], cam_gain[3], cam_bayer[3], false, {}, half_nr, half_tall}};
-          six_isp->Apply(jobs);
+        // C1/C2 and the four halves keep separate WB histories but form one
+        // hardware ISP batch where there is one.
+        const IspFrameJob full_jobs[] = {
+            {left_image, left_color, "cam1", isp_camera_gain[0], image1_bayer,
+             fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
+            {right_image, right_color, "cam2", isp_camera_gain[1],
+             image2_bayer, fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)}};
+        const IspFrameJob half_jobs[] = {
+            {hr0, hc0, halves.name[0], cam_gain[0], cam_bayer[0], false, {}, half_nr, half_tall},
+            {hr1, hc1, halves.name[1], cam_gain[1], cam_bayer[1], false, {}, half_nr, half_tall},
+            {hr2, hc2, halves.name[2], cam_gain[2], cam_bayer[2], false, {}, half_nr, half_tall},
+            {hr3, hc3, halves.name[3], cam_gain[3], cam_bayer[3], false, {}, half_nr, half_tall}};
+        if (ar0234_six) {
+          // Without the hardware ISP, AR0234's 1920x1080 planes need the
+          // six-thread scheduler to keep 30 fps.
+          six_this_frame =
+              !isp.ApplyHardwareWith(full_jobs, 2, half_isp, half_jobs, 4);
+          if (six_this_frame) {
+            if (!six_isp) six_isp.reset(new SixCameraIspProcessor(
+                use_uyvy422 ? IspPixelFormat::kUyvy422Bt601FullRange
+                            : IspPixelFormat::kBgr888));
+            const IspFrameJob jobs[] = {full_jobs[0], full_jobs[1],
+                                        half_jobs[0], half_jobs[1],
+                                        half_jobs[2], half_jobs[3]};
+            six_isp->Apply(jobs);
+          }
         } else {
-          half_isp.ApplyParallel({
-              {hr0, hc0, halves.name[0], cam_gain[0], cam_bayer[0], false, {}, half_nr, half_tall},
-              {hr1, hc1, halves.name[1], cam_gain[1], cam_bayer[1], false, {}, half_nr, half_tall},
-              {hr2, hc2, halves.name[2], cam_gain[2], cam_bayer[2], false, {}, half_nr, half_tall},
-              {hr3, hc3, halves.name[3], cam_gain[3], cam_bayer[3], false, {}, half_nr, half_tall},
-          });
+          isp.ApplyParallelWith(full_jobs, 2, half_isp, half_jobs, 4);
+        }
+        {
+          // The six ISP inputs of --save-at, replayable by isp_quad_bench
+          // six (a half carries its NR scale and half-height flag).
+          static const bool dump_six_jobs =
+              std::getenv("CYPERSTEREO_DUMP_ISP_JOBS") != nullptr;
+          if (dump_six_jobs && save_at >= 0 && count == save_at) {
+            std::ofstream jobs_file("isp_jobs_" + std::to_string(count) + ".txt");
+            for (int i = 0; i < 6; ++i) {
+              const IspFrameJob &j = i < 2 ? full_jobs[i] : half_jobs[i - 2];
+              const std::string file = "isp_raw_" + std::to_string(count) +
+                                       "_" + (i < 2 ? "full" : "half") +
+                                       std::to_string(i < 2 ? i + 1 : i - 1) +
+                                       ".png";
+              cv::imwrite(file, *j.raw);
+              jobs_file << file << ' ' << std::setprecision(9) << j.sensor_gain
+                        << ' ' << static_cast<int>(j.bayer) << ' '
+                        << (j.raw_bayer_nr_done ? 1 : 0) << ' '
+                        << j.metadata_region.row << ' '
+                        << j.metadata_region.first_col << ' '
+                        << j.metadata_region.end_col;
+              if (i >= 2)
+                jobs_file << ' ' << j.nr_gain_scale << ' '
+                          << (j.half_height ? 1 : 0);
+              jobs_file << '\n';
+            }
+            std::cout << "[save] isp_jobs_" << count << ".txt (six-image)"
+                      << std::endl;
+          }
         }
         OrientSixImageHalves(hardware_version, half_raw, half_color);
         // V1.6: half_isp slots 2/3 are physical C5/C6, same digital exposure

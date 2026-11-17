@@ -37,6 +37,8 @@ struct ReplayJob {
   BayerConversion bayer = BayerConversion::kColorBayerRg2Bgr;
   bool nr_done = false;
   RawMetadataRegion region;
+  double nr_scale = 1.0;
+  bool half = false;
 };
 
 double NowMs(clockid_t clock) {
@@ -59,6 +61,8 @@ bool LoadJobs(const std::string &path, std::vector<ReplayJob> &jobs) {
     fields >> job.file >> job.gain >> bayer >> nr >> job.region.row >>
         job.region.first_col >> job.region.end_col;
     if (!fields) return false;
+    int half = 0;
+    if (fields >> job.nr_scale >> half) job.half = half != 0;
     job.bayer = static_cast<BayerConversion>(bayer);
     job.nr_done = nr != 0;
     job.raw = cv::imread(dir + job.file, cv::IMREAD_GRAYSCALE);
@@ -68,7 +72,7 @@ bool LoadJobs(const std::string &path, std::vector<ReplayJob> &jobs) {
     }
     jobs.push_back(std::move(job));
   }
-  return jobs.size() == 4;
+  return jobs.size() == 4 || jobs.size() == 6;
 }
 
 // BT.601 full range, the fast ISP's UYVY definition.
@@ -91,10 +95,140 @@ cv::Mat Uyvy422Bt601FullRangeToBgr(const cv::Mat &uyvy) {
   return bgr;
 }
 
-int Run(int argc, char **argv) {
+// Same-colour horizontal 2:1 bin. Phase is unchanged, so the source camera's
+// BayerConversion still applies. 1280 -> 640, the SC136HGS six-image half
+// width the FPGA produces before the host demosaics at full height.
+void BayerHBin2SameColor(const cv::Mat &src, cv::Mat &dst) {
+  CV_Assert(src.type() == CV_8U && src.cols >= 4 && (src.cols % 4) == 0);
+  dst.create(src.rows, src.cols / 2, CV_8U);
+  for (int y = 0; y < src.rows; ++y) {
+    const uchar *s = src.ptr<uchar>(y);
+    uchar *d = dst.ptr<uchar>(y);
+    for (int x = 0; x < dst.cols; ++x) {
+      const int a = ((x >> 1) << 2) + (x & 1);
+      d[x] = static_cast<uchar>((s[a] + s[a + 2] + 1) >> 1);
+    }
+  }
+}
+
+// SC136HGS six-image schedule (not the AR0234 six-thread scheduler): the two
+// full planes and the four demosaic-first halves, as one ApplyParallelWith
+// call ("pair", default) or as two ApplyParallel calls ("split"). A six-line
+// job file from capture_image_imu holds the real halves; with a quad file
+// the halves are a same-colour horizontal bin of the four quad RAWs, the
+// pixel count and Bayer phase of the real half lanes.
+int RunSix(int argc, char **argv) {
   if (argc < 4) return 64;
   std::vector<ReplayJob> jobs;
   if (!LoadJobs(argv[2], jobs)) {
+    std::cerr << "invalid job file " << argv[2] << std::endl;
+    return 65;
+  }
+  const std::string prefix = argv[3];
+  const int iterations = argc > 4 ? std::max(40, std::atoi(argv[4])) : 120;
+  const bool split = argc > 5 && std::string(argv[5]) == "split";
+  constexpr int kWarmup = 20;
+  const bool real = jobs.size() == 6;
+  cv::Mat half_raw[4];
+  double half_gain[4], half_scale[4];
+  BayerConversion half_bayer[4];
+  for (int i = 0; i < 4; ++i) {
+    const ReplayJob &src = jobs[real ? i + 2 : i];
+    if (real)
+      half_raw[i] = src.raw;
+    else
+      BayerHBin2SameColor(src.raw, half_raw[i]);
+    half_gain[i] = src.gain;
+    half_bayer[i] = src.bayer;
+    half_scale[i] = real ? src.nr_scale : kHalfResTallNrGainScale;
+  }
+  cv::Mat half_out[4];
+  const bool uyvy = argc > 6 && std::string(argv[6]) == "uyvy";
+  const IspMode mode = uyvy ? IspMode::kFastBalancedUyvy422Bt601FullRange
+                            : IspMode::kFastBalancedBgr888;
+  IspProcessor full(mode);
+  IspProcessor halves(mode);
+  IspFrameJob full_jobs[] = {
+      {jobs[0].raw, jobs[0].output, "cam1", jobs[0].gain, jobs[0].bayer,
+       jobs[0].nr_done, jobs[0].region},
+      {jobs[1].raw, jobs[1].output, "cam2", jobs[1].gain, jobs[1].bayer,
+       jobs[1].nr_done, jobs[1].region},
+  };
+  static const char *const kHalf[4] = {"half0", "half1", "half2", "half3"};
+  IspFrameJob half_jobs[4] = {
+      {half_raw[0], half_out[0], kHalf[0], half_gain[0], half_bayer[0], false,
+       {}, half_scale[0], true},
+      {half_raw[1], half_out[1], kHalf[1], half_gain[1], half_bayer[1], false,
+       {}, half_scale[1], true},
+      {half_raw[2], half_out[2], kHalf[2], half_gain[2], half_bayer[2], false,
+       {}, half_scale[2], true},
+      {half_raw[3], half_out[3], kHalf[3], half_gain[3], half_bayer[3], false,
+       {}, half_scale[3], true},
+  };
+  std::vector<double> wall, cpu, full_wall, half_wall;
+  int full_hw = 0, half_hw = 0;
+  for (int it = 0; it < iterations; ++it) {
+    const double w0 = NowMs(CLOCK_MONOTONIC);
+    const double c0 = NowMs(CLOCK_PROCESS_CPUTIME_ID);
+    double mid = w0;
+    if (split) {
+      full.ApplyParallel(full_jobs, 2);
+#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+      full_hw = detail::RkHwIspLastBatchOnHardware() ? 1 : 0;
+#endif
+      mid = NowMs(CLOCK_MONOTONIC);
+      halves.ApplyParallel(half_jobs, 4);
+#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+      half_hw = detail::RkHwIspLastBatchOnHardware() ? 1 : 0;
+#endif
+    } else {
+      full.ApplyParallelWith(full_jobs, 2, halves, half_jobs, 4);
+#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+      full_hw = half_hw = detail::RkHwIspLastBatchOnHardware() ? 1 : 0;
+#endif
+    }
+    if (it >= kWarmup) {
+      const double end = NowMs(CLOCK_MONOTONIC);
+      wall.push_back(end - w0);
+      cpu.push_back(NowMs(CLOCK_PROCESS_CPUTIME_ID) - c0);
+      full_wall.push_back(mid - w0);
+      half_wall.push_back(end - mid);
+    }
+  }
+  const auto avg = [](const std::vector<double> &v) {
+    double s = 0;
+    for (double x : v) s += x;
+    return s / v.size();
+  };
+  std::cout << std::fixed << std::setprecision(2)
+            << "[six] " << (real ? "real" : "binned") << " "
+            << (split ? "split" : "pair") << " gain=" << jobs[0].gain << "/"
+            << half_gain[0] << " frames=" << wall.size()
+            << " full_hw=" << full_hw << " half_hw=" << half_hw
+            << " wall_avg=" << avg(wall) << " cpu_avg=" << avg(cpu)
+            << " full_wall=" << avg(full_wall)
+            << " half_wall=" << avg(half_wall) << " ms" << std::endl;
+  std::cout << "[six] full " << jobs[0].output.cols << "x" << jobs[0].output.rows
+            << "  half " << half_out[0].cols << "x" << half_out[0].rows
+            << "  bayer " << static_cast<int>(jobs[0].bayer)
+            << static_cast<int>(jobs[1].bayer) << "/"
+            << static_cast<int>(half_bayer[0]) << static_cast<int>(half_bayer[1])
+            << static_cast<int>(half_bayer[2]) << static_cast<int>(half_bayer[3])
+            << std::endl;
+  for (int i = 0; i < 2; ++i)
+    cv::imwrite(prefix + "_full" + std::to_string(i + 1) + ".png",
+                uyvy ? Uyvy422Bt601FullRangeToBgr(jobs[i].output)
+                     : jobs[i].output);
+  for (int i = 0; i < 4; ++i)
+    cv::imwrite(prefix + "_half" + std::to_string(i + 1) + ".png",
+                uyvy ? Uyvy422Bt601FullRangeToBgr(half_out[i]) : half_out[i]);
+  return 0;
+}
+
+int Run(int argc, char **argv) {
+  if (argc < 4) return 64;
+  std::vector<ReplayJob> jobs;
+  if (!LoadJobs(argv[2], jobs) || jobs.size() != 4) {
     std::cerr << "invalid job file " << argv[2] << std::endl;
     return 65;
   }
@@ -229,9 +363,12 @@ int main(int argc, char **argv) {
   cv::setNumThreads(1);
   GetThreadPriorityConfig().enable = false;
   if (argc > 1 && std::string(argv[1]) == "run") return Run(argc, argv);
+  if (argc > 1 && std::string(argv[1]) == "six") return RunSix(argc, argv);
   if (argc > 1 && std::string(argv[1]) == "compare") return Compare(argc, argv);
   std::cerr << "usage: isp_quad_bench run <isp_jobs.txt> <out_prefix> "
                "[iterations] [par|seq] [bgr|uyvy]\n"
+               "       isp_quad_bench six <isp_jobs.txt> <out_prefix> "
+               "[iterations] [pair|split] [bgr|uyvy]\n"
                "       isp_quad_bench compare <reference.png> <candidate.png>"
             << std::endl;
   return 64;
