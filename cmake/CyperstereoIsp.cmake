@@ -17,6 +17,11 @@ function(cyperstereo_add_isp target sdk_root)
   target_include_directories(${target}
     PRIVATE ${_isp}/srcs/include ${_isp}/thirdparty/easylog
     PUBLIC ${OpenCV_INCLUDE_DIRS})
+  # RK3576 ISP39 backend; empty unless CYPERSTEREO_RK3576 is defined.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(${target} PRIVATE ${_sdk}/src/usb/uvc/rk_hw_isp.cc)
+    target_include_directories(${target} PRIVATE ${_sdk}/src/usb/uvc/rkisp)
+  endif()
   target_compile_definitions(${target} PRIVATE
     ELPP_THREAD_SAFE ELPP_NO_DEFAULT_LOG_FILE)
   if(MSVC)

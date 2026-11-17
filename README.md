@@ -44,6 +44,7 @@ cmake --build samples/build --parallel 4
 When **cross-compiling** (or to force a specific tuning), pass `-DTARGET_BOARD`:
 ```c
 # --- Rockchip / Horizon / Raspberry Pi ---
+cmake -DTARGET_BOARD=rk3576 ..         # RK3576 (Cortex-A72 + A53), hardware ISP by default
 cmake -DTARGET_BOARD=rk3588 ..         # RK3588 (Cortex-A76 + A55)
 cmake -DTARGET_BOARD=sunrise-x5 ..     # Horizon Sunrise/Journey X5 (Cortex-A55)
 cmake -DTARGET_BOARD=pi5 ..            # Raspberry Pi 5 (Cortex-A76)
@@ -61,6 +62,69 @@ cmake -DTARGET_BOARD=generic ..        # portable ARMv8-A + NEON, no CPU-specifi
 
 make
 ```
+
+## Rockchip hardware ISP
+
+The fast-balanced ISP (BGR888 and UYVY422 output) can run on the Rockchip
+ISP core instead of the CPU. The backend is selected at build time:
+
+| Build | Default ISP |
+|---|---|
+| `TARGET_BOARD=rk3576`, or a native `auto` build on an RK3576 (AArch64) | hardware ISP39 core (`src/usb/uvc/rk_hw_isp.cc`) |
+| `TARGET_BOARD=rk3588` | software ISP; the RK3588 ISP30 core is not supported by the hardware backend yet |
+| every other board, x86 Linux, Windows, macOS | software ISP |
+
+This applies to the samples and ROS builds. The ROS 2 build does not have a
+`rk3576` board option yet and always uses the software ISP.
+
+```c
+cd ~/CyperstereoSDK
+cmake -S samples -B samples/build -DCMAKE_BUILD_TYPE=Release -DTARGET_BOARD=rk3576
+cmake --build samples/build --parallel 4
+./samples/build/capture_image_imu                            # hardware ISP
+CYPERSTEREO_ISP_BACKEND=sw ./samples/build/capture_image_imu # force the software ISP
+```
+
+Each RAW8 frame is replayed from memory through the ISP (rawrd -> ISP ->
+selfpath BGR / mainpath UYVY) without rkaiq. Black level, white balance,
+digital exposure and the highlight roll-off follow the software ISP of the
+same frame; YNR/CNR strength follows the sensor gain. The shared-luminance
+tone stays on the CPU, fused into the copy out of the ISP buffer. At low gain
+the output is within 40-50 dB PSNR of the software ISP.
+
+The hardware backend needs two free `rkisp-vir` virtual ISPs (one per CFA
+phase) and read/write access to their `/dev/video*` and `/dev/v4l-subdev*`
+nodes (normally the `video` group). A virtual ISP held by another client, for
+example `rkaiq_3A` waiting for a sensor, is skipped. A batch falls back to the
+software ISP when:
+
+- no virtual ISP can be opened or the ISP reports an error. This prints
+  `[rkisp] ...; using the software ISP from now on` once, and the process
+  then stays on the software ISP;
+- it would need the software BayerNR: the NR gain is at least
+  `CYPERSTEREO_RKISP_MAX_NR_GAIN` (default 3) and the FPGA BayerNR is off;
+- it contains half-height (six-image) jobs, odd image sizes, or mixed sizes or
+  output formats.
+
+Runtime tuning:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CYPERSTEREO_ISP_BACKEND` | hardware | `sw` (or `software`, `cpu`) keeps every batch on the software ISP |
+| `CYPERSTEREO_RKISP_MAX_NR_GAIN` | 3 | NR gain from which batches without FPGA BayerNR stay on the CPU |
+| `CYPERSTEREO_RKISP_NR_GAIN_SCALE` | 0.4 | YNR/CNR noise-model gain relative to the NR gain; higher values smooth flat walls more but lose fine texture |
+
+Measured on RK3576 with four 1280x1024 cameras at 30 fps, `performance`
+governor:
+
+| | Software ISP | Hardware ISP |
+|---|---|---|
+| CPU time per four-camera frame | 52-56 ms (about 1.6-1.7 cores) | 19-20 ms (about 0.6 cores) |
+| ISP latency per four-camera frame | 14-15 ms | 21-22 ms |
+
+The hardware ISP has the higher latency because both virtual ISPs share one
+ISP core and run back to back. It frees about one A72 core for the
+application.
 
 ## SmartSens firmware 2/3, 2/4, 2/5, 2/6, 2/7 and 2/8
 

@@ -1,10 +1,11 @@
 // Offline replay of the four-camera fast-balanced ISP.
 //
 //   isp_quad_bench run <isp_jobs_N.txt> <out_prefix> [iterations] [par|seq]
+//                      [bgr|uyvy]
 //     Replays the RAW planes written by capture_image_imu --save-at (with
 //     CYPERSTEREO_DUMP_ISP_JOBS=1 set) and
 //     reports wall/CPU time per frame. The last frame is written as
-//     <out_prefix>_camN.png.
+//     <out_prefix>_camN.png (UYVY output converted to BGR).
 //   isp_quad_bench compare <reference.png> <candidate.png>
 //     Prints max/mean absolute difference, PSNR and luma SSIM.
 #include <time.h>
@@ -70,6 +71,26 @@ bool LoadJobs(const std::string &path, std::vector<ReplayJob> &jobs) {
   return jobs.size() == 4;
 }
 
+// BT.601 full range, the fast ISP's UYVY definition.
+cv::Mat Uyvy422Bt601FullRangeToBgr(const cv::Mat &uyvy) {
+  cv::Mat bgr(uyvy.rows, uyvy.cols, CV_8UC3);
+  for (int y = 0; y < uyvy.rows; ++y) {
+    const uchar *src = uyvy.ptr<uchar>(y);
+    uchar *dst = bgr.ptr<uchar>(y);
+    for (int x = 0; x + 1 < uyvy.cols; x += 2, src += 4, dst += 6) {
+      const double cb = src[0] - 128.0, cr = src[2] - 128.0;
+      for (int k = 0; k < 2; ++k) {
+        const double luma = src[1 + 2 * k];
+        dst[3 * k + 0] = cv::saturate_cast<uchar>(luma + 1.772 * cb);
+        dst[3 * k + 1] =
+            cv::saturate_cast<uchar>(luma - 0.344136 * cb - 0.714136 * cr);
+        dst[3 * k + 2] = cv::saturate_cast<uchar>(luma + 1.402 * cr);
+      }
+    }
+  }
+  return bgr;
+}
+
 int Run(int argc, char **argv) {
   if (argc < 4) return 64;
   std::vector<ReplayJob> jobs;
@@ -80,13 +101,15 @@ int Run(int argc, char **argv) {
   const std::string prefix = argv[3];
   const int iterations = argc > 4 ? std::max(40, std::atoi(argv[4])) : 200;
   const bool sequential = argc > 5 && std::string(argv[5]) == "seq";
+  const bool uyvy = argc > 6 && std::string(argv[6]) == "uyvy";
+  const IspMode mode = uyvy ? IspMode::kFastBalancedUyvy422Bt601FullRange
+                            : IspMode::kFastBalancedBgr888;
   constexpr int kWarmup = 30;
   static const char *const kNames[4] = {"cam1", "cam2", "cam3", "cam4"};
 
-  IspProcessor parallel(IspMode::kFastBalancedBgr888);
+  IspProcessor parallel(mode);
   std::vector<std::unique_ptr<IspProcessor>> single;
-  for (int i = 0; i < 4; ++i)
-    single.emplace_back(new IspProcessor(IspMode::kFastBalancedBgr888));
+  for (int i = 0; i < 4; ++i) single.emplace_back(new IspProcessor(mode));
   std::vector<IspFrameJob> frame_jobs;
   for (int i = 0; i < 4; ++i)
     frame_jobs.emplace_back(jobs[i].raw, jobs[i].output, kNames[i],
@@ -137,7 +160,8 @@ int Run(int argc, char **argv) {
   }
   for (int i = 0; i < 4; ++i)
     cv::imwrite(prefix + "_cam" + std::to_string(i + 1) + ".png",
-                jobs[i].output);
+                uyvy ? Uyvy422Bt601FullRangeToBgr(jobs[i].output)
+                     : jobs[i].output);
   return 0;
 }
 
@@ -207,7 +231,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && std::string(argv[1]) == "run") return Run(argc, argv);
   if (argc > 1 && std::string(argv[1]) == "compare") return Compare(argc, argv);
   std::cerr << "usage: isp_quad_bench run <isp_jobs.txt> <out_prefix> "
-               "[iterations] [par|seq]\n"
+               "[iterations] [par|seq] [bgr|uyvy]\n"
                "       isp_quad_bench compare <reference.png> <candidate.png>"
             << std::endl;
   return 64;

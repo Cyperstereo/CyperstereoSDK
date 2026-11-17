@@ -2270,6 +2270,22 @@ inline bool FastSkipLumaNr() {
   return enabled;
 }
 
+// Factor on the guided luma-NR eps for linear (RAW) input. At 1.0 the woven
+// carpet texture at gain 10 (2-3 DN on the quarter grid) fell under the
+// threshold and was wiped; 0.25 recovers most of it while flat walls stay
+// within ~0.15 DN RMS of the old output. Env CYPERSTEREO_FAST_LUMA_EPS_GAIN
+// (0.05..4; 1 restores the previous output).
+inline double FastLumaEpsGain() {
+  static const double g = [] {
+    if (const char *e = std::getenv("CYPERSTEREO_FAST_LUMA_EPS_GAIN")) {
+      const double v = std::atof(e);
+      if (v >= 0.05 && v <= 4.0) return v;
+    }
+    return 0.25;
+  }();
+  return g;
+}
+
 // Drops the half-resolution 3x3 chroma median. Isolated colour specks remain.
 inline bool FastSkipChromaMedian() {
   static const bool enabled = [] {
@@ -2316,6 +2332,10 @@ class WhiteBalance {
   void RepairExistingRawCopy(const cv::Mat &raw, cv::Mat &copy) const {
     raw_rows_.RepairExistingCopy(raw, copy);
   }
+  // RAW row `y` as the ISP sees it (metadata row repaired).
+  const uchar *RawRow(const cv::Mat &raw, int y) const {
+    return raw_rows_.Row(raw, y);
+  }
   // Enables the display-path digital exposure for the following frames.
   // BGR and UYVY share this exposure; the quality path remains separate.
   // `analog_gain` is the sensor's current analog gain from the metadata row.
@@ -2332,6 +2352,28 @@ class WhiteBalance {
   double NrGainScale() const { return nr_gain_scale_; }
   // Exposure applied by the current LUTs, quantized to Q7 (128 = 1x).
   double DisplayExposure() const { return lut_exposure_q7_ / 128.0; }
+
+  // The linear WB LUT stage of the current frame as parameters for a
+  // hardware ISP: output = roll(max(raw - black, 0) * gain * exposure).
+  struct LinearStage {
+    double black;
+    double r_gain, g_gain, b_gain;  // white balance only, exposure excluded
+    double exposure;
+    double knee;                    // roll-off start in output DN, 0 = clip
+  };
+  // Same per-frame state transition as Apply()/ApplyTo() without touching
+  // any pixels. Call PrepareRawMetadata() and SetDisplayExposure() first.
+  LinearStage PrepareLinearStage(const cv::Mat &raw, BayerConversion bayer) {
+    PrepareLutsForFrame(raw, bayer);
+    LinearStage s;
+    s.black = lut_black_;
+    s.r_gain = lut_rg_;
+    s.g_gain = lut_g_scale_;
+    s.b_gain = lut_bg_;
+    s.exposure = lut_exposure_q7_ / 128.0;
+    s.knee = FastExposureKneeEffective(GetFastExposureConfig());
+    return s;
+  }
 
   void Apply(
       cv::Mat &raw,
@@ -11978,7 +12020,8 @@ inline void SuppressFalseColorImpl(const cv::Mat *raw_wb, cv::Mat &color,
   const float luma_eps_scale = static_cast<float>(
       nr_exposure *
       ((luma_eps_factor > 0.0 && luma_eps_factor <= 1.0) ? luma_eps_factor
-                                                          : 1.0));
+                                                          : 1.0) *
+      (linear_input ? FastLumaEpsGain() : 1.0));
   if (nr_exposure > 1.0) {
     const double t = (std::min)(1.0, nr_exposure - 1.0);
     guided_strength_q8 +=
@@ -13892,11 +13935,26 @@ struct FastBalancedIspDispatchJob {
   bool half_height = false;
 };
 
+#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+// ISP39 hardware backend (rk_hw_isp.cc), the default in RK3576 builds;
+// CYPERSTEREO_ISP_BACKEND=sw disables it. Returns false when it cannot take
+// the batch; the software ISP then runs it.
+bool RkHwIspBackendRequested();
+bool ApplyRkHwIspParallel(const FastBalancedIspDispatchJob *jobs, int n);
+// Runtime override of the environment choice, e.g. for a live A/B preview.
+void SetRkHwIspBackendRequested(bool on);
+// Whether the most recent batch actually ran on the ISP39.
+bool RkHwIspLastBatchOnHardware();
+#endif
+
 inline void ApplyFastBalancedISPParallelImpl(
     const FastBalancedIspDispatchJob *jobs, int n) {
   constexpr int kMaxWorkers = 3;
   if (n <= 0) return;
   CV_Assert(jobs != nullptr);
+#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+  if (RkHwIspBackendRequested() && ApplyRkHwIspParallel(jobs, n)) return;
+#endif
 #if defined(CYPERSTEREO_RK3588) || defined(CYPERSTEREO_RK3576)
   // jobs[0] runs on the caller at CPU4. The three persistent workers process
   // jobs[1..3] on CPU5..7 (Cortex-A76 on RK3588, Cortex-A72 on RK3576).

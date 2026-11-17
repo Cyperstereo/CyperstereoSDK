@@ -28,6 +28,9 @@
 #include "../src/usb/uvc/six_camera_isp.h"
 #include "../src/usb/uvc/tic_toc.h"
 #include "../src/usb/uvc/thread_priority.h"
+#ifdef __linux__
+#include "mjpeg_preview.h"
+#endif
 
 const double g = 9.7887;
 
@@ -437,6 +440,9 @@ static int run(int argc, char *argv[]) {
   long save_at = -1;
   long max_frames = -1;
   long save_every = 0;
+  // --stream [port]: live MJPEG preview over HTTP (temporary tool).
+  int stream_port = 0;
+  int stream_fps = 10;
   int raw_stats_every = 0;  // RAW statistics are opt-in diagnostics.
   if (const char *value = std::getenv("CYPERSTEREO_RAW_STATS_EVERY")) {
     char *end = nullptr;
@@ -471,6 +477,11 @@ static int run(int argc, char *argv[]) {
       output_request = CaptureColorOutput::kUyvy422Bt601FullRange;
     else if (arg == "--output-bgr" || arg == "--output-bgr888")
       output_request = CaptureColorOutput::kBgr888;
+    else if (arg == "--stream")
+      stream_port = (i + 1 < argc && argv[i + 1][0] != '-')
+                        ? std::atoi(argv[++i]) : 8080;
+    else if (arg == "--stream-fps" && i + 1 < argc)
+      stream_fps = std::atoi(argv[++i]);
   }
   // Fast-balanced defaults to BGR888. --output-yuv422 selects full-range
   // UYVY422 with the same digital exposure and tone. Quality/HDR is BGR-only.
@@ -607,6 +618,35 @@ static int run(int argc, char *argv[]) {
   }
   bool half_res_announced = false;
 
+#ifdef __linux__
+  // Preview ISP selection: 0 = software, 1 = ISP39, 2 = alternate per frame.
+  enum { kLiveSw = 0, kLiveHw = 1, kLiveAb = 2 };
+  int live_backend_default = kLiveSw;
+#if defined(CYPERSTEREO_RK3576)
+  if (cyperstereo::detail::RkHwIspBackendRequested())
+    live_backend_default = kLiveHw;
+#endif
+  std::atomic<int> live_backend{live_backend_default};
+  std::atomic<bool> live_save{false};
+  std::unique_ptr<MjpegPreview> live_preview;
+  if (stream_port > 0) {
+    live_preview.reset(new MjpegPreview(
+        stream_port, stream_fps, &Uyvy422Bt601FullRangeToBgrPreview,
+        [&](const std::string &key, const std::string &value) {
+          if (key == "isp")
+            live_backend = value == "hw" ? kLiveHw
+                           : value == "ab" ? kLiveAb : kLiveSw;
+          else if (key == "save")
+            live_save = true;
+        }));
+    if (!live_preview->ok()) live_preview.reset();
+  }
+  double live_isp_ms[2] = {0.0, 0.0};  // [0] SW, [1] HW
+  // A/B: the selected camera from the last HW frame waits for the next SW one.
+  cv::Mat live_ab_hw;
+  long live_ab_hw_frame = -1;
+#endif
+
   //imshow windows init
   constexpr int kShowEvery = 1;
   static const char *const kQuadWindowNames[4] = {
@@ -730,6 +770,13 @@ static int run(int argc, char *argv[]) {
     }
 
     bool six_this_frame = false;
+#if defined(__linux__) && defined(CYPERSTEREO_RK3576)
+    if (live_preview) {
+      const int b = live_backend.load();
+      cyperstereo::detail::SetRkHwIspBackendRequested(
+          b == kLiveHw || (b == kLiveAb && count % 2 == 0));
+    }
+#endif
     if (is_smartsens)
     {
       TicToc proc;
@@ -912,10 +959,49 @@ static int run(int argc, char *argv[]) {
                      show_raw ? *raw_images[i] : *display_images[i]);
         preview_key = cv::waitKey(1);
       }
+#ifdef __linux__
+      if (live_preview) {
+        bool on_hw = false;
+#if defined(CYPERSTEREO_RK3576)
+        on_hw = cyperstereo::detail::RkHwIspLastBatchOnHardware();
+#endif
+        double &ema = live_isp_ms[on_hw ? 1 : 0];
+        ema = ema > 0.0 ? 0.9 * ema + 0.1 * isp_ms : isp_ms;
+        const int view = live_preview->view();
+        const int cam = view >= 1 && view <= n_images ? view - 1 : 0;
+        std::ostringstream label;
+        label << std::fixed << std::setprecision(1);
+        if (live_backend == kLiveAb) {
+          if (on_hw) {
+            if (live_preview->Wants()) {
+              color_images[cam]->copyTo(live_ab_hw);
+              live_ab_hw_frame = count;
+            }
+          } else if (live_ab_hw_frame == count - 1) {
+            label << "A/B image" << cam + 1 << "  HW " << live_isp_ms[1]
+                  << " ms | SW " << live_isp_ms[0] << " ms  frame " << count;
+            const cv::Mat *pair[2] = {&live_ab_hw, color_images[cam]};
+            live_preview->Offer(pair, 2, use_uyvy422, label.str(), true,
+                                {"HW ISP39", "SW ISP"});
+            live_ab_hw_frame = -1;
+          }
+        } else if (live_preview->Wants()) {
+          label << (on_hw ? "HW ISP39" : "SW ISP") << "  "
+                << (use_uyvy422 ? "UYVY" : "BGR") << "  isp " << ema
+                << " ms  gain " << std::setprecision(2) << camera_gain[0]
+                << "  frame " << count;
+          live_preview->Offer(color_images, n_images, use_uyvy422,
+                              label.str());
+        }
+      }
+      const bool live_save_now = live_save.exchange(false);
+#else
+      const bool live_save_now = false;
+#endif
       // Save independently of HighGUI, including consecutive frames for
       // temporal-noise measurements. Automatic saving requires an explicit
       // option (save_at defaults to -1).
-      if (preview_key == 's' || preview_key == 'S' ||
+      if (preview_key == 's' || preview_key == 'S' || live_save_now ||
           (save_at >= 0 && (count == save_at || count == save_at + 1)) ||
           (save_every > 0 && count > 0 && count % save_every == 0)) {
           const cv::Mat *display_images[6];
