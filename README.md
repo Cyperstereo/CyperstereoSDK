@@ -76,8 +76,11 @@ ISP core instead of the CPU. The backend is selected at build time:
 | `TARGET_BOARD=rk3588` | software ISP; the RK3588 ISP30 core is not supported by the hardware backend yet |
 | every other board, x86 Linux, Windows, macOS | software ISP |
 
-This applies to the samples and ROS builds. The ROS 2 build does not have a
-`rk3576` board option yet and always uses the software ISP.
+This applies to the samples (`capture_image_imu`, `save_image_imu`), ROS and
+ROS 2 alike, six-image mode included: a plain `cmake`, `catkin_make` or
+`colcon build` on an RK3576 uses the hardware ISP, a cross build passes
+`-DTARGET_BOARD=rk3576`, and `CYPERSTEREO_ISP_BACKEND=sw` switches any of
+them back to the software ISP.
 
 ```c
 cd ~/CyperstereoSDK

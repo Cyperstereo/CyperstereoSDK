@@ -491,12 +491,11 @@ void DataFlow() {
                                  &left_front_color, &right_front_color};
             const int active =
                 half_res_lanes ? 2 : (four_ok ? 4 : (two_ok ? 2 : 1));
-            const bool six = half_res_lanes && use_six_scheduler &&
-                IsAr0234FamilyHardware(static_cast<int>(record.hardware_version));
-            if (!six) ApplyBayerCameraIsp(isp, raws, colors, active,
-                record.hardware_version, record.software_version,
-                record.camera_gain, record.fpga_bayer_nr, record.raw_telemetry);
-            if (half_res_lanes) {
+            if (!half_res_lanes) {
+              ApplyBayerCameraIsp(isp, raws, colors, active,
+                  record.hardware_version, record.software_version,
+                  record.camera_gain, record.fpga_bayer_nr, record.raw_telemetry);
+            } else {
               half_planes.Split(imgs[2], imgs[3], half_raw);
               const uint32_t hw = record.hardware_version;
               const uint32_t sw = record.software_version;
@@ -506,26 +505,27 @@ void DataFlow() {
               cv::Mat &hr1 = half_planes.IspRaw(half_raw, 1), &hc1 = half_color[1];
               cv::Mat &hr2 = half_planes.IspRaw(half_raw, 2), &hc2 = half_color[2];
               cv::Mat &hr3 = half_planes.IspRaw(half_raw, 3), &hc3 = half_color[3];
-              if (six) {
+              const IspFrameJob jobs[] = {
+                {left_image,left_color,"cam1",record.camera_gain[0],SelectDeliveredPlaneBayer(hw,sw,0),record.fpga_bayer_nr[0],record.raw_telemetry.RegionForPlane(0)},
+                {right_image,right_color,"cam2",record.camera_gain[1],SelectDeliveredPlaneBayer(hw,sw,1),record.fpga_bayer_nr[1],record.raw_telemetry.RegionForPlane(1)},
+                {hr0,hc0,halves.name[0],halves.gain[0],halves.bayer[0], false, {}, half_nr, half_tall},
+                {hr1,hc1,halves.name[1],halves.gain[1],halves.bayer[1], false, {}, half_nr, half_tall},
+                {hr2,hc2,halves.name[2],halves.gain[2],halves.bayer[2], false, {}, half_nr, half_tall},
+                {hr3,hc3,halves.name[3],halves.gain[3],halves.bayer[3], false, {}, half_nr, half_tall}};
+              // RK3576 runs the six images as one ISP39 batch; the CPU ISP
+              // runs them where there is no hardware ISP or it does not take
+              // the batch.
+              const bool on_hardware =
+                  isp.ApplyHardwareWith(jobs, 2, half_isp, jobs + 2, 4);
+              const bool six = use_six_scheduler &&
+                  IsAr0234FamilyHardware(static_cast<int>(hw));
+              if (!on_hardware && six) {
                 if (!six_isp) six_isp.reset(new SixCameraIspProcessor());
-                IspFrameJob jobs[] = {
-                  {left_image,left_color,"cam1",record.camera_gain[0],SelectDeliveredPlaneBayer(hw,sw,0),record.fpga_bayer_nr[0],record.raw_telemetry.RegionForPlane(0)},
-                  {right_image,right_color,"cam2",record.camera_gain[1],SelectDeliveredPlaneBayer(hw,sw,1),record.fpga_bayer_nr[1],record.raw_telemetry.RegionForPlane(1)},
-                  {hr0,hc0,halves.name[0],halves.gain[0],halves.bayer[0], false, {}, half_nr, half_tall},
-                  {hr1,hc1,halves.name[1],halves.gain[1],halves.bayer[1], false, {}, half_nr, half_tall},
-                  {hr2,hc2,halves.name[2],halves.gain[2],halves.bayer[2], false, {}, half_nr, half_tall},
-                  {hr3,hc3,halves.name[3],halves.gain[3],halves.bayer[3], false, {}, half_nr, half_tall}};
                 six_isp->Apply(jobs);
-              } else half_isp.ApplyParallel({
-                  {hr0, hc0, halves.name[0], halves.gain[0],
-                   halves.bayer[0], false, {}, half_nr, half_tall},
-                  {hr1, hc1, halves.name[1], halves.gain[1],
-                   halves.bayer[1], false, {}, half_nr, half_tall},
-                  {hr2, hc2, halves.name[2], halves.gain[2],
-                   halves.bayer[2], false, {}, half_nr, half_tall},
-                  {hr3, hc3, halves.name[3], halves.gain[3],
-                   halves.bayer[3], false, {}, half_nr, half_tall},
-              });
+              } else if (!on_hardware) {
+                isp.ApplyParallel(jobs, 2);
+                half_isp.ApplyParallel(jobs + 2, 4);
+              }
               OrientSixImageHalves(hw, half_raw, half_color);
             }
             std::thread t2;

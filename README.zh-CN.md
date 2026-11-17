@@ -75,7 +75,7 @@ fast-balanced ISP（BGR888 和 UYVY422 输出）可以在 Rockchip ISP 硬核上
 | `TARGET_BOARD=rk3588` | 软件 ISP；硬件后端暂不支持 RK3588 的 ISP30 |
 | 其他所有板子、x86 Linux、Windows、macOS | 软件 ISP |
 
-以上适用于 samples 和 ROS 构建。ROS 2 构建暂时没有 `rk3576` 板型选项，始终使用软件 ISP。
+以上同样适用于 samples（`capture_image_imu`、`save_image_imu`）、ROS 和 ROS 2：在 RK3576 上直接 `cmake`、`catkin_make` 或 `colcon build` 即默认使用硬核 ISP（含六目），交叉编译时传 `-DTARGET_BOARD=rk3576`；`CYPERSTEREO_ISP_BACKEND=sw` 对它们都可切回软件 ISP。
 
 ```c
 cd ~/CyperstereoSDK

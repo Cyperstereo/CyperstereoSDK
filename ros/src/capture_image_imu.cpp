@@ -215,10 +215,14 @@ int main(int argc, char *argv[]) {
             {half_planes.IspRaw(half_raw, 1), half_color[1], halves.name[1], halves.gain[1], halves.bayer[1], false, {}, half_nr, half_tall},
             {half_planes.IspRaw(half_raw, 2), half_color[2], halves.name[2], halves.gain[2], halves.bayer[2], false, {}, half_nr, half_tall},
             {half_planes.IspRaw(half_raw, 3), half_color[3], halves.name[3], halves.gain[3], halves.bayer[3], false, {}, half_nr, half_tall}};
-        if (use_six_scheduler) {
+        // RK3576 runs the six images as one ISP39 batch; the CPU ISP runs
+        // them where there is no hardware ISP or it does not take the batch.
+        const bool on_hardware =
+            isp.ApplyHardwareWith(jobs, 2, half_isp, jobs + 2, 4);
+        if (!on_hardware && use_six_scheduler) {
           if (!six_isp) six_isp.reset(new SixCameraIspProcessor());
           six_isp->Apply(jobs);
-        } else {
+        } else if (!on_hardware) {
           isp.ApplyParallel(jobs, 2);
           half_isp.ApplyParallel(jobs + 2, 4);
         }
