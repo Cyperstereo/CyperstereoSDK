@@ -33,8 +33,7 @@ msbuild ALL_BUILD.vcxproj /property:Configuration=Release
 
 # 3. ARM 编译
 构建会自动识别 CPU 并启用 NEON/SIMD。通用 ARM 处理直接本机编译即可；在 RK3576 或 RK3588 上
-本机编译也会识别出板子（RK3588 上即四个 ISP 相机线程固定在 CPU4-7 的 A76 上，以及硬件 ISP）。
-也可以显式指定板子：
+本机编译也会识别出板子并使用硬件 ISP。也可以显式指定板子：
 ```c
 cd ~/CyperstereoSDK
 cmake -S samples -B samples/build \
@@ -67,159 +66,28 @@ make
 
 ## Rockchip 硬件 ISP
 
-fast-balanced ISP（BGR888 和 UYVY422 输出）可以在 Rockchip ISP 硬核上运行，而不占用 CPU。
-后端在编译时选择：
+在 RK3576 和 RK3588 上，samples（`capture_image_imu`、`save_image_imu`）、ROS 和 ROS 2 默认使用硬件 ISP，六目同样适用。在板子上直接编译即可；交叉编译时传入 `-DTARGET_BOARD=rk3576` 或 `-DTARGET_BOARD=rk3588`。其他板子以及 x86 Linux、Windows、macOS 使用软件 ISP。
 
-| 构建 | 默认 ISP |
-|---|---|
-| `TARGET_BOARD=rk3576`，或在 RK3576（AArch64）上本机 `auto` 构建 | ISP39 硬核（`src/usb/uvc/rk_hw_isp.cc`） |
-| `TARGET_BOARD=rk3588`，或在 RK3588 上本机 `auto` 构建 | ISP30 硬核（同一文件），需先用 `scripts/setup_rk3588_hw_isp.sh` 启用一次（见 [RK3588](#rk3588isp30)） |
-| 其他所有板子、x86 Linux、Windows、macOS | 软件 ISP |
-
-以上同样适用于 samples（`capture_image_imu`、`save_image_imu`）、ROS 和 ROS 2：在 RK3576 或 RK3588 上直接 `cmake`、`catkin_make` 或 `colcon build` 即默认使用硬核 ISP（含六目），交叉编译时传 `-DTARGET_BOARD=rk3576` 或 `-DTARGET_BOARD=rk3588`；`CYPERSTEREO_ISP_BACKEND=sw` 对它们都可切回软件 ISP。本节其余部分描述 RK3576，RK3588 的差异见 [RK3588](#rk3588isp30)。
+RK3576 不需要额外配置：
 
 ```c
 cd ~/CyperstereoSDK
 cmake -S samples -B samples/build -DCMAKE_BUILD_TYPE=Release -DTARGET_BOARD=rk3576
 cmake --build samples/build --parallel 4
-./samples/build/capture_image_imu                            # 硬件 ISP
-CYPERSTEREO_ISP_BACKEND=sw ./samples/build/capture_image_imu # 强制使用软件 ISP
+./samples/build/capture_image_imu
 ```
 
-每帧 RAW8 从内存回灌进 ISP（rawrd -> ISP -> selfpath BGR / mainpath UYVY），不经过 rkaiq。
-黑电平、白平衡、数字曝光和高光压缩与同一帧的软件 ISP 一致；YNR/CNR 强度随传感器增益变化。
-共享亮度的色调映射仍在 CPU 上，融合在从 ISP 缓冲区拷出的那一步里。低增益下输出与软件 ISP
-的 PSNR 在 40-50 dB。
-
-硬件后端需要两路空闲的 `rkisp-vir` 虚拟 ISP（每种 CFA 相位一路），以及对其 `/dev/video*`
-和 `/dev/v4l-subdev*` 节点的读写权限（通常是 `video` 组）。被其他程序占用的虚拟 ISP（例如等待
-传感器的 `rkaiq_3A`）会被跳过，所以 `rkaiq_3A` 可以继续运行。在一块新的 RK3576 板上不需要
-任何额外操作：克隆、按上面的步骤编译、运行即可。以下情况一批图像会退回软件 ISP：
-
-- 打不开任何虚拟 ISP，或 ISP 报错。这时会打印一次
-  `[rkisp] ...; using the software ISP from now on`，之后该进程一直使用软件 ISP；
-- 这批图像高度或输出格式不同、全图（或半图）宽度不同，或宽高为奇数。
-
-ISP 没有软件 BayerNR 的替代模块。需要 BayerNR 的图像（NR 增益不低于
-`CYPERSTEREO_RKISP_MAX_NR_GAIN`，默认 3，且 FPGA BayerNR 关闭）会先在 CPU 上做软件 BayerNR，
-与白平衡融合，再由 ISP 在这份线性 RAW 上跑剩余流程。
-
-SC136HGS 六目（S6 序列号）的帧通过 `IspProcessor::ApplyParallelWith` 作为一个硬件批次运行：
-C1/C2 全尺寸，加上四张 `(cam_width/2) x frame_height` 的半图。半图的白平衡在 CPU 上完成，
-因此两张半图左右并排放进同一个 ISP 帧，中间隔 32 列镜像填充。ISP 以全高度去马赛克，CPU 在
-色调映射前把线性行 2:1 平均。另一种 CFA 相位的半图向内错开一行一列放置，这样 NR 增益相近的
-半图可以共用一帧，帧数也能在两路虚拟 ISP 间均分（仅 BGR 输出；UYVY 让每对半图保持同一相位）。
-ISP 保持六目尺寸打开（1280x1024 相机为 1312x1026），全图填充到这个尺寸。
-
-AR0234 六目（A6 序列号）走同样的批次。它的 960x1080 半图无间隔地填满 1920 宽的 selfpath
-（mainpath 上的 UYVY 保留 32 列间隔），每种 CFA 相位各两帧，不需要错一像素。一个批次超过
-`CYPERSTEREO_RKISP_HW_BUDGET_MP`（6.4 MP 的 ISP 帧，约 24 ms 核时间）时，多出的帧交给软件
-ISP，优先拿半图对，在 CPU6/7 上与 ISP 核并行运行：AR0234 六目的四个 1920x1080 帧中三个留在
-ISP 上，AR0234 四目的四张图中三张留在 ISP 上。SC136HGS 的批次低于预算。没有硬件 ISP 时，
-AR0234 六目使用六线程软件调度（`SixCameraIspProcessor`）。
-
-运行时调节：
-
-| 变量 | 默认值 | 含义 |
-|---|---|---|
-| `CYPERSTEREO_ISP_BACKEND` | hardware | `sw`（或 `software`、`cpu`）让所有批次都走软件 ISP |
-| `CYPERSTEREO_RKISP_MAX_NR_GAIN` | 3 | 从这个 NR 增益起，没有 FPGA BayerNR 的图像先在 CPU 上做软件 BayerNR 再进 ISP |
-| `CYPERSTEREO_RKISP_NR_GAIN_SCALE` | 0.4 | YNR/CNR 噪声模型增益相对 NR 增益的比例；越大平坦墙面越平滑，但细纹理损失越多 |
-| `CYPERSTEREO_RKISP_PACK_GAP` | 32 | 同一 ISP 帧中两张六目半图之间的镜像列数（4 的倍数） |
-| `CYPERSTEREO_RKISP_PACK` | 1 | `0` 让每张六目半图单独占一个 ISP 帧 |
-| `CYPERSTEREO_RKISP_CORE_MHZ` | 594 | ISP 核时钟；`0` 保持驱动的 396 MHz，`702` 选最高档 |
-| `CYPERSTEREO_RKISP_HW_BUDGET_MP` | 6.4 | 每批 ISP 帧的百万像素上限；超出部分由软件 ISP 并行处理（`0` = 不限制） |
-
-在 RK3576 上测得，四个 1280x1024 相机 30 fps，`performance` 调频，ISP 核 396 MHz
-（默认的 594 MHz 下，相同帧的离线回放从 20.3-21 ms 降到 17.0-17.4 ms）：
-
-| | 软件 ISP | 硬件 ISP |
-|---|---|---|
-| 每个四目帧的 CPU 时间 | 52-56 ms（约 1.6-1.7 核） | 19-20 ms（约 0.6 核） |
-| 每个四目帧的 ISP 延迟 | 14-15 ms | 21-22 ms |
-
-硬件 ISP 延迟更高，是因为两路虚拟 ISP 共用一个 ISP 核、依次运行。它为应用腾出了大约一个 A72 核。
-
-SC136HGS 六目（C1/C2 1280x1024 加四张 640x512 半图），条件相同（594 MHz 下离线回放从
-20.2 ms 降到 17.0-17.5 ms）：
-
-| | 软件 ISP | 硬件 ISP |
-|---|---|---|
-| 每个六目帧的 CPU 时间，离线回放 | 46-55 ms（约 1.4-1.7 核） | 21-25 ms（约 0.65-0.75 核） |
-| 每个六目帧的 CPU 时间，实机 | 48-49 ms（约 1.45 核） | 25-27 ms（约 0.75-0.8 核） |
-| 每个六目帧的 ISP 延迟，实机 | 20 ms | 22.5-23 ms |
-
-AR0234（1920x1080），条件相同，硬件 ISP 为默认的 594 MHz（括号内为 396 MHz）。四目一行用
-两路真实图像各复制一份回放；手头只有 AR0234 六目相机：
-
-| | 软件 ISP | 硬件 ISP |
-|---|---|---|
-| 六目 BGR，实机：延迟 / 每帧 CPU | 28.3 ms / 101 ms（3.0 核） | 24.1-24.7 ms（30.1-30.4 ms）/ 55 ms（1.65 核） |
-| 六目 UYVY，实机：延迟 / 每帧 CPU | 46.5 ms（20 fps）/ 108 ms | 23.8-24.2 ms（30.5 ms）/ 64 ms（1.9 核） |
-| 六目 BGR，离线：延迟 / CPU | 30.8 ms / 77 ms | 21.8 ms（25.7 ms）/ 40 ms |
-| 四目 BGR，离线：延迟 / CPU | 20.5 ms / 81 ms | 23.0 ms（25.6 ms）/ 37 ms |
-
-396 MHz 且不设预算（`CYPERSTEREO_RKISP_HW_BUDGET_MP=0`）时，四个 1920x1080 帧离线需要 31 ms
-核时间，实机 34 ms，达不到 30 fps。
-
-ISP 核默认运行在 594 MHz；单靠驱动，这些帧尺寸只会得到 396 MHz。rawrd 输入时，Rockchip 驱动
-按正在出流的虚拟 ISP 的输入尺寸选核时钟：(w x h 之和) x 30 fps x (1 + 每路 25%)，对照
-400/400/500/600/702 MHz 档位，并且只在 `RKISP_CMD_MULTI_DEV_FORCE_ENUM` 时才重新读取这些尺寸。
-后端在第一帧之前先把每路虚拟 ISP 设成较大的输入尺寸并发出该命令，然后再按真实尺寸打开自己的
-两路虚拟 ISP，于是驱动选中 600 MHz 档（GPLL 分频得到 594 MHz）。这不需要改内核、不需要 root，
-也不占用额外的虚拟 ISP，`rkaiq_3A` 运行时同样有效；如果已有别的程序在用 ISP 出流，尺寸无法
-重新读取，会打印一条提示并保持驱动的时钟。输出与 396 MHz 逐位一致，CPU 时间不变；进程退出后
-时钟恢复为驱动的选择。`CYPERSTEREO_RKISP_CORE_MHZ=0` 保持驱动的时钟，`702` 选最高档，对这些
-批次不会更快。
-
-### RK3588（ISP30）
-
-RK3588 有两个 ISP30 核。设备树里没有描述摄像头传感器时，大多数 RK3588 系统镜像默认关闭其虚拟
-ISP，需要先启用一次并重启：
+RK3588 的系统镜像在设备树里没有摄像头时默认关闭 ISP，需要启用一次并重启：
 
 ```c
 sudo apt install device-tree-compiler           # 缺少 dtc 时安装
-sudo ./scripts/setup_rk3588_hw_isp.sh           # 安装 overlay，然后重启
+sudo ./scripts/setup_rk3588_hw_isp.sh           # 然后重启
 sudo ./scripts/setup_rk3588_hw_isp.sh --remove  # 撤销，然后重启
-sudo ./scripts/setup_rk3588_hw_isp.sh --print   # 打印 overlay 源码
 ```
 
-脚本编译一个设备树 overlay，启用两个 ISP 核、对应的 IOMMU，以及每个核三路虚拟 ISP
-（`rkisp0-vir0..2`、`rkisp1-vir0..2`），安装为 `/boot/overlay-user/cyperstereo-rkisp.dtbo`，
-并把它加入 `/boot/orangepiEnv.txt`（或 `/boot/armbianEnv.txt`）的 `user_overlays=`；其他引导
-程序需要手动加入 `--print` 的输出。已在 Orange Pi 5 Plus（Ubuntu 22.04，内核 6.1.43，rkisp
-驱动 v2.4.0）上验证。没有该 overlay 时，后端会打印一次 `[rkisp] no usable virtual ISP: no
-rkisp-vir media device; using the software ISP from now on`。
+脚本把 overlay 加到 `/boot/orangepiEnv.txt` 或 `/boot/armbianEnv.txt`。其他引导程序把 `--print` 打印的内容手动加进去。没有 overlay 时，程序会打印一次 `[rkisp] ...; using the software ISP from now on`，之后一直使用软件 ISP。`CYPERSTEREO_ISP_BACKEND=sw` 可在两块板子上强制使用软件 ISP。
 
-与 RK3576 的差异：
-
-- 使用四路虚拟 ISP：每个核上每种 CFA 相位各一路，同一相位的帧在两个核之间交替分配，两个核
-  并行运行。驱动的时钟估算（见上文）只统计正在出流的虚拟 ISP，所以每个核要有两路出流才能到
-  600 MHz 档：后端在第一帧之前把每个核的第一路虚拟 ISP 设为 3840x2160、其余设为 2560x1536
-  （更大的输入会让驱动对每帧回读两遍），两个核都会选中 594 MHz。`CYPERSTEREO_RKISP_CORE_MHZ=0`
-  保持驱动的 300 MHz；`702` 与默认相同。
-- selfpath 没有 RGB 输出，所以 BGR 输出取自 mainpath 的 UYVY，在拷出时由 CPU 转成 BGR，再做
-  色调映射。
-- ISP 帧宽最多 2560，更宽的批次走软件 ISP。`CYPERSTEREO_RKISP_HW_BUDGET_MP` 按每个核计算。
-- ISP30 使用 RK3576 的 DPCC 和色彩空间配置，以及 `/etc/iqfiles` 中 imx415 ISO-50 标定的去马赛克
-  参数。它不做 YNR、CNR 和锐化（ISP30 的降噪模块与 ISP39 不同，目前还没有采集到对应标定），
-  因此高增益下平坦区域的颗粒比软件 ISP 多。四个 SC136HGS 相机在增益 10 时，输出与软件 ISP 的
-  PSNR 为 34.7-36.9 dB，BGR 和 UYVY 相同。
-
-在 Orange Pi 5 Plus 上测得，四个 SC136HGS 1280x1024 相机 30 fps（增益 10），`performance`
-调频，ISP 核 594 MHz。实机数据来自 `capture_image_imu`（`isp_wall`、进程 CPU），离线数据来自
-对同一相机的帧运行 `isp_quad_bench`：
-
-| | 软件 ISP | 硬件 ISP |
-|---|---|---|
-| BGR（默认），实机：ISP 延迟 / CPU | 8.05 ms / 0.99 核 | 9.36 ms / 0.62 核 |
-| UYVY，实机：ISP 延迟 / CPU | 14.8 ms / 1.68 核 | 8.5 ms / 0.54 核 |
-| BGR，离线：延迟 / 每帧 CPU | 7.9 ms / 30.7 ms | 9.5 ms / 17.4 ms |
-| UYVY，离线：延迟 / 每帧 CPU | 15.1-18.6 ms / 59-72 ms | 8.5 ms / 13.4 ms |
-
-每个核处理一张 1280x1024 帧约 2 ms，每批两帧；硬件延迟的其余部分是 CPU 拷出和色调映射，BGR
-还要多一步 UYVY 转 BGR。BGR 输出时，硬件 ISP 用 1.3 ms 的延迟换来约 0.4 核；UYVY 输出时它更快，
-并省下一个多核。
+ROS 和 ROS 2 同样：在板子上执行 `catkin_make` 或 `colcon build`。
 
 ## SmartSens 固件 2/3、2/4、2/5、2/6、2/7 和 2/8
 
@@ -295,29 +163,13 @@ mkdir imu
 ./capture_image_imu
 ```
 
-`capture_image_imu`、`save_image_imu` 以及 ROS 1 / ROS 2 节点在所有平台上默认输出 BGR888
-（`CV_8UC3`、`bgr8`），并已应用 RGB 色调映射；在 RK3576 和 RK3588 上由硬件 ISP 生成。
-`capture_image_imu --output-yuv422` 可改为输出紧凑排列的 UYVY422（`CV_8UC2`，字节顺序
-`Cb,Y0,Cr,Y1`，仅限 fast-balanced ISP）。它使用 BT.601 全范围数值，并把 ISP 的 4:2:0 色度行
-在垂直方向上复制，数字曝光和色调与 BGR 相同。不要把这路流当作 studio/limited 范围的 YUV 解码。
-质量参考 ISP 始终输出 BGR888。
-
-在 RK3588 上，四目示例还默认无界面运行，并在创建任何 UVC、OpenCV 或 ISP 线程之前，把整个采集
-进程限制在 CPU4-7 这四个 Cortex-A76 核上，不使用 CPU0-3 的 Cortex-A55 核。示例还关闭了小核
-辅助和单帧内嵌套的 ISP 分片。
-
-常用的覆盖选项：
+`capture_image_imu`、`save_image_imu` 以及 ROS 1 / ROS 2 节点默认输出 BGR888。在 RK3576 和
+RK3588 上由硬件 ISP 生成。`./capture_image_imu --output-yuv422` 改为输出全范围 UYVY422
+（`CV_8UC2`，字节顺序 `Cb,Y0,Cr,Y1`）。不要把它当作 limited 范围的 YUV 解码。RK3588 上示例
+默认不打开预览窗口，需要时加 `--display`。
 
 ```c
-# 显式打开本地预览。
-./capture_image_imu --display --isp-fast
-
-# 显式选择 BGR888（默认）。
-./capture_image_imu --output-bgr --isp-fast
-
-# 显式选择紧凑的全范围 UYVY422。
-./capture_image_imu --output-yuv422 --isp-fast
-
-# 恢复逐帧元数据日志（RK3588 默认每秒一条）。
-./capture_image_imu --verbose
+./capture_image_imu --display        # 打开预览
+./capture_image_imu --output-yuv422  # 输出 UYVY422 而不是 BGR888
+./capture_image_imu --verbose        # 逐帧日志（RK3588 默认每秒一条）
 ```
