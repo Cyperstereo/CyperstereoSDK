@@ -173,17 +173,17 @@ int RunSix(int argc, char **argv) {
     double mid = w0;
     if (split) {
       full.ApplyParallel(full_jobs, 2);
-#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+#if defined(CYPERSTEREO_RK_HW_ISP)
       full_hw = detail::RkHwIspLastBatchOnHardware() ? 1 : 0;
 #endif
       mid = NowMs(CLOCK_MONOTONIC);
       halves.ApplyParallel(half_jobs, 4);
-#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+#if defined(CYPERSTEREO_RK_HW_ISP)
       half_hw = detail::RkHwIspLastBatchOnHardware() ? 1 : 0;
 #endif
     } else {
       full.ApplyParallelWith(full_jobs, 2, halves, half_jobs, 4);
-#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+#if defined(CYPERSTEREO_RK_HW_ISP)
       full_hw = half_hw = detail::RkHwIspLastBatchOnHardware() ? 1 : 0;
 #endif
     }

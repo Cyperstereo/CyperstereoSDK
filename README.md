@@ -33,8 +33,9 @@ msbuild ALL_BUILD.vcxproj /property:Configuration=Release
 
 # 3.Arm Compile
 The build auto-detects the CPU and enables NEON/SIMD. A native build is enough
-for generic ARM processing, but RK3588 topology-aware scheduling (the four ISP
-camera owners on CPU4-7 A76) requires `TARGET_BOARD=rk3588`:
+for generic ARM processing, and a native build on an RK3576 or RK3588 also
+recognizes the board (on RK3588: the four ISP camera owners on CPU4-7 A76 and
+the hardware ISP). The board can also be named explicitly:
 ```c
 cd ~/CyperstereoSDK
 cmake -S samples -B samples/build \
@@ -47,7 +48,7 @@ When **cross-compiling** (or to force a specific tuning), pass `-DTARGET_BOARD`:
 ```c
 # --- Rockchip / Horizon / Raspberry Pi ---
 cmake -DTARGET_BOARD=rk3576 ..         # RK3576 (Cortex-A72 + A53), hardware ISP by default
-cmake -DTARGET_BOARD=rk3588 ..         # RK3588 (Cortex-A76 + A55)
+cmake -DTARGET_BOARD=rk3588 ..         # RK3588 (Cortex-A76 + A55), hardware ISP by default
 cmake -DTARGET_BOARD=sunrise-x5 ..     # Horizon Sunrise/Journey X5 (Cortex-A55)
 cmake -DTARGET_BOARD=pi5 ..            # Raspberry Pi 5 (Cortex-A76)
 cmake -DTARGET_BOARD=pi4 ..            # Raspberry Pi 4 (Cortex-A72)
@@ -73,14 +74,16 @@ ISP core instead of the CPU. The backend is selected at build time:
 | Build | Default ISP |
 |---|---|
 | `TARGET_BOARD=rk3576`, or a native `auto` build on an RK3576 (AArch64) | hardware ISP39 core (`src/usb/uvc/rk_hw_isp.cc`) |
-| `TARGET_BOARD=rk3588` | software ISP; the RK3588 ISP30 core is not supported by the hardware backend yet |
+| `TARGET_BOARD=rk3588`, or a native `auto` build on an RK3588 | hardware ISP30 cores (same file), once enabled with `scripts/setup_rk3588_hw_isp.sh` (see [RK3588](#rk3588-isp30)) |
 | every other board, x86 Linux, Windows, macOS | software ISP |
 
 This applies to the samples (`capture_image_imu`, `save_image_imu`), ROS and
 ROS 2 alike, six-image mode included: a plain `cmake`, `catkin_make` or
-`colcon build` on an RK3576 uses the hardware ISP, a cross build passes
-`-DTARGET_BOARD=rk3576`, and `CYPERSTEREO_ISP_BACKEND=sw` switches any of
-them back to the software ISP.
+`colcon build` on an RK3576 or RK3588 uses the hardware ISP, a cross build
+passes `-DTARGET_BOARD=rk3576` or `-DTARGET_BOARD=rk3588`, and
+`CYPERSTEREO_ISP_BACKEND=sw` switches any of them back to the software ISP.
+The rest of this section describes the RK3576; the RK3588 differences are in
+[RK3588](#rk3588-isp30).
 
 ```c
 cd ~/CyperstereoSDK
@@ -203,6 +206,67 @@ the driver's choice when the process exits. `CYPERSTEREO_RKISP_CORE_MHZ=0`
 keeps the driver's clock, `702` selects the top step, which is no faster for
 these batches.
 
+### RK3588 (ISP30)
+
+The RK3588 has two ISP30 cores. Most RK3588 images ship their virtual ISPs
+disabled when no camera sensor is described in the device tree, so enable them
+once and reboot:
+
+```c
+sudo apt install device-tree-compiler           # dtc, if missing
+sudo ./scripts/setup_rk3588_hw_isp.sh           # install the overlay, then reboot
+sudo ./scripts/setup_rk3588_hw_isp.sh --remove  # undo, then reboot
+sudo ./scripts/setup_rk3588_hw_isp.sh --print   # show the overlay source
+```
+
+The script compiles a device-tree overlay that enables both ISP cores, their
+IOMMUs and three virtual ISPs per core (`rkisp0-vir0..2`, `rkisp1-vir0..2`),
+installs it as `/boot/overlay-user/cyperstereo-rkisp.dtbo` and adds it to
+`user_overlays=` in `/boot/orangepiEnv.txt` (or `/boot/armbianEnv.txt`); other
+boot loaders need the `--print` output added by hand. It was tested on an
+Orange Pi 5 Plus (Ubuntu 22.04, kernel 6.1.43, rkisp driver v2.4.0). Without
+the overlay the backend prints `[rkisp] no usable virtual ISP: no rkisp-vir
+media device; using the software ISP from now on` once.
+
+Differences from the RK3576:
+
+- Four virtual ISPs are used, one per CFA phase on each core, and the frames
+  of a phase alternate between the cores, so the two cores run concurrently.
+  The driver's clock estimate (above) counts only streaming virtual ISPs, so
+  each core needs two of them for the 600 MHz step: before the first frame the
+  backend sets the first virtual ISP of each core to 3840x2160 and the others
+  to 2560x1536 (larger inputs make the driver read every frame back twice),
+  which selects 594 MHz on both cores. `CYPERSTEREO_RKISP_CORE_MHZ=0` keeps
+  the driver's 300 MHz; `702` behaves like the default.
+- The selfpath has no RGB output, so BGR output comes from the mainpath UYVY
+  and is converted to BGR on the CPU during the copy out, before the tone.
+- ISP frames are at most 2560 wide; wider batches run on the software ISP.
+  `CYPERSTEREO_RKISP_HW_BUDGET_MP` applies per core.
+- The ISP30 takes the RK3576 DPCC and colour-space configs and the debayer of
+  the imx415 ISO-50 tuning shipped in `/etc/iqfiles`. It runs no YNR, CNR or
+  sharpening (the ISP30 noise filters differ from the ISP39's and have no
+  captured tuning yet), so at high gain flat areas keep more grain than the
+  software ISP. With four SC136HGS cameras at gain 10 the output is within
+  34.7-36.9 dB PSNR of the software ISP, BGR and UYVY alike.
+
+Measured on the Orange Pi 5 Plus with four SC136HGS 1280x1024 cameras at
+30 fps (gain 10), `performance` governor, ISP cores at 594 MHz. Live numbers
+are `capture_image_imu` (`isp_wall`, process CPU); offline numbers are
+`isp_quad_bench` on frames from the same camera:
+
+| | Software ISP | Hardware ISP |
+|---|---|---|
+| BGR (default), live: ISP latency / CPU | 8.05 ms / 0.99 cores | 9.36 ms / 0.62 cores |
+| UYVY, live: ISP latency / CPU | 14.8 ms / 1.68 cores | 8.5 ms / 0.54 cores |
+| BGR, offline: latency / CPU per frame | 7.9 ms / 30.7 ms | 9.5 ms / 17.4 ms |
+| UYVY, offline: latency / CPU per frame | 15.1-18.6 ms / 59-72 ms | 8.5 ms / 13.4 ms |
+
+Each core spends about 2 ms per 1280x1024 frame, two frames per batch; the
+rest of the hardware latency is the CPU copy out with the tone, which BGR
+lengthens by the UYVY-to-BGR conversion. With BGR output the hardware ISP
+trades 1.3 ms of latency for about 0.4 cores; with UYVY it is faster and
+saves more than a core.
+
 ## SmartSens firmware 2/3, 2/4, 2/5, 2/6, 2/7 and 2/8
 
 Windows, Linux/V4L2, ROS, ROS 2 and ARM builds all use the same versioned
@@ -284,14 +348,14 @@ mkdir imu
 ./capture_image_imu
 ```
 
-The fast-balanced capture path outputs packed UYVY422 by default on every
-platform (`CV_8UC2`, byte order
-`Cb,Y0,Cr,Y1`). It uses BT.601 full-range values and vertically duplicates the
-ISP's 4:2:0 chroma rows. RGB tone mapping is deliberately deferred, so a
-consumer that needs the former BGR888 appearance must perform a full-range
-UYVY-to-BGR conversion and then apply the same tone mapping. Do not decode
-this stream as studio/limited-range YUV. The quality-reference ISP continues
-to output BGR888.
+`capture_image_imu`, `save_image_imu` and the ROS 1 / ROS 2 nodes output
+BGR888 (`CV_8UC3`, `bgr8`) by default on every platform, with the RGB tone
+mapping applied; on RK3576 and RK3588 it comes from the hardware ISP.
+`capture_image_imu --output-yuv422` selects packed UYVY422 instead (`CV_8UC2`,
+byte order `Cb,Y0,Cr,Y1`, fast-balanced ISP only). It uses BT.601 full-range
+values and vertically duplicates the ISP's 4:2:0 chroma rows, with the same
+digital exposure and tone. Do not decode this stream as studio/limited-range
+YUV. The quality-reference ISP always outputs BGR888.
 
 On RK3588, the four-camera sample is additionally headless by default and
 restricts the complete capture process to the four Cortex-A76 cores CPU4-7
@@ -305,7 +369,7 @@ Useful overrides are:
 # Show the local preview explicitly.
 ./capture_image_imu --display --isp-fast
 
-# Restore the legacy BGR888 fast output (including RGB tone mapping).
+# Select BGR888 explicitly (the default).
 ./capture_image_imu --output-bgr --isp-fast
 
 # Select packed full-range UYVY422 explicitly.

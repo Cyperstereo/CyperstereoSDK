@@ -13935,15 +13935,21 @@ struct FastBalancedIspDispatchJob {
   bool half_height = false;
 };
 
-#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
-// ISP39 hardware backend (rk_hw_isp.cc), the default in RK3576 builds;
-// CYPERSTEREO_ISP_BACKEND=sw disables it. Returns false when it cannot take
-// the batch; the software ISP then runs it.
+#if (defined(CYPERSTEREO_RK3576) || defined(CYPERSTEREO_RK3588)) && \
+    defined(__linux__)
+#define CYPERSTEREO_RK_HW_ISP 1
+#endif
+
+#if defined(CYPERSTEREO_RK_HW_ISP)
+// Rockchip ISP hardware backend (rk_hw_isp.cc: ISP39 on RK3576, ISP30 on
+// RK3588), the default in those builds; CYPERSTEREO_ISP_BACKEND=sw disables
+// it. Returns false when it cannot take the batch; the software ISP then
+// runs it.
 bool RkHwIspBackendRequested();
 bool ApplyRkHwIspParallel(const FastBalancedIspDispatchJob *jobs, int n);
 // Runtime override of the environment choice, e.g. for a live A/B preview.
 void SetRkHwIspBackendRequested(bool on);
-// Whether the most recent batch actually ran on the ISP39.
+// Whether the most recent batch actually ran on the ISP.
 bool RkHwIspLastBatchOnHardware();
 #endif
 
@@ -13952,7 +13958,7 @@ inline void ApplyFastBalancedISPParallelImpl(
   constexpr int kMaxWorkers = 3;
   if (n <= 0) return;
   CV_Assert(jobs != nullptr);
-#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+#if defined(CYPERSTEREO_RK_HW_ISP)
   if (RkHwIspBackendRequested() && ApplyRkHwIspParallel(jobs, n)) return;
 #endif
 #if defined(CYPERSTEREO_RK3588) || defined(CYPERSTEREO_RK3576)
@@ -14192,7 +14198,7 @@ class IspProcessor {
   // when there is no hardware ISP or it does not take the batch.
   bool ApplyHardwareWith(const IspFrameJob *jobs, int n, IspProcessor &other,
                          const IspFrameJob *other_jobs, int other_n) {
-#if defined(CYPERSTEREO_RK3576) && defined(__linux__)
+#if defined(CYPERSTEREO_RK_HW_ISP)
     if (UsesFastBalanced() && other.mode_ == mode_ && n > 0 && n <= 4 &&
         other_n > 0 && other_n <= 4 && detail::RkHwIspBackendRequested()) {
       std::array<detail::FastBalancedIspDispatchJob, 8> dispatch{};

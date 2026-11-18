@@ -619,10 +619,10 @@ static int run(int argc, char *argv[]) {
   bool half_res_announced = false;
 
 #ifdef __linux__
-  // Preview ISP selection: 0 = software, 1 = ISP39, 2 = alternate per frame.
+  // Preview ISP selection: 0 = software, 1 = hardware ISP, 2 = alternate per frame.
   enum { kLiveSw = 0, kLiveHw = 1, kLiveAb = 2 };
   int live_backend_default = kLiveSw;
-#if defined(CYPERSTEREO_RK3576)
+#if defined(CYPERSTEREO_RK_HW_ISP)
   if (cyperstereo::detail::RkHwIspBackendRequested())
     live_backend_default = kLiveHw;
 #endif
@@ -770,7 +770,7 @@ static int run(int argc, char *argv[]) {
     }
 
     bool six_this_frame = false;
-#if defined(__linux__) && defined(CYPERSTEREO_RK3576)
+#if defined(CYPERSTEREO_RK_HW_ISP)
     if (live_preview) {
       const int b = live_backend.load();
       cyperstereo::detail::SetRkHwIspBackendRequested(
@@ -990,7 +990,7 @@ static int run(int argc, char *argv[]) {
 #ifdef __linux__
       if (live_preview) {
         bool on_hw = false;
-#if defined(CYPERSTEREO_RK3576)
+#if defined(CYPERSTEREO_RK_HW_ISP)
         on_hw = cyperstereo::detail::RkHwIspLastBatchOnHardware();
 #endif
         double &ema = live_isp_ms[on_hw ? 1 : 0];

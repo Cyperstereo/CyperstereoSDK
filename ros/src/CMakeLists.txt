@@ -227,19 +227,22 @@ catkin_package(CATKIN_DEPENDS
 
 add_executable(capture_image_imu capture_image_imu.cpp)
 set(_native_rk3576 FALSE)
+set(_native_rk3588 FALSE)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING AND
    (TARGET_BOARD STREQUAL "auto" OR TARGET_BOARD STREQUAL "native") AND
    EXISTS "/proc/device-tree/compatible")
   file(STRINGS "/proc/device-tree/compatible" _device_compatible)
   if("${_device_compatible}" MATCHES "rockchip,rk3576")
     set(_native_rk3576 TRUE)
+  elseif("${_device_compatible}" MATCHES "rockchip,rk3588")
+    set(_native_rk3588 TRUE)
   endif()
 endif()
 if((TARGET_BOARD STREQUAL "rk3576" OR _native_rk3576) AND
    _cyper_cpu MATCHES "^(aarch64|arm64)$")
   target_compile_definitions(Cyperlib PUBLIC CYPERSTEREO_RK3576=1)
 endif()
-if(TARGET_BOARD STREQUAL "rk3588" AND
+if((TARGET_BOARD STREQUAL "rk3588" OR _native_rk3588) AND
    _cyper_cpu MATCHES "^(aarch64|arm64|arm|armv[0-9])")
   target_compile_definitions(Cyperlib PUBLIC CYPERSTEREO_RK3588=1)
 endif()

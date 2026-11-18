@@ -227,11 +227,14 @@ endif()
 # Recognize this board during a native default build; do not guess topology
 # from the architecture alone, and do not inspect the host for cross builds.
 set(_native_rk3576 FALSE)
+set(_native_rk3588 FALSE)
 if(NOT CMAKE_CROSSCOMPILING AND TARGET_BOARD STREQUAL "auto" AND
    EXISTS "/proc/device-tree/compatible")
   file(STRINGS "/proc/device-tree/compatible" _native_compatible)
   if(_native_compatible MATCHES "rockchip,rk3576")
     set(_native_rk3576 TRUE)
+  elseif(_native_compatible MATCHES "rockchip,rk3588")
+    set(_native_rk3588 TRUE)
   endif()
 endif()
 if((TARGET_BOARD STREQUAL "rk3576" OR _native_rk3576) AND
@@ -243,7 +246,7 @@ endif()
 # the four Cortex-A76 performance cores as CPU4-7. Expose the selected board
 # to the header-only ISP scheduler so its four camera workers can be pinned
 # one per A76. Keep this board-specific: other ARM SoCs use different layouts.
-if(TARGET_BOARD STREQUAL "rk3588" AND
+if((TARGET_BOARD STREQUAL "rk3588" OR _native_rk3588) AND
    _proc MATCHES "^(aarch64|arm64|arm|armv[0-9])")
   add_definitions(-DCYPERSTEREO_RK3588=1)
 endif()
