@@ -542,6 +542,15 @@ void DataFlow() {
                   cv::imwrite(half_dirs[i] + image_name, half_color[i]);
                 });
               }
+            } else if (four_ok) {
+              // Full-resolution quad: lanes 2/3 are C3/C4 and already ISP'd
+              // into left_front_color / right_front_color.
+              th[0] = std::thread([&] {
+                cv::imwrite("./cam3/" + image_name, left_front_color);
+              });
+              th[1] = std::thread([&] {
+                cv::imwrite("./cam4/" + image_name, right_front_color);
+              });
             }
             cv::imwrite("./cam1/" + image_name, left_color);
             if (t2.joinable()) t2.join();
