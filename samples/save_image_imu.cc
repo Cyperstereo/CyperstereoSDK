@@ -506,8 +506,8 @@ void DataFlow() {
               cv::Mat &hr2 = half_planes.IspRaw(half_raw, 2), &hc2 = half_color[2];
               cv::Mat &hr3 = half_planes.IspRaw(half_raw, 3), &hc3 = half_color[3];
               const IspFrameJob jobs[] = {
-                {left_image,left_color,"cam1",record.camera_gain[0],SelectDeliveredPlaneBayer(hw,sw,0),record.fpga_bayer_nr[0],record.raw_telemetry.RegionForPlane(0)},
-                {right_image,right_color,"cam2",record.camera_gain[1],SelectDeliveredPlaneBayer(hw,sw,1),record.fpga_bayer_nr[1],record.raw_telemetry.RegionForPlane(1)},
+                {left_image,left_color,"cam1",record.camera_gain[0],SelectDeliveredPlaneBayer(hw,sw, 0, IsAr0234FpgaOriented(record.raw_telemetry)),record.fpga_bayer_nr[0],record.raw_telemetry.RegionForPlane(0)},
+                {right_image,right_color,"cam2",record.camera_gain[1],SelectDeliveredPlaneBayer(hw,sw, 1, IsAr0234FpgaOriented(record.raw_telemetry)),record.fpga_bayer_nr[1],record.raw_telemetry.RegionForPlane(1)},
                 {hr0,hc0,halves.name[0],halves.gain[0],halves.bayer[0], false, {}, half_nr, half_tall},
                 {hr1,hc1,halves.name[1],halves.gain[1],halves.bayer[1], false, {}, half_nr, half_tall},
                 {hr2,hc2,halves.name[2],halves.gain[2],halves.bayer[2], false, {}, half_nr, half_tall},
@@ -526,7 +526,8 @@ void DataFlow() {
                 isp.ApplyParallel(jobs, 2);
                 half_isp.ApplyParallel(jobs + 2, 4);
               }
-              OrientSixImageHalves(hw, half_raw, half_color);
+              OrientSixImageHalves(hw, half_raw, half_color,
+                                   IsAr0234FpgaOriented(record.raw_telemetry));
             }
             std::thread t2;
             if (two_ok) {

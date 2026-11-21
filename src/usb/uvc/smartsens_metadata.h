@@ -61,6 +61,13 @@ inline bool IsSixImageSerial(const std::string &serial_number) {
          Ar0234CameraCountFromSerial(serial_number) == 6;
 }
 
+// Character 2 'M' (e.g. A0M0004) marks monochrome sensors: the planes are
+// already gray and must not go through the Bayer ISP.
+inline bool IsMonoSensorSerial(const std::string &serial_number) {
+  return serial_number.size() >= 3 &&
+         (serial_number[2] == 'M' || serial_number[2] == 'm');
+}
+
 static constexpr int kSmartSensHardwareVersion = 2;
 static constexpr int kSmartSensSoftwareVersion3 = 3;
 static constexpr int kSmartSensSoftwareVersion4 = 4;
@@ -180,8 +187,71 @@ static constexpr int kMetaImuBaseCol = 5;
 static constexpr int kImuWordsPerSample = 9;
 static constexpr int kSmartSensLegacyImuSamplesPerFrame = 7;
 static constexpr int kSmartSensV5ImuSamplesPerFrame = 13;
+
+// SC136HGS 02/07, 04/07 and AR0234 03/07, 05/07 with host-selectable frame
+// rate (AR0234 sets FRAME_LENGTH_LINES per rate). Column 160 =
+// {0xF5, fps}; column 161 = {0x07, n}: n (0..24) extension IMU slots of nine
+// words follow the seven legacy slots at columns 162.. and continue the same
+// sample sequence. The FPGA zero-fills the extension slots after the last
+// sample. At 30 Hz n is 0 and the frame is identical to the fixed-rate
+// firmware; older bitstreams have pixels at these columns, so trust them only
+// when both markers match.
+static constexpr int kFrameRateMarkerCol = 160;
+static constexpr int kFrameRateMarkerHigh = 0xF5;
+static constexpr int kImuExtInfoCol = 161;
+static constexpr int kImuExtInfoHigh = kSmartSensLegacyImuSamplesPerFrame;
+static constexpr int kImuExtBaseCol = 162;
+static constexpr int kImuExtMaxSamplesPerFrame = 24;
+static constexpr int kImuExtEndCol =
+    kImuExtBaseCol + kImuExtMaxSamplesPerFrame * kImuWordsPerSample;
+
 static constexpr int kImuMaxSamplesPerFrame =
-    kSmartSensV5ImuSamplesPerFrame;
+    kSmartSensLegacyImuSamplesPerFrame + kImuExtMaxSamplesPerFrame;
+static_assert(kImuMaxSamplesPerFrame >= kSmartSensV5ImuSamplesPerFrame,
+              "IMU arrays must hold the 13-slot software-05 layout");
+
+// 60 Hz: SC136HGS bitstreams only (the camera's supported mask says which).
+inline bool IsSupportedFrameRate(int fps) {
+  return fps == 10 || fps == 15 || fps == 20 || fps == 30 || fps == 60;
+}
+
+// Firmware whose metadata row may carry the column-160/161 markers.
+inline bool HasFrameRateMarkerLayout(int hardware_version, int software_version) {
+  return (IsSc136FamilyHardware(hardware_version) &&
+          software_version == kSmartSensSoftwareVersion7) ||
+         (IsAr0234FamilyHardware(hardware_version) &&
+          software_version == kAr0234SoftwareVersion7);
+}
+
+// Frame rate from the column-160 word, or 0 when the bitstream does not
+// report it.
+inline int FrameRateFromMarker(int marker_word) {
+  const int fps = marker_word & 0xff;
+  return (marker_word >> 8) == kFrameRateMarkerHigh && IsSupportedFrameRate(fps)
+             ? fps
+             : 0;
+}
+
+// Extension IMU slot count from the column-161 word (0 when absent/invalid).
+inline int ImuExtSlotsFromInfo(int info_word) {
+  const int n = info_word & 0xff;
+  return (info_word >> 8) == kImuExtInfoHigh && n <= kImuExtMaxSamplesPerFrame
+             ? n
+             : 0;
+}
+
+// First metadata column of IMU slot i: slots 0..6 are the legacy columns
+// 5..67, slots 7.. the extension at column 162.
+inline int ImuSlotBaseCol(int slot) {
+  return slot < kSmartSensLegacyImuSamplesPerFrame
+             ? kMetaImuBaseCol + slot * kImuWordsPerSample
+             : kImuExtBaseCol +
+                   (slot - kSmartSensLegacyImuSamplesPerFrame) *
+                       kImuWordsPerSample;
+}
+
+// 1.5 frame periods.
+inline double ImageGapThresholdForFps(int fps) { return 1.5 / fps; }
 
 static constexpr double kImageGapThresholdSec = 0.040;
 static constexpr double kSmartSensV5ImageGapThresholdSec = 0.080;
@@ -193,6 +263,9 @@ static constexpr double kSmartSensV5ImageGapThresholdSec = 0.080;
 static constexpr double kSmartSensLegacyLineTimeSec = 23.868131868e-6;
 static constexpr double kSmartSensV5LineTimeSec = 23.572016461e-6;
 static constexpr double kSmartSensV6LineTimeSec = 452.0 / 15187500.0;
+// At 60 Hz the 02/07 and 04/07 bitstreams switch to the vendor 60 fps timing:
+// 24 MHz EXTCLK (SCLK 24.3 MHz) and HTS=364.
+static constexpr double kSmartSens60HzLineTimeSec = 364.0 / 24300000.0;
 // AR0234 parallel row = 4 * LINE_LENGTH_PCK(612) PIXCLK at 85.714 MHz
 // (24 MHz EXTCLK, PLL 50/2, VCO 600 MHz, vt_pix_clk_div 7).
 static constexpr double kAr0234LineTimeSec = 2448.0 * 7.0 / 600000000.0;
@@ -331,7 +404,16 @@ inline SmartSensMetadataLayout GetSmartSensMetadataLayout(
       false};
 }
 
-static constexpr int kSmartSensMaxMetadataCols = 135;
+// Exposure line time of one frame; frame_rate is the column-160 rate (0 when
+// the bitstream does not report it).
+inline double SmartSensLineTimeSec(const SmartSensMetadataLayout &layout,
+                                   int hardware_version, int frame_rate) {
+  return IsSc136FamilyHardware(hardware_version) && frame_rate == 60
+             ? kSmartSens60HzLineTimeSec
+             : layout.line_time_sec;
+}
+
+static constexpr int kSmartSensMaxMetadataCols = kImuExtEndCol;
 
 // AE marker column (ae_marker_col) = {0xAE, lo}. lo[3:0] = cam4/3/2/1 present.
 // lo[7:4] = per physical sensor C4/C3/C2/C1: the FPGA already applied the

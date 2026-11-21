@@ -30,6 +30,7 @@
 #include "uvc.h"
 #include "bayer_format.h"
 #include "smartsens_metadata.h"
+#include "camera_frame_rate.h"
 #include "ar0234_diagnostics.h"
 #include "ar0234_temperature.h"
 #include "ar0234_exposure_meter.h"
@@ -610,13 +611,14 @@ inline const int *SixImageHalfOutputOrder(uint32_t hardware_version) {
 // V1.6: C5 (socket J9, half 2) is mounted upside down. Default-board
 // AR0234: C1h/C2h come from the sensors that OrientAr0234Image12 rotates
 // 180 degrees. Both flips run after demosaic so the RAW Bayer phase is
-// never changed.
+// never changed. ar0234_fpga_oriented: the FPGA already did that rotation.
 inline void OrientSixImageHalves(uint32_t hardware_version, cv::Mat raw[4],
-                                 cv::Mat color[4]) {
+                                 cv::Mat color[4],
+                                 bool ar0234_fpga_oriented = false) {
   const int hw = static_cast<int>(hardware_version);
   if (IsV16BoardHardware(hw)) {
     MirrorImage5Vertical(raw[2], color[2]);
-  } else if (IsAr0234FamilyHardware(hw)) {
+  } else if (IsAr0234FamilyHardware(hw) && !ar0234_fpga_oriented) {
     for (int i = 0; i < 2; ++i) {
       if (!raw[i].empty()) cv::flip(raw[i], raw[i], -1);
       if (!color[i].empty()) cv::flip(color[i], color[i], -1);
@@ -888,6 +890,9 @@ struct FrameStreamData {
   std::string serial_num;
   uint32_t hardware_version{0};
   uint32_t software_version{0};
+  // Frame rate reported by the metadata (10/15/20/30, SC136HGS also 60), 0
+  // when the bitstream does not report it.
+  int frame_rate{0};
 	double image_timestamp;   // exposure END, common to all sensors (seconds)
 
   // Per-display-plane AE telemetry, parsed from the SmartSens metadata row.
@@ -909,6 +914,10 @@ struct FrameStreamData {
   // True when the FPGA already ran the fast-ISP BayerNR on this plane's RAW.
   // Pass it as raw_bayer_nr_done to the fast ISP so the filter is not doubled.
   bool     fpga_bayer_nr[4]{};
+  // AR0234: the FPGA already reads every sensor out upright (metadata
+  // column 125 = 0xF11F), so image1/image2 and the six-image halves must
+  // not be rotated again.
+  bool     ar0234_fpga_oriented{false};
 
   // Per-camera capture timestamp taken at the exposure MIDPOINT:
   //   image_midpoint_timestamp[i] = image_timestamp - exposure_time[i]/2.
@@ -979,6 +988,7 @@ struct FrameInfo {
   // a stale/held-over legacy metadata slot jumps away from it. Firmware 05
   // zero-filled slots are rejected explicitly. Sentinel < -900 means no ref.
   double last_imu_temperature{-1000.0};
+  int reported_frame_rate{0};  // last metadata frame rate, for change logs
   // Anomaly replay ring: last kDiagRingLen frames of raw metadata.
   static constexpr int kDiagRingLen = 10;
   FrameDiagRec diag_ring[kDiagRingLen]{};
@@ -2208,6 +2218,17 @@ inline void FastParallelForRows(int rows, const char *stage,
 #define CYPERSTEREO_NOINLINE
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define CYPERSTEREO_PREFETCH(address, locality) \
+  __builtin_prefetch((address), 0, (locality))
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#define CYPERSTEREO_PREFETCH(address, locality)                         \
+  _mm_prefetch(reinterpret_cast<const char *>(address),                \
+               (locality) >= 3 ? _MM_HINT_T0 : _MM_HINT_T1)
+#else
+#define CYPERSTEREO_PREFETCH(address, locality) ((void)(address))
+#endif
+
 // Keep the short BayerNR SIMD tail in a separately compiled row function.
 // Besides being cold (at most 15 pixels/row), this avoids a GCC 9
 // outlined-lambda
@@ -2979,7 +3000,7 @@ class WhiteBalance {
         for (int r = y + kEstStep; r < y + kEstStep + 2; ++r) {
           const uchar *ahead = raw.ptr<uchar>(r);
           for (int x = 0; x < raw.cols; x += 64)
-            __builtin_prefetch(ahead + x, 0, 3);
+            CYPERSTEREO_PREFETCH(ahead + x, 3);
         }
       }
       const uchar *r0 = raw_rows_.Row(raw, y);
@@ -11211,7 +11232,7 @@ inline int FastNeonStreamedTailPrefetch() {
 inline void FastPrefetchL2(const void *address, size_t bytes) {
   const char *p = static_cast<const char *>(address);
   for (size_t offset = 0; offset < bytes; offset += 64)
-    __builtin_prefetch(p + offset, 0, 2);
+    CYPERSTEREO_PREFETCH(p + offset, 2);
 }
 
 // Gate, reconstruct, median3, blend/hue, highlight fade and the BGR output
@@ -14472,6 +14493,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
         const CameraProfile &prof = frame_info.profile;
         FrameStreamData &fs = frame_info.framestream;
         fs.raw_telemetry = RawTelemetrySnapshot{};
+        fs.ar0234_fpga_oriented = false;
         for (int p = 0; p < 4; ++p) {
           if (IsAr0234FamilyHardware(static_cast<int>(fs.hardware_version)))
             fs.camera_temperature[p] = Ar0234TemperatureState::Unavailable();
@@ -14684,11 +14706,42 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
 
           fs.hardware_version = static_cast<uint32_t>(ver0);
           fs.software_version = static_cast<uint32_t>(ver1);
+          // Host-selectable-rate SC136HGS and AR0234 bitstreams report the
+          // rate and the extension IMU slots that follow the seven legacy ones.
+          fs.frame_rate = 0;
+          int imu_ext_slots = 0;
+          if (IsSmartSensProfile(prof) && HasFrameRateMarkerLayout(ver0, ver1) &&
+              lo_plane->cols >= kImuExtEndCol) {
+            fs.frame_rate = FrameRateFromMarker(meta_u(kFrameRateMarkerCol));
+            if (fs.frame_rate != 0)
+              imu_ext_slots = ImuExtSlotsFromInfo(meta_u(kImuExtInfoCol));
+          }
+          // A rate switch spans one period of the slower rate.
+          const int gap_frame_rate =
+              frame_info.reported_frame_rate != 0 && fs.frame_rate != 0
+                  ? (std::min)(fs.frame_rate, frame_info.reported_frame_rate)
+                  : fs.frame_rate;
+          if (fs.frame_rate != frame_info.reported_frame_rate) {
+            if (fs.frame_rate != 0)
+              std::cout << "[api] camera frame rate " << fs.frame_rate
+                        << " Hz (" << imu_ext_slots << " extension IMU slots)"
+                        << std::endl;
+            frame_info.reported_frame_rate = fs.frame_rate;
+          }
+          const double exposure_line_time_sec =
+              SmartSensLineTimeSec(smartsens_layout, ver0, fs.frame_rate);
+          const int imu_slots =
+              prof.imu_samples_per_frame +
+              (prof.imu_samples_per_frame == kSmartSensLegacyImuSamplesPerFrame
+                   ? imu_ext_slots
+                   : 0);
           // Capture original telemetry after marker validation and before any
           // consumer can create an ISP copy. AR0234 image1/image2 are oriented
           // only after this snapshot; image3/image4 stay untouched.
           fs.raw_telemetry = DecodeRawTelemetrySnapshot(
               lo, hi, lo_plane->cols, prof.meta_row, ver0, ver1);
+          fs.ar0234_fpga_oriented =
+              IsAr0234FpgaOriented(fs.raw_telemetry);
 
           double image_count_hour = meta_u(2);
           double image_count_ms = meta_u(3);
@@ -14734,7 +14787,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
               const int lines =
                   meta_u(smartsens_layout.exposure_base_col + sensor);
               fs.exposure_lines[p] = static_cast<uint16_t>(lines);
-              fs.exposure_time[p] = lines * smartsens_layout.line_time_sec;
+              fs.exposure_time[p] = lines * exposure_line_time_sec;
               const int traw =
                   meta_u(smartsens_layout.temperature_base_col + sensor);
               fs.camera_temperature[p] =
@@ -14861,7 +14914,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
               fs.c56_present[c] = ((marker >> c) & 1) != 0;
               const int lines = meta_u(kSixCamC56ExposureCol + c);
               fs.c56_exposure_lines[c] = static_cast<uint16_t>(lines);
-              fs.c56_exposure_time[c] = lines * smartsens_layout.line_time_sec;
+              fs.c56_exposure_time[c] = lines * exposure_line_time_sec;
               const int traw = meta_u(kSixCamC56TemperatureCol + c);
               fs.c56_camera_temperature[c] =
                   ((traw >> 8) * 8 + (traw & 0x7)) / 4.0 - 273.15;
@@ -14930,9 +14983,9 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           rec.img_ms = static_cast<int>(image_count_ms);
           rec.img_s = static_cast<int>(image_count_s);
           rec.image_ts = fs.image_timestamp;
-          rec.imu_n = prof.imu_samples_per_frame;
-          for (int i = 0; i < prof.imu_samples_per_frame; ++i) {
-            const int base = kMetaImuBaseCol + i * kImuWordsPerSample;
+          rec.imu_n = imu_slots;
+          for (int i = 0; i < imu_slots; ++i) {
+            const int base = ImuSlotBaseCol(i);
             rec.imu_ms[i] = meta_u(base + 0);
             rec.imu_s[i] = meta_u(base + 1);
           }
@@ -14953,7 +15006,9 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
             const double image_gap =
                 fs.image_timestamp - frame_info.last_image_timestamp;
             const double image_gap_threshold =
-                IsSmartSensProfile(prof)
+                gap_frame_rate != 0
+                    ? ImageGapThresholdForFps(gap_frame_rate)
+                : IsSmartSensProfile(prof)
                     ? smartsens_layout.image_gap_threshold_sec
                     : kImageGapThresholdSec;
             // Flag BOTH directions: a backward step (negative gap) was
@@ -15032,17 +15087,18 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           // sample only while both the timestamp and the temperature stay
           // continuous; the first slot that breaks continuity ends the run
           // (stale/held-over slots only ever trail the genuine samples).
-          const int imu_slots = prof.imu_samples_per_frame;
           int valid_samples = 0;
           double prev_ts = -1.0;
           double prev_temp = frame_info.last_imu_temperature;
           for (int i = 0; i < imu_slots; ++i) {
-            const int base = kMetaImuBaseCol + i * kImuWordsPerSample;
+            const int base = ImuSlotBaseCol(i);
             // Software 05 explicitly zero-fills an unused 13th slot and all
-            // slots on an unprefilled startup frame. Stop before timestamp /
+            // slots on an unprefilled startup frame; the extension slots are
+            // zero-filled after the last sample. Stop before timestamp /
             // temperature heuristics can mistake an all-zero slot as valid.
             if (IsSmartSensProfile(prof) &&
-                smartsens_layout.zero_fills_unused_imu) {
+                (smartsens_layout.zero_fills_unused_imu ||
+                 i >= kSmartSensLegacyImuSamplesPerFrame)) {
               bool all_zero = true;
               for (int word = 0; word < kImuWordsPerSample; ++word) {
                 if (meta_u(base + word) != 0) {
@@ -15270,7 +15326,7 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
           const int orient_hw = fs.hardware_version != 0
                                     ? static_cast<int>(fs.hardware_version)
                                     : prof.hardware_version;
-          if (IsAr0234FamilyHardware(orient_hw))
+          if (IsAr0234FamilyHardware(orient_hw) && !fs.ar0234_fpga_oriented)
             OrientAr0234Image12(fs);
         }
 

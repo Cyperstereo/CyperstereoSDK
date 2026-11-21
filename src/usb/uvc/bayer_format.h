@@ -49,16 +49,18 @@ inline BayerConversion SelectBayerConversion(uint32_t hardware_version,
   return BayerConversion::kColorBayerRg2Bgr;
 }
 
-// AR0234 image1/image2 are rotated 180 degrees after telemetry is captured.
-// Both dimensions are even, so that rotation swaps RGGB and BGGR. image3,
-// image4, and the six-image half cameras are not rotated and keep
-// SelectBayerConversion.
+// AR0234 image1/image2 are rotated 180 degrees by the SDK after telemetry is
+// captured, unless ar0234_fpga_oriented (the sensor already read them out
+// upright, which keeps RGGB). Both dimensions are even, so the SDK rotation
+// swaps RGGB and BGGR. image3, image4, and the six-image half cameras are not
+// rotated and keep SelectBayerConversion.
 inline BayerConversion SelectDeliveredPlaneBayer(uint32_t hardware_version,
                                                  uint32_t software_version,
-                                                 int image_index) {
+                                                 int image_index,
+                                                 bool ar0234_fpga_oriented) {
   const BayerConversion native =
       SelectBayerConversion(hardware_version, software_version, image_index);
-  if ((image_index == 0 || image_index == 1) &&
+  if ((image_index == 0 || image_index == 1) && !ar0234_fpga_oriented &&
       IsAr0234FamilyHardware(static_cast<int>(hardware_version))) {
     return native == BayerConversion::kColorBayerBg2Bgr
                ? BayerConversion::kColorBayerRg2Bgr

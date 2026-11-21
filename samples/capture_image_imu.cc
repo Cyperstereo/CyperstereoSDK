@@ -443,6 +443,10 @@ static int run(int argc, char *argv[]) {
   // --stream [port]: live MJPEG preview over HTTP (temporary tool).
   int stream_port = 0;
   int stream_fps = 10;
+  // --fps 10|15|20|30|60|default: store the camera frame rate in its Flash
+  // (SC136HGS bitstreams with a selectable rate), applied after the camera is
+  // power-cycled; default clears it. 0 = leave it, -1 = default.
+  int camera_fps = 0;
   int raw_stats_every = 0;  // RAW statistics are opt-in diagnostics.
   if (const char *value = std::getenv("CYPERSTEREO_RAW_STATS_EVERY")) {
     char *end = nullptr;
@@ -482,6 +486,10 @@ static int run(int argc, char *argv[]) {
                         ? std::atoi(argv[++i]) : 8080;
     else if (arg == "--stream-fps" && i + 1 < argc)
       stream_fps = std::atoi(argv[++i]);
+    else if (arg == "--fps" && i + 1 < argc) {
+      const std::string value(argv[++i]);
+      camera_fps = value == "default" ? -1 : std::atoi(value.c_str());
+    }
   }
   // Fast-balanced defaults to BGR888. --output-yuv422 selects full-range
   // UYVY422 with the same digital exposure and tone. Quality/HDR is BGR-only.
@@ -535,6 +543,29 @@ static int run(int argc, char *argv[]) {
   if (process_cameras == 1 && num_cameras > 1)
     std::cout << "  process: C1 only (S1 color SKU)";
   std::cout << std::endl;
+  {
+    cyperstereo::CameraFrameRateInfo rate;
+    std::string error;
+    const bool ok =
+        camera_fps != 0
+            ? cyperstereo::StoreCameraFrameRate(*cyperstereo_device,
+                                                camera_fps < 0 ? 0 : camera_fps,
+                                                &rate, &error)
+            : cyperstereo::QueryCameraFrameRate(*cyperstereo_device, &rate,
+                                                &error);
+    if (ok) {
+      std::cout << "[fps] camera " << rate.active_fps << " Hz ("
+                << (rate.from_flash ? "stored" : "default") << ", default "
+                << rate.default_fps << " Hz, supported mask 0x" << std::hex
+                << rate.supported_mask << std::dec << ")";
+      if (rate.RestartPending())
+        std::cout << "; " << rate.NextBootFps()
+                  << " Hz after the camera is power-cycled";
+      std::cout << std::endl;
+    } else if (camera_fps != 0) {
+      std::cerr << "[fps] cannot store the frame rate: " << error << std::endl;
+    }
+  }
   cyperstereo::uvc::set_device_mode(
     *cyperstereo_device, profile.frame_width, profile.frame_height,
     static_cast<int>(cyperstereo::Format::YUYV), profile.fps,
@@ -714,6 +745,7 @@ static int run(int argc, char *argv[]) {
     C56Telemetry c56;
     RawTelemetrySnapshot raw_telemetry;
     uint32_t hardware_version = 0;
+    bool ar0234_fpga_oriented = false;
     uint32_t software_version = 0;
     cyperstereo::IMUStreamData imu_data{};
     cyperstereo::GNSSStreamData gnss_data{};
@@ -723,6 +755,7 @@ static int run(int argc, char *argv[]) {
       image_timestamp = frame_info.framestream.image_timestamp;
       raw_telemetry = frame_info.framestream.raw_telemetry;
       hardware_version = frame_info.framestream.hardware_version;
+      ar0234_fpga_oriented = frame_info.framestream.ar0234_fpga_oriented;
       software_version = frame_info.framestream.software_version;
       cv::swap(frame_info.framestream.left_image, left_image);
       if (process_cameras >= 2)
@@ -786,9 +819,9 @@ static int run(int argc, char *argv[]) {
       // image1/image2 use the delivered phase: AR0234 rotates those two RAW
       // planes 180 degrees. image3/image4 stay in transport orientation.
       const BayerConversion image1_bayer =
-          SelectDeliveredPlaneBayer(hardware_version, software_version, 0);
+          SelectDeliveredPlaneBayer(hardware_version, software_version, 0, IsAr0234FpgaOriented(raw_telemetry));
       const BayerConversion image2_bayer =
-          SelectDeliveredPlaneBayer(hardware_version, software_version, 1);
+          SelectDeliveredPlaneBayer(hardware_version, software_version, 1, IsAr0234FpgaOriented(raw_telemetry));
       const BayerConversion image3_bayer =
           SelectBayerConversion(hardware_version, software_version, 2);
       const BayerConversion image4_bayer =
@@ -911,7 +944,8 @@ static int run(int argc, char *argv[]) {
                       << std::endl;
           }
         }
-        OrientSixImageHalves(hardware_version, half_raw, half_color);
+        OrientSixImageHalves(hardware_version, half_raw, half_color,
+                             ar0234_fpga_oriented);
         // V1.6: half_isp slots 2/3 are physical C5/C6, same digital exposure
         // as image1.
         if (halves.camera[2] == 5) {

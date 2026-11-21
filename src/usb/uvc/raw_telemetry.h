@@ -60,6 +60,11 @@ inline RawTelemetrySnapshot DecodeRawTelemetrySnapshot(
   if (family == kSmartSensHardwareVersion && software == 7 &&
       columns >= 108 && word(106) == 0xA915 && word(107) == 0x0106)
     end = 132;
+  if (HasFrameRateMarkerLayout(hardware, software) &&
+      columns >= kImuExtEndCol &&
+      FrameRateFromMarker(word(kFrameRateMarkerCol)) != 0 &&
+      (word(kImuExtInfoCol) >> 8) == kImuExtInfoHigh)
+    end = kImuExtEndCol;
   // Fault/status bits inside an advertised extension do not make its bytes
   // into image pixels. Detect occupancy separately from telemetry validity.
   if (columns < end || end > static_cast<int>(result.words.size())) return result;
@@ -127,6 +132,15 @@ inline void PrepareIspRaw(const cv::Mat &raw, cv::Mat &out,
   if (!region.active()) return;
   raw.row(region.row - 2).colRange(region.first_col, region.end_col)
       .copyTo(out.row(region.row).colRange(region.first_col, region.end_col));
+}
+
+// AR0234 readback layout 0x1005, column 125 = 0xF11F: the FPGA reads every
+// sensor out upright. Older bitstreams send 0 there.
+static constexpr uint16_t kAr0234FpgaOrientedMarker = 0xF11F;
+inline bool IsAr0234FpgaOriented(const RawTelemetrySnapshot &snapshot) {
+  return snapshot.valid && snapshot.word_count >= 126 &&
+         snapshot.words[106] == 0xB1C1 && snapshot.words[107] == 0x1005 &&
+         snapshot.words[125] == kAr0234FpgaOrientedMarker;
 }
 
 inline void WriteRawTelemetryCsv(std::ostream &out,

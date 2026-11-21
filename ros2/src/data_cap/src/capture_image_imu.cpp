@@ -144,6 +144,7 @@ public:
             RawTelemetrySnapshot raw_telemetry;
             CameraSensorSnapshot sensors;
             uint32_t hardware_version = 0;
+            bool ar0234_fpga_oriented = false;
             uint32_t software_version = 0;
             std::array<double, 4> camera_gain{{1.0, 1.0, 1.0, 1.0}};
             std::array<bool, 4> fpga_bayer_nr{};
@@ -157,6 +158,7 @@ public:
                 raw_telemetry = frame_info.framestream.raw_telemetry;
                 sensors = CameraSensorSnapshot::FromFrame(frame_info.framestream);
                 hardware_version = frame_info.framestream.hardware_version;
+                ar0234_fpga_oriented = frame_info.framestream.ar0234_fpga_oriented;
                 software_version = frame_info.framestream.software_version;
                 cv::swap(frame_info.framestream.left_image, left_image);
                 if (process_cameras >= 2)
@@ -211,8 +213,8 @@ public:
                 const double half_nr = half_planes.NrGainScale();
                 const bool half_tall = half_planes.demosaic_first;
                 const IspFrameJob jobs[] = {
-                    {left_image, left_color, "cam1", camera_gain[0], SelectDeliveredPlaneBayer(hardware_version, software_version, 0), fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
-                    {right_image, right_color, "cam2", camera_gain[1], SelectDeliveredPlaneBayer(hardware_version, software_version, 1), fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
+                    {left_image, left_color, "cam1", camera_gain[0], SelectDeliveredPlaneBayer(hardware_version, software_version, 0, IsAr0234FpgaOriented(raw_telemetry)), fpga_bayer_nr[0], raw_telemetry.RegionForPlane(0)},
+                    {right_image, right_color, "cam2", camera_gain[1], SelectDeliveredPlaneBayer(hardware_version, software_version, 1, IsAr0234FpgaOriented(raw_telemetry)), fpga_bayer_nr[1], raw_telemetry.RegionForPlane(1)},
                     {half_planes.IspRaw(half_raw, 0), half_color[0], halves.name[0], halves.gain[0], halves.bayer[0], false, {}, half_nr, half_tall},
                     {half_planes.IspRaw(half_raw, 1), half_color[1], halves.name[1], halves.gain[1], halves.bayer[1], false, {}, half_nr, half_tall},
                     {half_planes.IspRaw(half_raw, 2), half_color[2], halves.name[2], halves.gain[2], halves.bayer[2], false, {}, half_nr, half_tall},
@@ -229,7 +231,8 @@ public:
                     isp.ApplyParallel(jobs, 2);
                     half_isp.ApplyParallel(jobs + 2, 4);
                 }
-                OrientSixImageHalves(hardware_version, half_raw, half_color);
+                OrientSixImageHalves(hardware_version, half_raw, half_color,
+                             ar0234_fpga_oriented);
                 const cv::Mat *color[6] = {&left_color, &right_color,
                     &half_color[half_order[0]], &half_color[half_order[1]],
                     &half_color[half_order[2]], &half_color[half_order[3]]};
