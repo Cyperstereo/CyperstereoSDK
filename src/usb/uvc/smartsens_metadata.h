@@ -42,14 +42,16 @@ inline int SmartSensProcessedCameraCount(const std::string &serial_number,
 }
 
 // AR0234 serials encode the SKU in character 1: A0xxxxx=quad,
-// A6xxxxx=six-image. Both use the four-lane 3840x1080 transport and the same
-// metadata column 0 (03 default board, 05 V1.6). Return 0 for another
-// family/SKU.
+// A2xxxxx=stereo (C1/C2, 1920x1080), A6xxxxx=six-image. Quad and six-image
+// use the four-lane 3840x1080 transport; stereo uses the two-lane transport.
+// All three share metadata column 0 (03 default board, 05 V1.6). Return 0
+// for another family/SKU.
 inline int Ar0234CameraCountFromSerial(const std::string &serial_number) {
   if (serial_number.size() < 2 ||
       (serial_number[0] != 'A' && serial_number[0] != 'a'))
     return 0;
   if (serial_number[1] == '0') return 4;
+  if (serial_number[1] == '2') return 2;
   if (serial_number[1] == '6') return 6;
   return 0;
 }

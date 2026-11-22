@@ -406,9 +406,11 @@ static constexpr int kFx3HalfFrameWidth = kSmartSensCamWidth;
 static constexpr int kFx3HalfFramePixels = kFx3HalfFrameWidth * kFx3FrameHeight;
 
 // AR0234 quad: four 1920x1080 RAW8 planes on the same four byte lanes, so the
-// YUY2 transport is 3840x1080.
+// YUY2 transport is 3840x1080. Stereo (A2) keeps one byte lane per camera,
+// so its YUY2 transport is 1920x1080.
 static constexpr int kAr0234CamWidth = 1920;
 static constexpr int kAr0234FrameWidth = kAr0234CamWidth * 2;
+static constexpr int kAr0234FrameWidthStereo = kAr0234CamWidth;
 static constexpr int kAr0234FrameHeight = 1080;
 
 // Six-image half lanes (S6/A6 serials; see smartsens_metadata.h): split the
@@ -695,6 +697,13 @@ static constexpr CameraProfile kProfileAr0234Quad{
     kAr0234FrameWidth, kAr0234FrameHeight, kFx3FrameFps, 4, kAr0234CamWidth,
     kAr0234FrameHeight - 1, kSmartSensLegacyImuSamplesPerFrame, 72};
 
+// A2 stereo AR0234: C1/C2 on the 16-bit GPIF path, YUY2 1920x1080 at 30 Hz.
+static constexpr CameraProfile kProfileAr0234Stereo{
+    "AR0234(stereo/A2)", kAr0234HardwareVersion, kAr0234SoftwareVersion7,
+    kAr0234FrameWidthStereo, kAr0234FrameHeight, kFx3FrameFps, 2,
+    kAr0234CamWidth, kAr0234FrameHeight - 1,
+    kSmartSensLegacyImuSamplesPerFrame, 72};
+
 // A6 six-image AR0234: same 3840x1080 transport as the quad. Column 0
 // (03 default board / 05 V1.6) is latched from the first frame.
 static constexpr CameraProfile kProfileAr0234Six{
@@ -753,10 +762,12 @@ inline const CameraProfile &SelectSmartSensBySerial(
   return kProfileSmartSensQuad;
 }
 
-// A0 = quad, A6 = six-image; other A serials fall back to the quad profile.
+// A0 = quad, A2 = stereo, A6 = six-image; other A serials fall back to quad.
 // Column 0 (03 / 05) only names the board; the serial decides the lane layout.
 inline const CameraProfile &SelectAr0234BySerial(const std::string &serial_num) {
-  if (Ar0234CameraCountFromSerial(serial_num) == 6) return kProfileAr0234Six;
+  const int camera_count = Ar0234CameraCountFromSerial(serial_num);
+  if (camera_count == 6) return kProfileAr0234Six;
+  if (camera_count == 2) return kProfileAr0234Stereo;
   return kProfileAr0234Quad;
 }
 
@@ -797,12 +808,20 @@ inline const CameraProfile &SelectProfile(const std::string &serial_num,
       uvc::has_frame_size(device, kMt9FrameWidth, kMt9FrameHeight);
   const bool has_ar0234 =
       uvc::has_frame_size(device, kAr0234FrameWidth, kAr0234FrameHeight);
+  const bool has_ar0234_stereo = uvc::has_frame_size(
+      device, kAr0234FrameWidthStereo, kAr0234FrameHeight);
 
   if (has_ar0234) {
     std::cout << "[api] no USB serial; UVC size " << kAr0234FrameWidth << "x"
               << kAr0234FrameHeight << " -> " << kProfileAr0234Quad.name
               << std::endl;
     return kProfileAr0234Quad;
+  }
+  if (has_ar0234_stereo) {
+    std::cout << "[api] no USB serial; UVC size "
+              << kAr0234FrameWidthStereo << "x" << kAr0234FrameHeight << " -> "
+              << kProfileAr0234Stereo.name << std::endl;
+    return kProfileAr0234Stereo;
   }
   if (has_stereo && !has_quad && !has_mt9) {
     std::cout << "[api] no USB serial; UVC size " << kFx3FrameWidthStereo
@@ -14592,8 +14611,9 @@ inline void SetStreamData(FrameInfo& frame_info, const void *data,
               frame_info.profile.software_version = ver1;
               // Leave an S2/S1 name alone; quad and six-image SKUs take the
               // board from column 0.
-              const int serial_cameras =
-                  SmartSensCameraCountFromSerial(fs.serial_num);
+              const int serial_cameras = (std::max)(
+                  SmartSensCameraCountFromSerial(fs.serial_num),
+                  Ar0234CameraCountFromSerial(fs.serial_num));
               const bool lane_sku = serial_cameras != 1 && serial_cameras != 2;
               if (lane_sku &&
                   (hardware_changed ||
