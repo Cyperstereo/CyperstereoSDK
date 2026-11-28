@@ -1,0 +1,156 @@
+Metadata-Version: 2.4
+Name: rosbags
+Version: 0.11.10
+Summary: Pure Python library to read, modify, convert, and write rosbag files.
+Author-email: Ternaris <team@ternaris.com>
+License-Expression: Apache-2.0
+Project-URL: Homepage, https://gitlab.com/ternaris/rosbags
+Project-URL: Documentation, https://ternaris.gitlab.io/rosbags
+Project-URL: Source, https://gitlab.com/ternaris/rosbags
+Project-URL: Issues, https://gitlab.com/ternaris/rosbags/issues
+Project-URL: Changelog, https://gitlab.com/ternaris/rosbags/-/blob/master/CHANGES.rst
+Keywords: cdr,conversion,deserialization,idl,mcap,message,msg,reader,ros,ros2,rosbag,rosbag2,serialization,writer
+Classifier: Development Status :: 4 - Beta
+Classifier: Programming Language :: Python
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: Python :: 3.14
+Classifier: Programming Language :: Python :: 3.15
+Classifier: Topic :: Scientific/Engineering
+Classifier: Typing :: Typed
+Requires-Python: >=3.10
+Description-Content-Type: text/x-rst
+License-File: LICENSE.txt
+Requires-Dist: apsw
+Requires-Dist: backports.zstd; python_version < "3.14"
+Requires-Dist: lz4
+Requires-Dist: numpy
+Requires-Dist: ruamel.yaml
+Requires-Dist: typing_extensions>=4.5; python_version < "3.12"
+Dynamic: license-file
+
+.. image:: https://gitlab.com/ternaris/rosbags/badges/master/pipeline.svg
+   :target: https://gitlab.com/ternaris/rosbags/-/commits/master
+   :alt: pipeline status
+
+.. image:: https://gitlab.com/ternaris/rosbags/badges/master/coverage.svg
+   :target: https://gitlab.com/ternaris/rosbags/-/commits/master
+   :alt: coverage report
+
+.. image:: https://img.shields.io/pypi/pyversions/rosbags
+   :alt: python versions
+
+.. image:: https://img.shields.io/pypi/dm/rosbags
+   :alt: PyPI - Downloads
+
+=======
+Rosbags
+=======
+
+Rosbags is the **pure python** library for everything rosbag. It contains:
+
+- **highlevel** easy-to-use interfaces,
+- **rosbag2** reader and writer,
+- **rosbag1** reader and writer,
+- **extensible** type system with serializers and deserializers,
+- **efficient converter** between rosbag1 and rosbag2,
+- and more.
+
+Rosbags does not have any dependencies on the ROS software stacks and can be used on its own or alongside ROS1 or ROS2.
+
+Rosbags was developed for `MARV <https://gitlab.com/ternaris/marv-robotics>`_, which requires a fast, correct, and flexible library to read, manipulate, and write the various rosbag file formats.
+
+
+Getting started
+===============
+
+Rosbags is published on PyPI and does not have any special dependencies. Simply install with pip::
+
+   pip install rosbags
+
+
+Read and deserialize messages from rosbag1 or rosbag2 files:
+
+.. code-block:: python
+
+   from pathlib import Path
+
+   from rosbags.highlevel import AnyReader
+   from rosbags.typesys import Stores, get_typestore
+
+   bagpath = Path('/home/ros/rosbag_2020_03_24')
+
+   # Create a type store to use if the bag has no message definitions.
+   typestore = get_typestore(Stores.ROS2_FOXY)
+
+   # Create reader instance and open for reading.
+   with AnyReader([bagpath], default_typestore=typestore) as reader:
+       connections = [x for x in reader.connections if x.topic == '/imu_raw/Imu']
+       for connection, timestamp, rawdata in reader.messages(connections=connections):
+            msg = reader.deserialize(rawdata, connection.msgtype)
+            print(msg.header.frame_id)
+
+
+Convert between rosbag versions::
+
+   # Convert "foo.bag", result will be "foo/"
+   rosbags-convert foo.bag
+
+   # Convert "bar", result will be "bar.bag"
+   rosbags-convert bar
+
+   # Convert "foo.bag", save the result as "bar"
+   rosbags-convert foo.bag --dst /path/to/bar
+
+   # Convert "bar", save the result as "foo.bag"
+   rosbags-convert bar --dst /path/to/foo.bag
+
+
+Documentation
+=============
+
+Read the `documentation <https://ternaris.gitlab.io/rosbags/>`_ for further information.
+
+.. end documentation
+
+
+Contributing
+============
+
+Thank you for considering to contribute to rosbags.
+
+To submit issues or create merge requests please follow the instructions provided in the `contribution guide <https://gitlab.com/ternaris/rosbags/-/blob/master/CONTRIBUTING.rst>`_.
+
+By contributing to rosbags you accept and agree to the terms and conditions laid out in there.
+
+
+Development
+===========
+
+Clone the repository and setup your local checkout::
+
+   git clone https://gitlab.com/ternaris/rosbags.git
+
+   cd rosbags
+   uv sync
+
+This creates a new virtual environment with the necessary python dependencies and installs rosbags in editable mode. The rosbags code base uses pytest as its test runner, run the test suite by simply invoking::
+
+   uv run pytest
+
+
+To build the documentation from its source run sphinx-build::
+
+   uv run sphinx-build -a docs public
+
+
+The entry point to the local documentation build should be available under ``public/index.html``.
+
+
+Support
+=======
+
+Professional support is available from `Ternaris <https://ternaris.com>`_.

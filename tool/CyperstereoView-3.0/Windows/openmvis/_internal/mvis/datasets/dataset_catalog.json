@@ -1,0 +1,2086 @@
+{
+ "version": 1,
+ "generated": "2026-08-29",
+ "datasets_root": "~/Datasets",
+ "datasets": [
+  {
+   "key": "mvis_4imus_3cams",
+   "title": "VI-rig 3-cam April",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "own",
+   "hosting_policy": "host_both_formats",
+   "native_format": "rosbag",
+   "notes": "AprilGrid 6x6; hosted on calibench-vi/datasets.",
+   "attribution": {
+    "creator": "Yulin Yang (OpenMVIS)",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://huggingface.co/datasets/calibench-vi/datasets",
+    "citation": "Y. Yang, P. Geneva, G. Huang, \"Multi-visual-inertial system: Analysis, calibration, and estimation\", IJRR 2024",
+    "doi": "10.1177/02783649241245726"
+   },
+   "sources": [
+    {
+     "sequence": "april_01",
+     "local_relative_path": "mvis_4imus_3cams/virig_4imus_3cams_april_01.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams/virig_4imus_3cams_april_01.bag",
+     "sha256": "d73054db96b82fad371bb1745caa8a8910726bbe44e8431a77f3fe4bc1cdbdb7",
+     "size_bytes": 6913564906,
+     "suite": null
+    },
+    {
+     "sequence": "april_02",
+     "local_relative_path": "mvis_4imus_3cams/virig_4imus_3cams_april_02.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams/virig_4imus_3cams_april_02.bag",
+     "sha256": "921ff7dc00508474d863e5de5b316750b8b0760ef22f707d58c25c236c9939ce",
+     "size_bytes": 7445248139,
+     "suite": null
+    },
+    {
+     "sequence": "april_03",
+     "local_relative_path": "mvis_4imus_3cams/virig_4imus_3cams_april_03.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams/virig_4imus_3cams_april_03.bag",
+     "sha256": "1840c2d0c3f3027771825928d87b86de110569a6a45d15b9e692e6f8577462e2",
+     "size_bytes": 7350516155,
+     "suite": null
+    },
+    {
+     "sequence": "april_04",
+     "local_relative_path": "mvis_4imus_3cams/virig_4imus_3cams_april_04.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams/virig_4imus_3cams_april_04.bag",
+     "sha256": "8c6a91d99e86e50867d6010cf770135f25916d14c495ccf1e178345e510f6ecd",
+     "size_bytes": 8107342722,
+     "suite": null
+    },
+    {
+     "sequence": "april_05",
+     "local_relative_path": "mvis_4imus_3cams/virig_4imus_3cams_april_05.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams/virig_4imus_3cams_april_05.bag",
+     "sha256": "5d8aa431a53521b96f46f52b14afaf2affa44cce44fde754c867ee58af290e1f",
+     "size_bytes": 8486567570,
+     "suite": null
+    },
+    {
+     "sequence": "april_06",
+     "local_relative_path": "mvis_4imus_3cams/virig_4imus_3cams_april_06.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams/virig_4imus_3cams_april_06.bag",
+     "sha256": "e297696535c89dc3fe2262352f4e2b4800595987b3b9eb1a4f0fa066b83061f3",
+     "size_bytes": 7753590799,
+     "suite": null
+    },
+    {
+     "sequence": "april_07",
+     "local_relative_path": "mvis_4imus_3cams/virig_4imus_3cams_april_07.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams/virig_4imus_3cams_april_07.bag",
+     "sha256": "f342499a3f5f81807d16b99421067cef03aaf1fde8238cd6329f1d13295f337d",
+     "size_bytes": 7640876808,
+     "suite": null
+    },
+    {
+     "sequence": "april_08",
+     "local_relative_path": "mvis_4imus_3cams/virig_4imus_3cams_april_08.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams/virig_4imus_3cams_april_08.bag",
+     "sha256": "f6ad55ecc0248e0ce14c56932f3d6fb3fcc189ce452ff4b5126e5f46e7cd6d7f",
+     "size_bytes": 7735969959,
+     "suite": null
+    },
+    {
+     "sequence": "april_09",
+     "local_relative_path": "mvis_4imus_3cams/virig_4imus_3cams_april_09.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams/virig_4imus_3cams_april_09.bag",
+     "sha256": "a21301a21825c9d3deaac3318b152571ab960e5c7841fd5940d9e2bf0e6df1b5",
+     "size_bytes": 7309990890,
+     "suite": null
+    },
+    {
+     "sequence": "april_10",
+     "local_relative_path": "mvis_4imus_3cams/virig_4imus_3cams_april_10.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams/virig_4imus_3cams_april_10.bag",
+     "sha256": "037c4fa15baccd8ca545c8e1bb7ae2bd80615290c4f5caf20afad528c5dad099",
+     "size_bytes": 7177489761,
+     "suite": null
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "mvis_4imus_3cams_aruco",
+   "title": "VI-rig 3-cam ArUco (feature mode)",
+   "suites": [
+    "camera_imu"
+   ],
+   "license_bucket": "own",
+   "hosting_policy": "host_both_formats",
+   "native_format": "rosbag",
+   "notes": "ArUco tags as geometry-free features; cam-IMU feature mode only.",
+   "attribution": {
+    "creator": "Yulin Yang (OpenMVIS)",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://huggingface.co/datasets/calibench-vi/datasets",
+    "citation": "Y. Yang, P. Geneva, G. Huang, \"Multi-visual-inertial system: Analysis, calibration, and estimation\", IJRR 2024",
+    "doi": "10.1177/02783649241245726"
+   },
+   "sources": [
+    {
+     "sequence": "aruco_01",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_01.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_01.bag",
+     "sha256": "abd080ea305a5f20cf8b5a9035982186b5f7ce52f0e98afe5c25e02a519158a3",
+     "size_bytes": 6615417842,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_02",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_02.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_02.bag",
+     "sha256": "b4afd28eafa4f52884aea5e4af053214f00dea0421a038889fe242410f7b3c04",
+     "size_bytes": 6844902630,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_03",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_03.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_03.bag",
+     "sha256": "b901d11ca7039152f0459b3c15703bb353d45da5c3b202c21ccb09aa1afdf063",
+     "size_bytes": 6959028105,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_04",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_04.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_04.bag",
+     "sha256": "61dd50d8339512621026e164f36812f2b4ace67c9f3fb9980698fe4444199e0f",
+     "size_bytes": 7117988123,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_05",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_05.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_05.bag",
+     "sha256": "a3d8559986c2d4aed721e1ab4ee4759aa49194b793ea4287e05431fc71adb330",
+     "size_bytes": 6960791941,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_06",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_06.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_06.bag",
+     "sha256": "2dae70a4e1d8b075857b569e8c91ed0959045b187b5144936ed9e4af3bc867e3",
+     "size_bytes": 7008715029,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_07",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_07.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_07.bag",
+     "sha256": "5a98635075773c2a3a2399618c7c615b2f77b49d897eb9190a8fea0027332718",
+     "size_bytes": 7165134516,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_08",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_08.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_08.bag",
+     "sha256": "cdf05ad8a4a7d099ce2852fb08457d0d8a92fff3d272567fd34e1b63197f8a3b",
+     "size_bytes": 7227195408,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_09",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_09.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_09.bag",
+     "sha256": "415cffd0493772bd78e25a065855515fc3fcfc252b3d6dacd8ef40a529015a3c",
+     "size_bytes": 7246235578,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_10",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_10.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_10.bag",
+     "sha256": "43b662d23584c21e897bcd84aa7b8d8f32752278457c30962c27e24cec8571c8",
+     "size_bytes": 7341734919,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_11",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_11.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_11.bag",
+     "sha256": "b260a6223eadcab4166d38d034a40fe1b7a8dec14f3892db22c3dcb8f2c9a695",
+     "size_bytes": 5398414350,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_12",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_12.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_12.bag",
+     "sha256": "82bd8a13e251d7fc0a1d5bd7e64b2ec1ff4c12ec5cba89f83cd3f827afaa829f",
+     "size_bytes": 6758643631,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_13",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_13.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_13.bag",
+     "sha256": "ee2e17e1f11a40778c516a245b100f7a6b31b861b0d069918eea9c5ea00ad04d",
+     "size_bytes": 7285347947,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_14",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_14.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_14.bag",
+     "sha256": "2746ba76b30c9595d94c46bfbfcad4e49de1b5b3bc188a40f64ca3206eb246dd",
+     "size_bytes": 6599107745,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_15",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_15.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_15.bag",
+     "sha256": "db2bd0b99b24ff4b78cb0745f84e73b51ac00cdad2b6fb8108b09938eacf5f2f",
+     "size_bytes": 6825213016,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_16",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_16.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_16.bag",
+     "sha256": "f8d5797c1ac3e9814bf755494b5ba8a8f0f2aabd673a4790ebd9aa6feca7e053",
+     "size_bytes": 6677279103,
+     "suite": null
+    },
+    {
+     "sequence": "aruco_17",
+     "local_relative_path": "mvis_4imus_3cams/data_arucotags/virig_4imus_3cams_aurco_17.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-3cams-aruco/virig_4imus_3cams_aurco_17.bag",
+     "sha256": "12efe47cc26a506c1a5800cb2f64524aed33549f8e641c92541b9ab87654629c",
+     "size_bytes": 6671968648,
+     "suite": null
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "mvis_4imus_4cams",
+   "title": "VI-rig 4-cam",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "own",
+   "hosting_policy": "host_both_formats",
+   "native_format": "rosbag",
+   "notes": "ELP rolling-shutter stereo + T265; 15-bag repeatability set.",
+   "attribution": {
+    "creator": "Yulin Yang (OpenMVIS)",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://huggingface.co/datasets/calibench-vi/datasets",
+    "citation": "Y. Yang, P. Geneva, G. Huang, \"Multi-visual-inertial system: Analysis, calibration, and estimation\", IJRR 2024",
+    "doi": "10.1177/02783649241245726"
+   },
+   "sources": [
+    {
+     "sequence": "bag_01",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_01.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_01.bag",
+     "sha256": "467bb1a0bf0d5a1a1c991e6b7a8a2720aae486e90fb43d966ae282e8b811ff9b",
+     "size_bytes": 8137531618,
+     "suite": null
+    },
+    {
+     "sequence": "bag_02",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_02.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_02.bag",
+     "sha256": "1b81d4e0ba568787e810efe4e3428276b45510f04c4c18f2c12970fc51212056",
+     "size_bytes": 7756064615,
+     "suite": null
+    },
+    {
+     "sequence": "bag_03",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_03.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_03.bag",
+     "sha256": "78e46a2a21b5ca95d50dc898b1b0eb7a9b94c902670e10262947db10b70d4783",
+     "size_bytes": 7128567198,
+     "suite": null
+    },
+    {
+     "sequence": "bag_04",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_04.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_04.bag",
+     "sha256": "1a1e16719210ffaf65ab58f9577153048da22038be7920a6b87bd7c3d4e50303",
+     "size_bytes": 7668135575,
+     "suite": null
+    },
+    {
+     "sequence": "bag_05",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_05.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_05.bag",
+     "sha256": "f06fffe86a4824093ff0878b3f57bd3b1f7b5064ac8eba1b501d7698616fcd2b",
+     "size_bytes": 8266188658,
+     "suite": null
+    },
+    {
+     "sequence": "bag_06",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_06.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_06.bag",
+     "sha256": "5963e627aded5d062695cb2d68c56bb85c54c3b56135c9fe20a5e8a729c3c4c1",
+     "size_bytes": 7490751382,
+     "suite": null
+    },
+    {
+     "sequence": "bag_07",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_07.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_07.bag",
+     "sha256": "0513d54b2e599fcc34f64c35fe5134634859bbf57f9cbfab502fdccfc2c346f3",
+     "size_bytes": 7158436072,
+     "suite": null
+    },
+    {
+     "sequence": "bag_08",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_08.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_08.bag",
+     "sha256": "575f0baf3b0946430a8d772865286104a45dddeba60566e787af439e5e5456de",
+     "size_bytes": 7719451418,
+     "suite": null
+    },
+    {
+     "sequence": "bag_09",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_09.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_09.bag",
+     "sha256": "858df19e3c3acfd27dc68e66698910bf8b15a158fe5e1b0450a2e878fb839bae",
+     "size_bytes": 7381133022,
+     "suite": null
+    },
+    {
+     "sequence": "bag_10",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_10.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_10.bag",
+     "sha256": "ebac08096b5ab06c6aba85df8452c7e75c2d2775144d5a13c09c968720f693e3",
+     "size_bytes": 7627959837,
+     "suite": null
+    },
+    {
+     "sequence": "bag_11",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_11.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_11.bag",
+     "sha256": "fd8388abfe8a09176875a0071fe03ea11baa53eb16a3c4f6ed264903c32dcd21",
+     "size_bytes": 7275106997,
+     "suite": null
+    },
+    {
+     "sequence": "bag_12",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_12.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_12.bag",
+     "sha256": "c99377ecd4e54c3a4a057d9bee2de85301a972073b7037f4e0a3756c79f269cf",
+     "size_bytes": 7163206692,
+     "suite": null
+    },
+    {
+     "sequence": "bag_13",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_13.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_13.bag",
+     "sha256": "19d70e4fd90af363f9f16aae0a03a4f30be5d3d43abf7cf5944b796ca6a4a559",
+     "size_bytes": 7424957102,
+     "suite": null
+    },
+    {
+     "sequence": "bag_14",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_14.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_14.bag",
+     "sha256": "084d0d22fa03503fae2ee01b0a301117e9861b711db96a4345a6b60bb821d3a9",
+     "size_bytes": 7103982164,
+     "suite": null
+    },
+    {
+     "sequence": "bag_15",
+     "local_relative_path": "mvis_4imus_4cams/4imus_4cams_15.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-4imus-4cams/4imus_4cams_15.bag",
+     "sha256": "b2a4ebe84b53d0d7f8d0399ae15bbcbd3bdaa63d6515e800839580bbe35bfbc4",
+     "size_bytes": 7176313548,
+     "suite": null
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "vi_sensor_rigs_5imus",
+   "title": "VI-rig 5-IMU",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "own",
+   "hosting_policy": "host_both_formats",
+   "native_format": "rosbag",
+   "notes": "Two T265 rigs (4 fisheyes) + 5 IMUs.",
+   "attribution": {
+    "creator": "Yulin Yang (OpenMVIS)",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://huggingface.co/datasets/calibench-vi/datasets",
+    "citation": "Y. Yang, P. Geneva, G. Huang, \"Multi-visual-inertial system: Analysis, calibration, and estimation\", IJRR 2024",
+    "doi": "10.1177/02783649241245726"
+   },
+   "sources": [
+    {
+     "sequence": "bag_01",
+     "local_relative_path": "vi_sensor_rigs_5imus/5imus_4cams_01.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-5imus-4cams/5imus_4cams_01.bag",
+     "sha256": "91c1115263fc38e8c9f5e2d29cde58bf3b66ffb5a09597c7397ce9a80af5d5ab",
+     "size_bytes": 5214474757,
+     "suite": null
+    },
+    {
+     "sequence": "bag_02",
+     "local_relative_path": "vi_sensor_rigs_5imus/5imus_4cams_02.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-5imus-4cams/5imus_4cams_02.bag",
+     "sha256": "b2a3c2cc3dda140f0ed0ab8c890848cdc1f658396b13b4cf97ed45ac21c7320b",
+     "size_bytes": 4001053124,
+     "suite": null
+    },
+    {
+     "sequence": "bag_03",
+     "local_relative_path": "vi_sensor_rigs_5imus/5imus_4cams_03.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-5imus-4cams/5imus_4cams_03.bag",
+     "sha256": "adfcb149184457d10b2a51ba268820dd0b5cc1659131a6b0ddfd72f824cf8db7",
+     "size_bytes": 4380942525,
+     "suite": null
+    },
+    {
+     "sequence": "bag_04",
+     "local_relative_path": "vi_sensor_rigs_5imus/5imus_4cams_04.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-5imus-4cams/5imus_4cams_04.bag",
+     "sha256": "33b6bbdecb7c18f13a6272fca701cb1b641c1b9cf45a361fb7b482cc285dc492",
+     "size_bytes": 3323290222,
+     "suite": null
+    },
+    {
+     "sequence": "bag_05",
+     "local_relative_path": "vi_sensor_rigs_5imus/5imus_4cams_05.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-5imus-4cams/5imus_4cams_05.bag",
+     "sha256": "d8aa91374c025e41da0bbb0b992187b0eae18355f2f6c8e6b47699ac349b3eea",
+     "size_bytes": 3416216351,
+     "suite": null
+    },
+    {
+     "sequence": "bag_06",
+     "local_relative_path": "vi_sensor_rigs_5imus/5imus_4cams_06.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-5imus-4cams/5imus_4cams_06.bag",
+     "sha256": "b614516d72717e6a8d3518224c52ac280b90d3f3d6529f1135fe0078bfb02a35",
+     "size_bytes": 3828198684,
+     "suite": null
+    },
+    {
+     "sequence": "bag_07",
+     "local_relative_path": "vi_sensor_rigs_5imus/5imus_4cams_07.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/virig-5imus-4cams/5imus_4cams_07.bag",
+     "sha256": "ddded77b6449e2f675f0698723ff29e9267f11b309d0406c05f3403a32a54117",
+     "size_bytes": 3677909469,
+     "suite": null
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "looper_insight9",
+   "title": "Looper Robotics Insight-9 (SA16)",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "partner",
+   "hosting_policy": "host_rosbag",
+   "native_format": "rosbag",
+   "notes": "Looper Robotics Insight-9 (SA16) sensor head: 2 global-shutter mono + 1 rolling-shutter colour camera + IMU; 10-recording repeatability group. Hosted with permission on calibench-vi/datasets (looper-insight9).",
+   "attribution": {
+    "creator": "Looper Robotics (hosted with permission)",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://huggingface.co/datasets/calibench-vi/datasets",
+    "citation": "Y. Yang, P. Geneva, G. Huang, \"Multi-visual-inertial system: Analysis, calibration, and estimation\", IJRR 2024",
+    "doi": "10.1177/02783649241245726"
+   },
+   "sources": [
+    {
+     "sequence": "bag_1",
+     "local_relative_path": "looperrobotics/1/looper_1.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/looper-insight9/looper_1.bag",
+     "sha256": "da8a2cb3e948fef7daab17594c346be386c31d2accc09b849347e096a9074f39",
+     "size_bytes": 1531386096,
+     "suite": null
+    },
+    {
+     "sequence": "bag_2",
+     "local_relative_path": "looperrobotics/2/looper_2.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/looper-insight9/looper_2.bag",
+     "sha256": "4286bbfeafe58f00a51b4231977c2f0bbd55b27d47c80d71ae98a155e312cf70",
+     "size_bytes": 1673716264,
+     "suite": null
+    },
+    {
+     "sequence": "bag_3",
+     "local_relative_path": "looperrobotics/3/looper_3.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/looper-insight9/looper_3.bag",
+     "sha256": "757bb0ad6bdffa859322aa636f059507c3ce94cdc09b4b19c868d4399699c33f",
+     "size_bytes": 1670920358,
+     "suite": null
+    },
+    {
+     "sequence": "bag_4",
+     "local_relative_path": "looperrobotics/4/looper_4.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/looper-insight9/looper_4.bag",
+     "sha256": "f5b9958f368eee43a5ca28941d515b07b68ec37dbe722c9fcf14c1b0149d8271",
+     "size_bytes": 1455653255,
+     "suite": null
+    },
+    {
+     "sequence": "bag_5",
+     "local_relative_path": "looperrobotics/5/looper_5.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/looper-insight9/looper_5.bag",
+     "sha256": "95587029f39d8a13129f97e35e611801f87ea48096a4f74ec3c413e79bf170b5",
+     "size_bytes": 1579066292,
+     "suite": null
+    },
+    {
+     "sequence": "bag_6",
+     "local_relative_path": "looperrobotics/6/looper_6.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/looper-insight9/looper_6.bag",
+     "sha256": "adb94dcf0bd910686995a8b1a4647c98b0ec3b93a218779d6bba77d9f5caf525",
+     "size_bytes": 1595186576,
+     "suite": null
+    },
+    {
+     "sequence": "bag_7",
+     "local_relative_path": "looperrobotics/7/looper_7.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/looper-insight9/looper_7.bag",
+     "sha256": "b62063f8490b16df3f3fb42b89a2a7ab6bb76c335035e9874a768b6f10a63d60",
+     "size_bytes": 1443729330,
+     "suite": null
+    },
+    {
+     "sequence": "bag_8",
+     "local_relative_path": "looperrobotics/8/looper_8.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/looper-insight9/looper_8.bag",
+     "sha256": "1ce268a5bb55d4fbda7f27176585b5639361e7541b7b62693672c005e34d46b1",
+     "size_bytes": 1464064019,
+     "suite": null
+    },
+    {
+     "sequence": "bag_9",
+     "local_relative_path": "looperrobotics/9/looper_9.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/looper-insight9/looper_9.bag",
+     "sha256": "ee051cac0c5327228ebbe2cd24739dff23ad57fcfa7b7b8dcc227b6420230f77",
+     "size_bytes": 1417086905,
+     "suite": null
+    },
+    {
+     "sequence": "bag_10",
+     "local_relative_path": "looperrobotics/10/looper_10.bag",
+     "url": "https://huggingface.co/datasets/calibench-vi/datasets/resolve/51fc5237c419b2df6f19304a063e864eb63d9c02/looper-insight9/looper_10.bag",
+     "sha256": "5f6964d6867876949b4dfb4aaa1104bdcb53391601e1e3a3a57901a1c023cc36",
+     "size_bytes": 1578360568,
+     "suite": null
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "tum_vi_raw",
+   "title": "TUM-VI raw",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "cc_by",
+   "hosting_policy": "host_rosbag",
+   "native_format": "rosbag",
+   "notes": "cam1..8 = camera-only board sweeps; imu1..4 = cam-IMU excitation.",
+   "attribution": {
+    "creator": "TUM Computer Vision Group",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://cvg.cit.tum.de/data/datasets/visual-inertial-dataset",
+    "citation": "D. Schubert, T. Goll, N. Demmel, V. Usenko, J. Stueckler, D. Cremers, \"The TUM VI Benchmark for Evaluating Visual-Inertial Odometry\", IROS 2018",
+    "doi": "10.1109/IROS.2018.8593419"
+   },
+   "sources": [
+    {
+     "sequence": "cam1",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-cam1.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-cam1.bag",
+     "sha256": "550c33dd499ab92edc36fa0ec67e47caff81a7012e3643253d9f26421363737e",
+     "size_bytes": 1838956430,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam2",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-cam2.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-cam2.bag",
+     "sha256": "91214e2f1e9af3744d434f110a801b29529849e0b3eaaa10cdb29d0d1d271138",
+     "size_bytes": 1185164042,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam3",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-cam3.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-cam3.bag",
+     "sha256": "b510575e573b65815aafe4d37b19c9119cb60492a04e9d75a35a6bc2a924ecdf",
+     "size_bytes": 1421337115,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam4",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-cam4.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-cam4.bag",
+     "sha256": "bfc2224da2f6de8811a7ac10245217997ba43abe489bb791ea42f0f72f4955a4",
+     "size_bytes": 1109230910,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam5",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-cam5.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-cam5.bag",
+     "sha256": "ca4773b9c9f13968e2bb6c7f85d8568ff68fab7dc2078d8d7b26cb75f8ac566a",
+     "size_bytes": 1585824061,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam6",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-cam6.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-cam6.bag",
+     "sha256": "bc4b0ff7cc0469a8f6455f8c20ee22d74e74a726b8ecfacef9b9750dfbe33a88",
+     "size_bytes": 1493041123,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam7",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-cam7.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-cam7.bag",
+     "sha256": "ca6df19911c2569514a66e6918f551e7fdd713272f5aa9b2704f2751580f75bb",
+     "size_bytes": 632688766,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam8",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-cam8.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-cam8.bag",
+     "sha256": "8eaec9907e58052b9035b5e0e4c17d95d05c3dbeed4425aa1b008e9e2ef78a5e",
+     "size_bytes": 852019618,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "imu1",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-imu1.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-imu1.bag",
+     "sha256": "18663606f219a3189243c5606f27037eba04857ab2dc5a9f2ebcc90d215182dc",
+     "size_bytes": 4358736646,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "imu2",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-imu2.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-imu2.bag",
+     "sha256": "66b070ef99aa9005b8edda653f27b12f07438a93456c17310acc5856255cf3e4",
+     "size_bytes": 4453174251,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "imu3",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-imu3.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-imu3.bag",
+     "sha256": "2deeb4965a5e9bc616c2852e7a3a5cafe2bb4758c28b2720c2e4e7a370906a46",
+     "size_bytes": 4081595614,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "imu4",
+     "local_relative_path": "tum_vi_calib/raw/dataset-calib-imu4.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/raw/dataset-calib-imu4.bag",
+     "sha256": "2d2ca1b657dcef357c4ec208d19a3387e22c21b069dba19ba8b8b669dcbf139e",
+     "size_bytes": 3691043548,
+     "suite": "camera_imu"
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "tum_vi_standard_512",
+   "title": "TUM-VI standard 512 (frame-skip)",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "cc_by",
+   "hosting_policy": "host_rosbag",
+   "native_format": "rosbag",
+   "notes": "512_16 release: 512x512 frames at 4 Hz (frame-skip); imu1..4 = cam-IMU excitation.",
+   "attribution": {
+    "creator": "TUM Computer Vision Group",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://cvg.cit.tum.de/data/datasets/visual-inertial-dataset",
+    "citation": "D. Schubert, T. Goll, N. Demmel, V. Usenko, J. Stueckler, D. Cremers, \"The TUM VI Benchmark for Evaluating Visual-Inertial Odometry\", IROS 2018",
+    "doi": "10.1109/IROS.2018.8593419"
+   },
+   "sources": [
+    {
+     "sequence": "cam1",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-cam1_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-cam1_512_16.bag",
+     "sha256": "6342b756515bcc2ff4446d0015068cce90dfc0b33eac59a64b22d3f8cd62c4c8",
+     "size_bytes": 467239716,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam2",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-cam2_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-cam2_512_16.bag",
+     "sha256": "03ba0784af68051df123166713a77776731d734589f1150819c235c653198dd1",
+     "size_bytes": 301101595,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam3",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-cam3_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-cam3_512_16.bag",
+     "sha256": "753f661713ae932bdff1483bdb350789272c3c8f4f1b68e187bb2331735cf03c",
+     "size_bytes": 361091860,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam4",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-cam4_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-cam4_512_16.bag",
+     "sha256": "f94ed891623cb83a0125e517fb592324e69aefd448d1fbb44161860f357e59dd",
+     "size_bytes": 281796518,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam5",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-cam5_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-cam5_512_16.bag",
+     "sha256": "36b8f0c8ca8067b5882b239d1adba9697d2d6844cb0853bf233bc038cc66b06d",
+     "size_bytes": 402880207,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam6",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-cam6_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-cam6_512_16.bag",
+     "sha256": "6ac9553acbc3a3d8aa5806e34f4f2bc9cf9bb5a249e27d49f8e8bad87ca820a1",
+     "size_bytes": 379313427,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam7",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-cam7_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-cam7_512_16.bag",
+     "sha256": "e8ca17dfd88c1e60b2be72a5d77e7a9bdc235155c408c693e0b898a9e36b3fac",
+     "size_bytes": 160766695,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam8",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-cam8_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-cam8_512_16.bag",
+     "sha256": "15033e938e7966f0a6146b153e30d7b5cec8304b840f12dd0b8923acb83cc927",
+     "size_bytes": 216498183,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "imu1",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-imu1_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-imu1_512_16.bag",
+     "sha256": "45de668a7d1402de67964f148d6d10be0ce3c0289834a8daeca0a8f0c140d061",
+     "size_bytes": 1093340412,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "imu2",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-imu2_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-imu2_512_16.bag",
+     "sha256": "a95b27fbead2f28ae768adc3ff479ed2f665ac4d42c5fe264d6d51c0438b574c",
+     "size_bytes": 1116993569,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "imu3",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-imu3_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-imu3_512_16.bag",
+     "sha256": "dbb5dc32a2da795a6790d12441c6e1f54212372d1245037027299d329a8d6bac",
+     "size_bytes": 1023839597,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "imu4",
+     "local_relative_path": "tum_vi_calib/standard_512/dataset-calib-imu4_512_16.bag",
+     "url": "https://cdn3.vision.in.tum.de/tumvi/calibrated/512_16/dataset-calib-imu4_512_16.bag",
+     "sha256": "36419e58c5085247e1b498230e4b5fcec4d21708bf0ec0712b247bab26260a6d",
+     "size_bytes": 925856760,
+     "suite": "camera_imu"
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "tum_mic",
+   "title": "Monado MSD MIC (Valve Index)",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "cc_by",
+   "hosting_policy": "host_rosbag",
+   "native_format": "zip_archive",
+   "notes": "Monado SLAM Datasets group MI_valve_index/MIC_calibration (Valve Index).",
+   "attribution": {
+    "creator": "Collabora (Monado SLAM Datasets)",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://huggingface.co/datasets/collabora/monado-slam-datasets",
+    "citation": "M. de Mayo, D. Cremers, T. Pire, \"The Monado SLAM Dataset for Egocentric Visual-Inertial Tracking\", IROS 2025",
+    "doi": "10.1109/IROS60139.2025.11247240"
+   },
+   "sources": [
+    {
+     "sequence": "MIC01",
+     "local_relative_path": "tum_mic/mic_calib/MIC01_camcalib1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC01_camcalib1.zip",
+     "sha256": "76042403ba0dcdbe5019a0d5788adfcb98be56ac7a6b292536c8cbee802be4f4",
+     "size_bytes": 1159728520,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MIC02",
+     "local_relative_path": "tum_mic/mic_calib/MIC02_camcalib2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC02_camcalib2.zip",
+     "sha256": "575a375287fdec5ce1b4b07314d175c5141c30861de9763b758dab4d83b9d753",
+     "size_bytes": 1805006763,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MIC03",
+     "local_relative_path": "tum_mic/mic_calib/MIC03_camcalib3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC03_camcalib3.zip",
+     "sha256": "91cc34715e1f8f198203991b7c69c2ae3bb5ace10b01c7e458c59e5ca3ed5a06",
+     "size_bytes": 1486816565,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MIC04",
+     "local_relative_path": "tum_mic/mic_calib/MIC04_imucalib1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC04_imucalib1.zip",
+     "sha256": "fce485bc0d2361b5ae1f88b07bad34d0420531aca1f374a60a881c6ff2aa7d67",
+     "size_bytes": 2945329631,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MIC05",
+     "local_relative_path": "tum_mic/mic_calib/MIC05_imucalib2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC05_imucalib2.zip",
+     "sha256": "f2bf71654f8cd70e03ea4378fc564017e4f42fe83e06b1106613bc56a4958326",
+     "size_bytes": 2590183971,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MIC06",
+     "local_relative_path": "tum_mic/mic_calib/MIC06_imucalib3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC06_imucalib3.zip",
+     "sha256": "fb37e0ed0c08a3c607305c520b7f96467b9b519d757652eb11b7db545014eff3",
+     "size_bytes": 2375334223,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MIC07",
+     "local_relative_path": "tum_mic/mic_calib/MIC07_camcalib4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC07_camcalib4.zip",
+     "sha256": "603dc022316554300b3ca83295ba713cd4e5c8e11c2a7bbac79a5ad04e52998f",
+     "size_bytes": 1412415028,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MIC08",
+     "local_relative_path": "tum_mic/mic_calib/MIC08_camcalib5.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC08_camcalib5.zip",
+     "sha256": "80421f7efc52cabcd846bb583c411f7f80c7217da04ff08fb18a8a292e570213",
+     "size_bytes": 1603117274,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MIC09",
+     "local_relative_path": "tum_mic/mic_calib/MIC09_imucalib4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC09_imucalib4.zip",
+     "sha256": "7eb99901df839d5693fecabb6507f629b88019b27506cc361b422c465bd37438",
+     "size_bytes": 2018885350,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MIC10",
+     "local_relative_path": "tum_mic/mic_calib/MIC10_imucalib5.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC10_imucalib5.zip",
+     "sha256": "4969be9835387b6548f1b1ffda9f5181b939313d8494a5b1910d34dc5208fb4b",
+     "size_bytes": 3213434945,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MIC11",
+     "local_relative_path": "tum_mic/mic_calib/MIC11_camcalib6.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC11_camcalib6.zip",
+     "sha256": "ca28430c74eeb3b3204b171549fcd4c86e84b593c63366e3d9c3e06ec7f775cf",
+     "size_bytes": 1126637832,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MIC12",
+     "local_relative_path": "tum_mic/mic_calib/MIC12_imucalib6.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC12_imucalib6.zip",
+     "sha256": "3148b4fcb1a657aeb968a3ff6836f430a6ea9d1ef9cc2295114288278bb2e746",
+     "size_bytes": 2481175466,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MIC13",
+     "local_relative_path": "tum_mic/mic_calib/MIC13_camcalib7.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC13_camcalib7.zip",
+     "sha256": "1337fb2eab02beef5e9fece93ea749ee892cbccb71d9440b7c965612943d2816",
+     "size_bytes": 1488829118,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MIC14",
+     "local_relative_path": "tum_mic/mic_calib/MIC14_camcalib8.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC14_camcalib8.zip",
+     "sha256": "e2ac08baae5eda6ec012e0a00d3aa8e5c01c915a830f750f1946725ce419eaba",
+     "size_bytes": 1874036245,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MIC15",
+     "local_relative_path": "tum_mic/mic_calib/MIC15_imucalib7.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC15_imucalib7.zip",
+     "sha256": "10d31c3f45db4d96aa6b420335b7aa155eef2d62fc753d8e5369949115be41e6",
+     "size_bytes": 2074827631,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MIC16",
+     "local_relative_path": "tum_mic/mic_calib/MIC16_imucalib8.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MI_valve_index/MIC_calibration/MIC16_imucalib8.zip",
+     "sha256": "70cc6425a42131d69448b13b27a2098e3f107f6ff2d2e3addc948c573e42dacb",
+     "size_bytes": 2722675657,
+     "suite": "camera_imu"
+    }
+   ],
+   "conversion_chain": [
+    {
+     "converter": "extract_archive",
+     "arguments": {}
+    },
+    {
+     "converter": "convert_euroc_folder_to_rosbag",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "key": "monado_mgc",
+   "title": "Monado MSD MGC (Reverb G2)",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "cc_by",
+   "hosting_policy": "host_rosbag",
+   "native_format": "zip_archive",
+   "notes": "Pair-visibility rig (MGC: pairs 01/02/13); magcalib+imustatic tagged suite=other.",
+   "attribution": {
+    "creator": "Collabora (Monado SLAM Datasets)",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://huggingface.co/datasets/collabora/monado-slam-datasets",
+    "citation": "M. de Mayo, D. Cremers, T. Pire, \"The Monado SLAM Dataset for Egocentric Visual-Inertial Tracking\", IROS 2025",
+    "doi": "10.1109/IROS60139.2025.11247240"
+   },
+   "sources": [
+    {
+     "sequence": "MGC01_camcalib01_1",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC01_camcalib01_1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC01_camcalib01_1.zip",
+     "sha256": "a4330191aaf5eb5def9a57788893d05a299df2533b7ce722871623840e13ad0f",
+     "size_bytes": 480243200,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC02_camcalib02_1",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC02_camcalib02_1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC02_camcalib02_1.zip",
+     "sha256": "57b46671b28804e6234ec950f6c369cc6cbabc197721f58394d805c206bf2066",
+     "size_bytes": 664641566,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC03_camcalib13_1",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC03_camcalib13_1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC03_camcalib13_1.zip",
+     "sha256": "e47063f9d6aef308d70b5e61216646c4a33ff4b102c5ecb02ee86871293a9001",
+     "size_bytes": 548174503,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC04_imucalib01_1",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC04_imucalib01_1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC04_imucalib01_1.zip",
+     "sha256": "453ac1a65b8fa490b5d55213c2cd12736c8bd6966073308c22ba4076766cf4e2",
+     "size_bytes": 650751191,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC05_imucalib02_1",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC05_imucalib02_1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC05_imucalib02_1.zip",
+     "sha256": "8edfdaca4405bf5475a933815980b8d7ecec70d5c9be77b79a153a6157badb4b",
+     "size_bytes": 766795983,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC06_imucalib13_1",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC06_imucalib13_1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC06_imucalib13_1.zip",
+     "sha256": "44a146c787e529e1018e5203ebb5d33e1556c6bd02458131fb349adb80a9afec",
+     "size_bytes": 739609786,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC07_magcalib_1",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC07_magcalib_1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC07_magcalib_1.zip",
+     "sha256": "f25843fffda2515da297f2f73ca4c27735cc1eaa966b15da108434901afe0f63",
+     "size_bytes": 1012283264,
+     "suite": "other"
+    },
+    {
+     "sequence": "MGC08_camcalib01_2",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC08_camcalib01_2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC08_camcalib01_2.zip",
+     "sha256": "8f379b27ff1e7acae63d919cab856dd487e934d647bc9dc2e0ff8f4198ab1d98",
+     "size_bytes": 6534215541,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC09_camcalib02_2",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC09_camcalib02_2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC09_camcalib02_2.zip",
+     "sha256": "e04788f57fbf2fd1976502502d9da728e60c799a9fca78a68650126fcdd8e400",
+     "size_bytes": 7853030974,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC10_camcalib13_2",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC10_camcalib13_2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC10_camcalib13_2.zip",
+     "sha256": "71d4b4a3c743fa382101c65471c927ca0a46c1013e4dc5b4c3c24d78b87fd9a3",
+     "size_bytes": 5582570680,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC11_imucalib01_2",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC11_imucalib01_2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC11_imucalib01_2.zip",
+     "sha256": "5c039d3cac8f0fa08975e1d8c6ffabba4c4eacad27b72ade746a18f700e3e917",
+     "size_bytes": 10250248911,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC12_imucalib02_2",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC12_imucalib02_2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC12_imucalib02_2.zip",
+     "sha256": "fef4bda44c436cdc1639444d51aadeb5afd0314580ac3409ba085700e73e2e62",
+     "size_bytes": 7325779400,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC13_imucalib13_2",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC13_imucalib13_2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC13_imucalib13_2.zip",
+     "sha256": "a85fa2cb234f297a4c0928c492a718e830e49cebbe608ac3a71939b8ff8b5507",
+     "size_bytes": 877202538,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC14_magcalib_2",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC14_magcalib_2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC14_magcalib_2.zip",
+     "sha256": "24df50d7bf24e21e44755c498799b178d591e333dfe21e8c3b43dec20be676c0",
+     "size_bytes": 949477337,
+     "suite": "other"
+    },
+    {
+     "sequence": "MGC15_camcalib01_3",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC15_camcalib01_3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC15_camcalib01_3.zip",
+     "sha256": "9b51539fe190c10df09f1cbe16c0a694ed99c0ae2acc4da39ba0f4e37c7557df",
+     "size_bytes": 698530049,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC16_camcalib02_3",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC16_camcalib02_3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC16_camcalib02_3.zip",
+     "sha256": "57e88006f1a5d94fc3b8b11176a1ce43986b84f74d2855958508ecae50b679f5",
+     "size_bytes": 800212295,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC17_camcalib13_3",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC17_camcalib13_3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC17_camcalib13_3.zip",
+     "sha256": "f37e343523038bb480957f9972beb8a104116a24b24f6e10dd4e00cd4df5cec7",
+     "size_bytes": 731845673,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC18_imucalib01_3",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC18_imucalib01_3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC18_imucalib01_3.zip",
+     "sha256": "86a94a5e9874a3180934e4f00a9c04e405932bfc99932e6002b686166b1fd65a",
+     "size_bytes": 803538396,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC19_imucalib02_3",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC19_imucalib02_3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC19_imucalib02_3.zip",
+     "sha256": "72b67731ddf79cae63123689ee8a11ee7545e904d872f4efc583040508be7fdc",
+     "size_bytes": 797716835,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC20_imucalib13_3",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC20_imucalib13_3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC20_imucalib13_3.zip",
+     "sha256": "cf2cd0728632d5f08eddbd15bfd6ab57ea3bd3338a8a18469f27a56576d3a1d4",
+     "size_bytes": 966598980,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC21_magcalib_3",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC21_magcalib_3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC21_magcalib_3.zip",
+     "sha256": "ae4c3977673ed9c4f756e02ab2d455a78665a41405c05c7e902c222d3e5047d5",
+     "size_bytes": 997822642,
+     "suite": "other"
+    },
+    {
+     "sequence": "MGC22_camcalib01_4",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC22_camcalib01_4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC22_camcalib01_4.zip",
+     "sha256": "e5fffdb5ccd0f82beb356c259218e812ebb3867641e5ffd16cca9620f61a3020",
+     "size_bytes": 583028133,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC23_camcalib02_4",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC23_camcalib02_4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC23_camcalib02_4.zip",
+     "sha256": "a70a83bf387ae7d6ab5110cf93470abc12f54ea6ee04f0f32f8c02991672b023",
+     "size_bytes": 354275995,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC24_camcalib13_4",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC24_camcalib13_4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC24_camcalib13_4.zip",
+     "sha256": "a8bde32419830fdce2d8466deb140f1b2cbb801a9b6f173f2ffcde4d0f6026ff",
+     "size_bytes": 477611754,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MGC25_imucalib01_4",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC25_imucalib01_4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC25_imucalib01_4.zip",
+     "sha256": "2e7c1fb9346d155478a08c46507e8cacbc04c764c58afb7cc10eb56c341195a2",
+     "size_bytes": 703043425,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC26_imucalib02_4",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC26_imucalib02_4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC26_imucalib02_4.zip",
+     "sha256": "4665156813940ce6880f23a6483e153b06abc2702b551217493c60f38e7471fd",
+     "size_bytes": 699226177,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC27_imucalib13_4",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC27_imucalib13_4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC27_imucalib13_4.zip",
+     "sha256": "e67db9c6fcd132c7ba96cf632bd5c1002c37cb1059bffada4cd44ceb6011a4e5",
+     "size_bytes": 772566941,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MGC28_magcalib_4",
+     "local_relative_path": "monado_msd/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC28_magcalib_4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MG_reverb_g2/MGC_calibration/MGC28_magcalib_4.zip",
+     "sha256": "8b811a03fb0a6e9e7decb337c65b17b1141a7dadb5420027d91cf8fa7ffd3e18",
+     "size_bytes": 864247946,
+     "suite": "other"
+    }
+   ],
+   "conversion_chain": [
+    {
+     "converter": "extract_archive",
+     "arguments": {}
+    },
+    {
+     "converter": "convert_euroc_folder_to_rosbag",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "key": "monado_moc",
+   "title": "Monado MSD MOC (Odyssey+)",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "cc_by",
+   "hosting_policy": "host_rosbag",
+   "native_format": "zip_archive",
+   "notes": "Pair-visibility rig (MGC: pairs 01/02/13); magcalib+imustatic tagged suite=other.",
+   "attribution": {
+    "creator": "Collabora (Monado SLAM Datasets)",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://huggingface.co/datasets/collabora/monado-slam-datasets",
+    "citation": "M. de Mayo, D. Cremers, T. Pire, \"The Monado SLAM Dataset for Egocentric Visual-Inertial Tracking\", IROS 2025",
+    "doi": "10.1109/IROS60139.2025.11247240"
+   },
+   "sources": [
+    {
+     "sequence": "MOC01_camcalib_1",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC01_camcalib_1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC01_camcalib_1.zip",
+     "sha256": "e9ed363e9b5efe6b3dad997f05cb34b14367fa886b7f1413a959d5f2730802c8",
+     "size_bytes": 432355579,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MOC02_imucalib_1",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC02_imucalib_1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC02_imucalib_1.zip",
+     "sha256": "5031a4f116fdd20ce2595981b595ff7782a09564a429a5bafecad85026be21f9",
+     "size_bytes": 344359715,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MOC03_magcalib_1",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC03_magcalib_1.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC03_magcalib_1.zip",
+     "sha256": "f0f5c0be33ac41f9e6ed937ae5896734e20655b7614c6a65181195a87da33f95",
+     "size_bytes": 474789043,
+     "suite": "other"
+    },
+    {
+     "sequence": "MOC04_camcalib_2",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC04_camcalib_2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC04_camcalib_2.zip",
+     "sha256": "c796390c774002b23fe0aff954b1b1eb5f60b91db528ee244e4d9798843d4984",
+     "size_bytes": 593033712,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MOC05_imucalib_2",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC05_imucalib_2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC05_imucalib_2.zip",
+     "sha256": "a7132d43df0456bdc72d235d1ae82a707685769d702f671a3a4c40b84da0866f",
+     "size_bytes": 492871600,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MOC06_magcalib_2",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC06_magcalib_2.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC06_magcalib_2.zip",
+     "sha256": "4f3fd144447af6debfabe3354935a04cff272d88febb568d627a481402c21d24",
+     "size_bytes": 648813212,
+     "suite": "other"
+    },
+    {
+     "sequence": "MOC07_camcalib_3",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC07_camcalib_3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC07_camcalib_3.zip",
+     "sha256": "59f0c3cf690f4e0245f40f5c6983c2f5d01b5b6dc65bc1c7d6efb2038790ec34",
+     "size_bytes": 621707697,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MOC08_imucalib_3",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC08_imucalib_3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC08_imucalib_3.zip",
+     "sha256": "7f4fcd1d56c88783523d6de55df167d820b671d559b81190356ce0e62d1a9eab",
+     "size_bytes": 376749647,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MOC09_magcalib_3",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC09_magcalib_3.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC09_magcalib_3.zip",
+     "sha256": "7cc8234686b643f8b7d59d9358ce52b43b7b97e1c41b2e306a28195761c75ca0",
+     "size_bytes": 614863661,
+     "suite": "other"
+    },
+    {
+     "sequence": "MOC10_camcalib_4",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC10_camcalib_4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC10_camcalib_4.zip",
+     "sha256": "315ac34191f23fb5ad499db704804677afa99d50d71489ea26245b73e3a4a22f",
+     "size_bytes": 654203975,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "MOC11_imucalib_4",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC11_imucalib_4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC11_imucalib_4.zip",
+     "sha256": "da5e5e46f8d45eb13048536c00adbe181b5bb7614a0c7753829bdf31afb31685",
+     "size_bytes": 383056478,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "MOC12_magcalib_4",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC12_magcalib_4.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC12_magcalib_4.zip",
+     "sha256": "95e31f02c814959e41defd0ce3d8bdb20b3288cf5e67024408bf685c4366f79f",
+     "size_bytes": 544642225,
+     "suite": "other"
+    },
+    {
+     "sequence": "MOC13_imustatic",
+     "local_relative_path": "monado_msd/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC13_imustatic.zip",
+     "url": "https://huggingface.co/datasets/collabora/monado-slam-datasets/resolve/74c07d42d980c55775dd0edc06e58c486b848be1/M_monado_datasets/MO_odyssey_plus/MOC_calibration/MOC13_imustatic.zip",
+     "sha256": "2e2b04ab73445f3255dd4017a8654a46cef40aabd89a29317fe2b68595a43ccd",
+     "size_bytes": 3270382152,
+     "suite": "other"
+    }
+   ],
+   "conversion_chain": [
+    {
+     "converter": "extract_archive",
+     "arguments": {}
+    },
+    {
+     "converter": "convert_euroc_folder_to_rosbag",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "key": "tum_event",
+   "title": "TUM-VIE calibration (frame cams)",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "cc_by",
+   "hosting_policy": "host_rosbag",
+   "native_format": "tumvie_vidata",
+   "notes": "vi_data tars (events out of scope); A/B = recording sessions.",
+   "attribution": {
+    "creator": "TUM Computer Vision Group",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://cvg.cit.tum.de/data/datasets/visual-inertial-event-dataset",
+    "citation": "S. Klenk, J. Chui, N. Demmel, D. Cremers, \"TUM-VIE: The TUM Stereo Visual-Inertial Event Dataset\", IROS 2021",
+    "doi": "10.1109/IROS51168.2021.9636728"
+   },
+   "sources": [
+    {
+     "sequence": "calibA1",
+     "local_relative_path": "tum_event/dl/calibA1-vi_data.tar.gz",
+     "url": "https://tumevent-vi.vision.in.tum.de/calibration/day1/calibA1/calibA1-vi_data.tar.gz",
+     "sha256": "a70141b68cad90d3789c21df1c60a07699152078d9c94a6b746a22a50da07eda",
+     "size_bytes": 1578876690,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "calibA2",
+     "local_relative_path": "tum_event/dl/calibA2-vi_data.tar.gz",
+     "url": "https://tumevent-vi.vision.in.tum.de/calibration/day1/calibA2/calibA2-vi_data.tar.gz",
+     "sha256": "14b14fc8a7a665f08bb6f17c18133557c28cf858fc584caf2f164ba83b0c331e",
+     "size_bytes": 1131849101,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "calibB1",
+     "local_relative_path": "tum_event/dl/calibB1-vi_data.tar.gz",
+     "url": "https://tumevent-vi.vision.in.tum.de/calibration/day2/calibB1/calibB1-vi_data.tar.gz",
+     "sha256": "9aaa537535363c94f823d610530cf8e915ac6eb19c82d04377dd110bd51a2fc3",
+     "size_bytes": 1508147848,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "calibB2",
+     "local_relative_path": "tum_event/dl/calibB2-vi_data.tar.gz",
+     "url": "https://tumevent-vi.vision.in.tum.de/calibration/day2/calibB2/calibB2-vi_data.tar.gz",
+     "sha256": "c878af6ccfaeb0db0981ff7aba9b73518dbfe4c181a861c2ac053929bdde9e4d",
+     "size_bytes": 1338839082,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "imu_calibA1",
+     "local_relative_path": "tum_event/dl/imu_calibA1-vi_data.tar.gz",
+     "url": "https://tumevent-vi.vision.in.tum.de/calibration/day1/imu_calibA1/imu_calibA1-vi_data.tar.gz",
+     "sha256": "3ddf71cb3aaa4d563047fe33d6ba9aa69a378979faf68cd85e4b8f79e19cb94f",
+     "size_bytes": 432981752,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "imu_calibB1",
+     "local_relative_path": "tum_event/dl/imu_calibB1-vi_data.tar.gz",
+     "url": "https://tumevent-vi.vision.in.tum.de/calibration/day2/imu_calibB1/imu_calibB1-vi_data.tar.gz",
+     "sha256": "c59f79e42b9718593f9a79d0b99cc4d0cdc2d9a14712b01bd0067e279c5fb6c0",
+     "size_bytes": 532107468,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "imu_calibB2",
+     "local_relative_path": "tum_event/dl/imu_calibB2-vi_data.tar.gz",
+     "url": "https://tumevent-vi.vision.in.tum.de/calibration/day2/imu_calibB2/imu_calibB2-vi_data.tar.gz",
+     "sha256": "f1e5c7255871c6f6a2b38afb49fb6fb3d46b3f6e1245348af1a8b8d1093bf5e6",
+     "size_bytes": 506706150,
+     "suite": "camera_imu"
+    }
+   ],
+   "conversion_chain": [
+    {
+     "converter": "extract_archive",
+     "arguments": {}
+    },
+    {
+     "converter": "convert_tumvie_vidata_to_euroc_folder",
+     "arguments": {}
+    },
+    {
+     "converter": "convert_euroc_folder_to_rosbag",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "key": "uzh_fpv_davis",
+   "title": "UZH-FPV davis",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "cc_by_nc_sa",
+   "hosting_policy": "recipe_only",
+   "native_format": "rosbag",
+   "notes": "cam bags = camera-only sweeps; imu bags = cam-IMU excitation.",
+   "attribution": {
+    "creator": "Robotics and Perception Group, University of Zurich",
+    "license": "CC BY-NC-SA 3.0",
+    "license_url": "https://creativecommons.org/licenses/by-nc-sa/3.0/",
+    "source_url": "https://fpv.ifi.uzh.ch/",
+    "citation": "J. Delmerico, T. Cieslewski, H. Rebecq, M. Faessler, D. Scaramuzza, \"Are We Ready for Autonomous Drone Racing? The UZH-FPV Drone Racing Dataset\", ICRA 2019",
+    "doi": "10.1109/ICRA.2019.8793887"
+   },
+   "sources": [
+    {
+     "sequence": "indoor_forward_cam",
+     "local_relative_path": "UZH/davis/indoor_forward_calib_davis_cam.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/indoor_forward_calib_davis_cam.bag",
+     "sha256": "f391b1ece2332d26934e08a46881d668cfc487c130dbfc4dc4b0fa4a1bb9306c",
+     "size_bytes": 134144509,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "indoor_45_cam",
+     "local_relative_path": "UZH/davis/indoor_45_calib_davis_cam.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/indoor_45_calib_davis_cam.bag",
+     "sha256": "d4e088d24d659b8e61cf6ba097ec052cc06f3e61efac065a6977641a31bd873c",
+     "size_bytes": 206752459,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "outdoor_forward_cam",
+     "local_relative_path": "UZH/davis/outdoor_forward_calib_davis_cam.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/outdoor_forward_calib_davis_cam.bag",
+     "sha256": "f39c375a194141c838edc8f97eaf8989b76988de4194772da4276ee498e6ee13",
+     "size_bytes": 213148469,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "outdoor_45_cam",
+     "local_relative_path": "UZH/davis/outdoor_45_calib_davis_cam.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/outdoor_45_calib_davis_cam.bag",
+     "sha256": "dfd7602499af4ef40382362c9023cc43ed9735522885e49ee902c91615ea4a7a",
+     "size_bytes": 214656207,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "indoor_forward_imu",
+     "local_relative_path": "UZH/davis/indoor_forward_calib_davis_imu.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/indoor_forward_calib_davis_imu.bag",
+     "sha256": "14bdc37f8f6d617f15f0aa02378fc8d9a81be7538daf8447c1e19a10b9a79660",
+     "size_bytes": 138606989,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "indoor_45_imu",
+     "local_relative_path": "UZH/davis/indoor_45_calib_davis_imu.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/indoor_45_calib_davis_imu.bag",
+     "sha256": "f448d78844e732dfb8f1bab0e754a1ddff265a73e98b076b4ac9c617194f93ce",
+     "size_bytes": 112763054,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "outdoor_forward_imu",
+     "local_relative_path": "UZH/davis/outdoor_forward_calib_davis_imu.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/outdoor_forward_calib_davis_imu.bag",
+     "sha256": "e4338dcae31aab967575b18f18882b314739b2bff3edd6ce5ec778e7c9652062",
+     "size_bytes": 227613465,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "outdoor_45_imu",
+     "local_relative_path": "UZH/davis/outdoor_45_calib_davis_imu.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/outdoor_45_calib_davis_imu.bag",
+     "sha256": "1d8106f4df4297d2478441d243bab4100d99ed913d492610b65939273350cbc3",
+     "size_bytes": 130127972,
+     "suite": "camera_imu"
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "uzh_fpv_snapdragon",
+   "title": "UZH-FPV snapdragon",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "cc_by_nc_sa",
+   "hosting_policy": "recipe_only",
+   "native_format": "rosbag",
+   "notes": "cam bags = camera-only sweeps; imu bags = cam-IMU excitation.",
+   "attribution": {
+    "creator": "Robotics and Perception Group, University of Zurich",
+    "license": "CC BY-NC-SA 3.0",
+    "license_url": "https://creativecommons.org/licenses/by-nc-sa/3.0/",
+    "source_url": "https://fpv.ifi.uzh.ch/",
+    "citation": "J. Delmerico, T. Cieslewski, H. Rebecq, M. Faessler, D. Scaramuzza, \"Are We Ready for Autonomous Drone Racing? The UZH-FPV Drone Racing Dataset\", ICRA 2019",
+    "doi": "10.1109/ICRA.2019.8793887"
+   },
+   "sources": [
+    {
+     "sequence": "indoor_forward_cam",
+     "local_relative_path": "UZH/snapdragon/indoor_forward_calib_snapdragon_cam.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/indoor_forward_calib_snapdragon_cam.bag",
+     "sha256": "f8e64f2648caddb5013f233d970869e44e49ad2d1ac3606341cdcd4438d05c79",
+     "size_bytes": 1155527311,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "indoor_45_cam",
+     "local_relative_path": "UZH/snapdragon/indoor_45_calib_snapdragon_cam.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/indoor_45_calib_snapdragon_cam.bag",
+     "sha256": "2f306de08f28731afd635d3ee2972c1a992661c8a950ecd499c5027c5e017588",
+     "size_bytes": 1263424477,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "outdoor_forward_cam",
+     "local_relative_path": "UZH/snapdragon/outdoor_forward_calib_snapdragon_cam.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/outdoor_forward_calib_snapdragon_cam.bag",
+     "sha256": "bf63ae23f55894177d68f9b71a5f2b04105f38746e939710c7956ebca1a7a133",
+     "size_bytes": 919137318,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "outdoor_45_cam",
+     "local_relative_path": "UZH/snapdragon/outdoor_45_calib_snapdragon_cam.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/outdoor_45_calib_snapdragon_cam.bag",
+     "sha256": "acfabde3015b4f7e6061c46e53f1e390b36dbd20f82951f1ad26cd811cfdb823",
+     "size_bytes": 1379006752,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "indoor_forward_imu",
+     "local_relative_path": "UZH/snapdragon/indoor_forward_calib_snapdragon_imu.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/indoor_forward_calib_snapdragon_imu.bag",
+     "sha256": "ef4f118f7a781d67dbf79db6fdaeb6ee5d0d644e70bbaca584d88d3d755c9941",
+     "size_bytes": 1005336010,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "indoor_45_imu",
+     "local_relative_path": "UZH/snapdragon/indoor_45_calib_snapdragon_imu.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/indoor_45_calib_snapdragon_imu.bag",
+     "sha256": "c0473df30decf1f12a48d8dd9a70e1468f140a978085bd16e35cd829890d4e5f",
+     "size_bytes": 792331647,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "outdoor_forward_imu",
+     "local_relative_path": "UZH/snapdragon/outdoor_forward_calib_snapdragon_imu.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/outdoor_forward_calib_snapdragon_imu.bag",
+     "sha256": "1dfe3334ed1a64af81207d3c0676074747469ee18fd08ea02d98288413a90671",
+     "size_bytes": 892909131,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "outdoor_45_imu",
+     "local_relative_path": "UZH/snapdragon/outdoor_45_calib_snapdragon_imu.bag",
+     "url": "https://rpg.ifi.uzh.ch/datasets/uzh-fpv/calib/outdoor_45_calib_snapdragon_imu.bag",
+     "sha256": "e694fe6fc9e9322b9372503827f61332955fb544c0cf0087d4e98cff889979ea",
+     "size_bytes": 578379764,
+     "suite": "camera_imu"
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "tum_fisheye",
+   "title": "TUM-Fisheye (Double Sphere calibration)",
+   "suites": [
+    "camera_only"
+   ],
+   "license_bucket": "no_license",
+   "hosting_policy": "recipe_only",
+   "native_format": "rosbag",
+   "notes": "Double Sphere paper calibration bags: 5 lens setups (BF2M2020S23, BF5M13720, GoPro replacement lens, BM4018S118, BM2820) x 3 AprilGrid recordings; camera-only.",
+   "attribution": {
+    "creator": "TUM Computer Vision Group",
+    "license": "no licence stated",
+    "license_url": null,
+    "source_url": "https://cvg.cit.tum.de/research/vslam/double-sphere",
+    "citation": "V. Usenko, N. Demmel, D. Cremers, \"The Double Sphere Camera Model\", 3DV 2018",
+    "doi": "10.1109/3DV.2018.00069"
+   },
+   "sources": [
+    {
+     "sequence": "BF2M2020S23-1",
+     "local_relative_path": "tum_fisheye/BF2M2020S23/BF2M2020S23-1.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BF2M2020S23-1.bag",
+     "sha256": "b5043e223506e5fcc1c07cb069ddf25a9e2d94bcfda44833747397459fb8e4d2",
+     "size_bytes": 331649430,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BF2M2020S23-2",
+     "local_relative_path": "tum_fisheye/BF2M2020S23/BF2M2020S23-2.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BF2M2020S23-2.bag",
+     "sha256": "16ab23a1c71f1c55b0ab05103c073f3198b241226233505723654462ddd356bf",
+     "size_bytes": 304121843,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BF2M2020S23-3",
+     "local_relative_path": "tum_fisheye/BF2M2020S23/BF2M2020S23-3.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BF2M2020S23-3.bag",
+     "sha256": "28ada8100f826862e864a79f913b5cf0edcf0f378cdd83dfc53173e54068e340",
+     "size_bytes": 382771903,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BF5M13720-1",
+     "local_relative_path": "tum_fisheye/BF5M13720/BF5M13720-1.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BF5M13720-1.bag",
+     "sha256": "1ab327b27f628ba6fb92f52c3a71ae5148c83ce9b6e9c65f7a3b11439578f648",
+     "size_bytes": 353933489,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BF5M13720-2",
+     "local_relative_path": "tum_fisheye/BF5M13720/BF5M13720-2.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BF5M13720-2.bag",
+     "sha256": "200b0566981a8ac5b1f59954cf18f0c463e6eece0dcf46bfefa928ec2ffd4c53",
+     "size_bytes": 318541160,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BF5M13720-3",
+     "local_relative_path": "tum_fisheye/BF5M13720/BF5M13720-3.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BF5M13720-3.bag",
+     "sha256": "bc2e423bf5b4829e10a53a3e56f8b0709c063b5069b35c600c732a7acad69d50",
+     "size_bytes": 306743497,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "GOPRO-1",
+     "local_relative_path": "tum_fisheye/GOPRO/GOPRO-1.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/GOPRO-1.bag",
+     "sha256": "3c484de6b6b1d6c03d3a98f86fe762d7aa6432f4db07091131f553b35c6fd556",
+     "size_bytes": 356555143,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "GOPRO-2",
+     "local_relative_path": "tum_fisheye/GOPRO/GOPRO-2.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/GOPRO-2.bag",
+     "sha256": "1ee8c0114eb645e1a1aebdb85055c1366d4720d7a7e096170e235b51d349ed0a",
+     "size_bytes": 310675978,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "GOPRO-3",
+     "local_relative_path": "tum_fisheye/GOPRO/GOPRO-3.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/GOPRO-3.bag",
+     "sha256": "38f2cf09c40229e1f980976fcc649455ef2eed8e7d74f56d5488c850f52b68bb",
+     "size_bytes": 235958619,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BM4018S118-1",
+     "local_relative_path": "tum_fisheye/BM4018S118/BM4018S118-1.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BM4018S118-1.bag",
+     "sha256": "6e19289ea10450cf95dc3a68da47c8b01ce63e6206b1d7426bfcfe034493e543",
+     "size_bytes": 267418687,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BM4018S118-2",
+     "local_relative_path": "tum_fisheye/BM4018S118/BM4018S118-2.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BM4018S118-2.bag",
+     "sha256": "f0cb12a8dc75264b7f1263096312b8880be9800eac1643c26577483b89bd02ff",
+     "size_bytes": 237269446,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BM4018S118-3",
+     "local_relative_path": "tum_fisheye/BM4018S118/BM4018S118-3.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BM4018S118-3.bag",
+     "sha256": "8c944aec12b3c5b1b4686908113ec2c4aa5bf5502a4a013bf50d16b782b1c718",
+     "size_bytes": 247756062,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BM2820-1",
+     "local_relative_path": "tum_fisheye/BM2820/BM2820-1.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BM2820-1.bag",
+     "sha256": "7a648badeb107650c3d2984f68d95e3eedd56b6f51365e167f343005fb45a18d",
+     "size_bytes": 241201927,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BM2820-2",
+     "local_relative_path": "tum_fisheye/BM2820/BM2820-2.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BM2820-2.bag",
+     "sha256": "777c6769cbaba65c6d5b7251c3fd3ac78457f1b29e1abc8facb32f7b10321e7e",
+     "size_bytes": 233336965,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "BM2820-3",
+     "local_relative_path": "tum_fisheye/BM2820/BM2820-3.bag",
+     "url": "https://vision.in.tum.de/double-sphere/dataset1/BM2820-3.bag",
+     "sha256": "23f5813c331c0fc4484d59f3819a714d9fefbb95ab6892c8d3a10057b714f793",
+     "size_bytes": 256931851,
+     "suite": "camera_only"
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "penncosyvio",
+   "title": "PennCOSYVIO",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "citation_only",
+   "hosting_policy": "recipe_only",
+   "native_format": "tar_archive",
+   "notes": "intrinsic_calib = stills for all 7 cameras; sensor tars carry as/af/bs/bf seqs.",
+   "attribution": {
+    "creator": "Daniilidis Group, University of Pennsylvania",
+    "license": "no licence stated (cite the paper)",
+    "license_url": null,
+    "source_url": "https://daniilidis-group.github.io/penncosyvio/",
+    "citation": "B. Pfrommer, N. Sanket, K. Daniilidis, J. Cleveland, \"PennCOSYVIO: A Challenging Visual Inertial Odometry Benchmark\", ICRA 2017",
+    "doi": "10.1109/ICRA.2017.7989443"
+   },
+   "sources": [
+    {
+     "sequence": "c1",
+     "local_relative_path": "penncosyvio/tarfiles/c1.tar",
+     "url": "https://visiondata.cis.upenn.edu/penncosyvio/tarfiles/c1.tar",
+     "sha256": null,
+     "size_bytes": null,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "c2",
+     "local_relative_path": "penncosyvio/tarfiles/c2.tar",
+     "url": "https://visiondata.cis.upenn.edu/penncosyvio/tarfiles/c2.tar",
+     "sha256": null,
+     "size_bytes": null,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "c3",
+     "local_relative_path": "penncosyvio/tarfiles/c3.tar",
+     "url": "https://visiondata.cis.upenn.edu/penncosyvio/tarfiles/c3.tar",
+     "sha256": "44d8679cdcc49e3941fbb9e1847657360f028adcac6b3a7c65c2025010131b7f",
+     "size_bytes": 2945075200,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "tango_top",
+     "local_relative_path": "penncosyvio/tarfiles/tango_top.tar",
+     "url": "https://visiondata.cis.upenn.edu/penncosyvio/tarfiles/tango_top.tar",
+     "sha256": "e391538e916a0923bfe54b2265d3ac8d220ac5ffb48fae83b5c9f054fce20881",
+     "size_bytes": 267509760,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "tango_bottom",
+     "local_relative_path": "penncosyvio/tarfiles/tango_bottom.tar",
+     "url": "https://visiondata.cis.upenn.edu/penncosyvio/tarfiles/tango_bottom.tar",
+     "sha256": "680ee03ff830d3d1fc75dc1abd5a201c5ff204c9a9d76499839bfe48eaf639c3",
+     "size_bytes": 923617280,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "visensor",
+     "local_relative_path": "penncosyvio/tarfiles/visensor.tar",
+     "url": "https://visiondata.cis.upenn.edu/penncosyvio/tarfiles/visensor.tar",
+     "sha256": null,
+     "size_bytes": null,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "intrinsic_calib",
+     "local_relative_path": "penncosyvio/tarfiles/intrinsic_calib.tar",
+     "url": "https://visiondata.cis.upenn.edu/penncosyvio/tarfiles/intrinsic_calib.tar",
+     "sha256": "44ccde9266d2c3363b2a93d886b31ba418378196e1f2f430b49dd6a5617f3171",
+     "size_bytes": 1022740480,
+     "suite": "camera_only"
+    }
+   ],
+   "conversion_chain": [
+    {
+     "converter": "extract_archive",
+     "arguments": {}
+    },
+    {
+     "converter": "convert_penncosyvio_sequence_to_rosbag",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "key": "tum_rgbd_bag",
+   "title": "TUM RGB-D calibration",
+   "suites": [
+    "camera_only"
+   ],
+   "license_bucket": "cc_by",
+   "hosting_policy": "host_rosbag",
+   "native_format": "rosbag",
+   "notes": "Upstream serves each bag as a .tgz of the same name; the catalog path is the extracted .bag.",
+   "attribution": {
+    "creator": "TUM Computer Vision Group",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://cvg.cit.tum.de/data/datasets/rgbd-dataset",
+    "citation": "J. Sturm, N. Engelhard, F. Endres, W. Burgard, D. Cremers, \"A Benchmark for the Evaluation of RGB-D SLAM Systems\", IROS 2012",
+    "doi": "10.1109/IROS.2012.6385773"
+   },
+   "sources": [
+    {
+     "sequence": "fr1_rgb",
+     "local_relative_path": "tum_rgbd_bag/rgbd_dataset_freiburg1_rgb_calibration.bag",
+     "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_rgb_calibration.tgz",
+     "sha256": "502d7e43fc6659d162d74213029784705c37b072d8caf0ec8a670a19b6bfeb3a",
+     "size_bytes": 1052550475,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "fr1_ir",
+     "local_relative_path": "tum_rgbd_bag/rgbd_dataset_freiburg1_ir_calibration.bag",
+     "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_ir_calibration.tgz",
+     "sha256": "5dcba858813d5c8953706597dfc3728bf234244e03984b7577ef43b4bf855730",
+     "size_bytes": 2171356632,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "fr1_large",
+     "local_relative_path": "tum_rgbd_bag/rgbd_dataset_freiburg1_large_checkerboard_calibration.bag",
+     "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_large_checkerboard_calibration.tgz",
+     "sha256": "99b65c85d5859e79ced7a38bb04e9fe64e1965c82a1b864ec7952169e14444a2",
+     "size_bytes": 1062793358,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "fr2_rgb",
+     "local_relative_path": "tum_rgbd_bag/rgbd_dataset_freiburg2_rgb_calibration.bag",
+     "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg2/rgbd_dataset_freiburg2_rgb_calibration.tgz",
+     "sha256": "ef7e0a3c80594f2b6b746822bdfac908314ffe0bc2f96517904a59ba81c8b308",
+     "size_bytes": 1229518718,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "fr2_ir",
+     "local_relative_path": "tum_rgbd_bag/rgbd_dataset_freiburg2_ir_calibration.bag",
+     "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg2/rgbd_dataset_freiburg2_ir_calibration.tgz",
+     "sha256": "d6f029870f389f4a0d2b1976ea3981f9e6c0438c1f019c553b36161bd447d0e7",
+     "size_bytes": 2318235751,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "fr2_large",
+     "local_relative_path": "tum_rgbd_bag/rgbd_dataset_freiburg2_large_checkerboard_calibration.bag",
+     "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg2/rgbd_dataset_freiburg2_large_checkerboard_calibration.tgz",
+     "sha256": "cb0b9925047958ea9883a44ad8914e3b6fb4a74caa56cb172e2f938594321717",
+     "size_bytes": 1662646824,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "fr3_rgb",
+     "local_relative_path": "tum_rgbd_bag/rgbd_dataset_freiburg3_calibration_rgb_depth.bag",
+     "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg3/rgbd_dataset_freiburg3_calibration_rgb_depth.tgz",
+     "sha256": "8f701681f05835b0a9c3763c8589647694ff833f7a872bc440447660f9a6e7ef",
+     "size_bytes": 690769427,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "fr3_ir",
+     "local_relative_path": "tum_rgbd_bag/rgbd_dataset_freiburg3_calibration_ir.bag",
+     "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg3/rgbd_dataset_freiburg3_calibration_ir.tgz",
+     "sha256": "a0e1a74743b5709c9a6815d524305d65347f726a305753981cf8c096a3d9965b",
+     "size_bytes": 2561721519,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "fr3_large",
+     "local_relative_path": "tum_rgbd_bag/rgbd_dataset_freiburg3_checkerboard_large.bag",
+     "url": "https://cvg.cit.tum.de/rgbd/dataset/freiburg3/rgbd_dataset_freiburg3_checkerboard_large.tgz",
+     "sha256": "6e217ea76b9099897cb1c8d9062d0e6e2930173a7209a560315705b5ad6311f3",
+     "size_bytes": 880278214,
+     "suite": "camera_only"
+    }
+   ],
+   "conversion_chain": []
+  },
+  {
+   "key": "fisheye_dataset",
+   "title": "Urban fisheye (ImprovedOcamCalib)",
+   "suites": [
+    "camera_only"
+   ],
+   "license_bucket": "gpl_v2",
+   "hosting_policy": "recipe_only",
+   "native_format": "image_folder",
+   "notes": "Image sets inside the GitHub repository archive.",
+   "attribution": {
+    "creator": "Steffen Urban (ImprovedOcamCalib)",
+    "license": "GPL-2.0",
+    "license_url": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.html",
+    "source_url": "https://github.com/urbste/ImprovedOcamCalib",
+    "citation": "S. Urban, J. Leitloff, S. Hinz, \"Improved wide-angle, fisheye and omnidirectional camera calibration\", ISPRS Journal of Photogrammetry and Remote Sensing 108, 2015",
+    "doi": "10.1016/j.isprsjprs.2015.06.005"
+   },
+   "sources": [
+    {
+     "sequence": "repository",
+     "local_relative_path": "FisheyeDataSet/ImprovedOcamCalib-master.zip",
+     "url": "https://codeload.github.com/urbste/ImprovedOcamCalib/zip/refs/heads/master",
+     "sha256": null,
+     "size_bytes": null,
+     "suite": "camera_only"
+    }
+   ],
+   "conversion_chain": [
+    {
+     "converter": "extract_archive",
+     "arguments": {}
+    },
+    {
+     "converter": "convert_image_folder_to_rosbag",
+     "arguments": {
+      "frame_rate_hz": 1.0,
+      "synthetic_timestamps": true
+     }
+    }
+   ]
+  },
+  {
+   "key": "hilti_2026",
+   "title": "Hilti-Trimble SLAM Challenge 2026 calibration",
+   "suites": [
+    "camera_only",
+    "camera_imu"
+   ],
+   "license_bucket": "cc_by_nc_sa",
+   "hosting_policy": "recipe_only",
+   "native_format": "rosbag",
+   "notes": "Insta360 ONE RS 1-Inch 360: two back-to-back rolling-shutter fisheye lenses, 1472x1440 JPEG at 30 Hz (/cam0/image_raw/compressed, /cam1/image_raw/compressed) + 1 kHz IMU (/imu/data_raw). ROS2 sqlite3 bags with empty type hashes: need rosbags>=0.11.6; give MVIS the rosbag folder or its .db3. cam0_cam1 = camera pair on a 6x6 AprilGrid (tag 80 mm, spacing 0.3), camera still; cam0_imu / cam1_imu = one lens + IMU each on a 7x12 AprilGrid (tag 150 mm, spacing 0.25) that is twisted about 12 mm peak to peak, so estimate the board shape. The Hub's cam0_imu/rosbag/rosbag_blurred_0.db3 is byte-identical to rosbag.db3 (same sha256).",
+   "attribution": {
+    "creator": "Hilti, Trimble and the University of Oxford (Hilti-Trimble SLAM Challenge 2026)",
+    "license": "CC BY-NC-SA 3.0",
+    "license_url": "https://creativecommons.org/licenses/by-nc-sa/3.0/",
+    "source_url": "https://github.com/Hilti-Research/hilti-trimble-slam-challenge-2026",
+    "citation": "Hilti-Trimble SLAM Challenge 2026 dataset, camera_calibration recordings",
+    "doi": null
+   },
+   "sources": [
+    {
+     "sequence": "cam0_cam1",
+     "local_relative_path": "hilti_2026/camera_calibration/cam0_cam1/rosbag/rosbag.db3",
+     "url": "https://huggingface.co/datasets/Hilti-Research/hilti-trimble-slam-challenge-2026/resolve/ac5fd207e10a7a45438f04d1dbc96a529b1088be/camera_calibration/cam0_cam1/rosbag/rosbag.db3",
+     "sha256": "54fdce5229abf9c0e519be01b04d694017503951d30562bf08b249c4a5bdf501",
+     "size_bytes": 7164887040,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam0_cam1_metadata",
+     "local_relative_path": "hilti_2026/camera_calibration/cam0_cam1/rosbag/metadata.yaml",
+     "url": "https://huggingface.co/datasets/Hilti-Research/hilti-trimble-slam-challenge-2026/resolve/ac5fd207e10a7a45438f04d1dbc96a529b1088be/camera_calibration/cam0_cam1/rosbag/metadata.yaml",
+     "sha256": "78a26cf4e4b700652eb9a1c43a3d7fbb90c74f398e55e18b31ccb83b2674fe33",
+     "size_bytes": 1245,
+     "suite": "camera_only"
+    },
+    {
+     "sequence": "cam0_imu",
+     "local_relative_path": "hilti_2026/camera_calibration/cam0_imu/rosbag/rosbag.db3",
+     "url": "https://huggingface.co/datasets/Hilti-Research/hilti-trimble-slam-challenge-2026/resolve/ac5fd207e10a7a45438f04d1dbc96a529b1088be/camera_calibration/cam0_imu/rosbag/rosbag.db3",
+     "sha256": "65a4df3f56ca19794f27a5919ffc88d518a02934e596545ffb885e64c940a679",
+     "size_bytes": 7852101632,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "cam0_imu_metadata",
+     "local_relative_path": "hilti_2026/camera_calibration/cam0_imu/rosbag/metadata.yaml",
+     "url": "https://huggingface.co/datasets/Hilti-Research/hilti-trimble-slam-challenge-2026/resolve/ac5fd207e10a7a45438f04d1dbc96a529b1088be/camera_calibration/cam0_imu/rosbag/metadata.yaml",
+     "sha256": "2bb054251dd91ced3d5048e58d87425cc1422d3feb5592352fbcd293802d740d",
+     "size_bytes": 1245,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "cam1_imu",
+     "local_relative_path": "hilti_2026/camera_calibration/cam1_imu/rosbag/rosbag.db3",
+     "url": "https://huggingface.co/datasets/Hilti-Research/hilti-trimble-slam-challenge-2026/resolve/ac5fd207e10a7a45438f04d1dbc96a529b1088be/camera_calibration/cam1_imu/rosbag/rosbag.db3",
+     "sha256": "4cd49b44a8684be93c0d63c724aeb0dc4d0c40419525faf4ace2e5d50f37374c",
+     "size_bytes": 6885531648,
+     "suite": "camera_imu"
+    },
+    {
+     "sequence": "cam1_imu_metadata",
+     "local_relative_path": "hilti_2026/camera_calibration/cam1_imu/rosbag/metadata.yaml",
+     "url": "https://huggingface.co/datasets/Hilti-Research/hilti-trimble-slam-challenge-2026/resolve/ac5fd207e10a7a45438f04d1dbc96a529b1088be/camera_calibration/cam1_imu/rosbag/metadata.yaml",
+     "sha256": "c50b1e8c933ebaf4c12d888c1a8b1902971981c7ace755ddc6442a95790d704c",
+     "size_bytes": 1245,
+     "suite": "camera_imu"
+    }
+   ],
+   "conversion_chain": []
+  }
+ ]
+}

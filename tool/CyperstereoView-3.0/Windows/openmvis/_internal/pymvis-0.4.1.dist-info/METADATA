@@ -1,0 +1,286 @@
+Metadata-Version: 2.4
+Name: pymvis
+Version: 0.4.1
+Summary: Open-source multi-visual-inertial sensor calibration: camera and camera-IMU calibration for single-camera to multi-camera, multi-IMU rigs
+Author-email: Yulin Yang <contact@openmvis.com>
+License-Expression: GPL-3.0-only
+Project-URL: Homepage, https://openmvis.com
+Project-URL: Repository, https://github.com/openmvis/openmvis
+Keywords: calibration,camera-calibration,camera-imu,visual-inertial,extrinsics,intrinsics,gtsam,factor-graph,slam,robotics
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Science/Research
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Operating System :: MacOS :: MacOS X
+Classifier: Topic :: Scientific/Engineering :: Image Processing
+Requires-Python: <3.13,>=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+License-File: COMMERCIAL-LICENSE.md
+Requires-Dist: numpy<2,>=1.20
+Requires-Dist: opencv-python<4.12,>=4.5
+Requires-Dist: gtsam<4.3,>=4.2
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: scipy>=1.7
+Requires-Dist: tqdm>=4.60
+Requires-Dist: matplotlib>=3.5
+Requires-Dist: plotly>=5.0
+Provides-Extra: apriltag
+Requires-Dist: aprilgrid>=0.5; extra == "apriltag"
+Provides-Extra: aruco
+Requires-Dist: opencv-contrib-python<4.12,>=4.7; extra == "aruco"
+Provides-Extra: ros1
+Requires-Dist: rosbags>=0.11.6; extra == "ros1"
+Provides-Extra: mcap
+Requires-Dist: mcap>=1.1; extra == "mcap"
+Requires-Dist: mcap-protobuf-support>=0.5; extra == "mcap"
+Requires-Dist: av>=10; extra == "mcap"
+Provides-Extra: viz
+Requires-Dist: rerun-sdk>=0.18; extra == "viz"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0; extra == "dev"
+Requires-Dist: pytest-timeout>=2.3; extra == "dev"
+Dynamic: license-file
+
+# OpenMVIS
+
+<img src="doc/img/openmvis-banner.png" alt="OpenMVIS: open-source multi-visual-inertial sensor calibration" width="100%">
+
+[![PyPI](https://img.shields.io/pypi/v/pymvis?label=pymvis)](https://pypi.org/p/pymvis/)
+[![Python](https://img.shields.io/pypi/pyversions/pymvis)](https://pypi.org/p/pymvis/)
+[![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24239182.svg)](https://doi.org/10.5281/zenodo.24239182)
+[![Tests](https://github.com/openmvis/openmvis/actions/workflows/test.yml/badge.svg)](https://github.com/openmvis/openmvis/actions/workflows/test.yml)
+[![Docs](https://img.shields.io/badge/docs-openmvis.com-0f172a)](https://openmvis.com)
+
+**Open-source Multi-Visual-Inertial Sensor calibration.** A Python toolbox for
+**camera** and **camera-IMU** calibration, from a single camera to multi-camera,
+multi-IMU rigs. OpenMVIS is the project, MVIS is the calibration toolbox, and
+`pymvis` is its Python package (import and CLI `mvis`).
+
+[openmvis.com](https://openmvis.com) (documentation) ·
+[PyPI](https://pypi.org/p/pymvis/) ·
+[Calibench-VI datasets](https://huggingface.co/calibench-vi) ·
+[results on real recordings](https://openmvis.com/benchmark/results/)
+
+## What OpenMVIS does
+
+- **Camera calibration** of one or many cameras: intrinsics, distortion,
+  extrinsics, camera-camera time offsets and rolling-shutter readout, solved
+  jointly on a GTSAM factor graph with analytical Jacobians, Huber loss and an
+  outlier-driven second pass with a guardrail against pathological basins. No
+  field-of-view overlap is needed between cameras.
+  [Guide](https://openmvis.com/guides/camera-calibration/)
+- **Camera-IMU calibration** of single or multi cam/IMU rigs: camera-IMU
+  extrinsics, time offsets, readout, camera intrinsics, IMU intrinsics
+  (`kalibr`, `rpng` or `calyx` model, `Dw`/`Da`, optional `Tg`), biases and the
+  base IMU's gyro-accel time offset `t_ga`. Aux IMUs can be solved from their
+  gyro alone. One config calibrates a whole family of recordings (`input.bags`).
+  [Guide](https://openmvis.com/guides/camera-imu-calibration/) ·
+  [multi-sensor rigs](https://openmvis.com/guides/multi-sensor-rigs/)
+- **Eight camera models**, mixed freely within one rig and available in both
+  modes: `radtan`, `equidistant`, `kb4` (Kannala-Brandt, valid past 90 deg),
+  `fov`, `double_sphere`, `eucm`, `ucm`, `omni_radtan` (experimental).
+  [Camera model](https://openmvis.com/concepts/camera-model/)
+- **Rolling shutter**: readout time per camera, for one camera or jointly in a
+  multi-camera rig. [Guide](https://openmvis.com/guides/rolling-shutter/)
+- **Apply and verify**: `mvis apply-calib` writes a calibration-corrected copy
+  of a bag (IMU intrinsics and biases removed, every stream on the base-IMU
+  timeline, `t_ga` corrected); `mvis roundtrip` calibrates, corrects and
+  recalibrates and reports PASS/FAIL.
+  [Guide](https://openmvis.com/guides/roundtrip/)
+- **Inputs**: image folders, timestamped images, ROS1 and ROS2 bags (no ROS
+  install), EuRoC/ASL folders; AprilGrid, chessboard, ArUco and ChArUco boards; Kalibr
+  `camchain` read and write; streaming detection, so memory does not grow with
+  the recording. [Configuration](https://openmvis.com/reference/configuration/)
+- **Outputs**: YAML calibrations, JSON results, self-contained HTML reports
+  (reprojection analysis, motion excitation, detection statistics, timing) and
+  an optional Rerun 3D view.
+  [Result formats](https://openmvis.com/reference/result-formats/)
+- **Datasets**: `mvis datasets` lists, downloads and verifies the Calibench-VI
+  recordings on Hugging Face. [Datasets](https://openmvis.com/datasets/)
+- **Pure Python**: `pip install`, no C++ build or ROS workspace. Linux and
+  macOS, Python 3.11 and 3.12 (GTSAM ships no wheels below cp311; `numpy<2`
+  has no 3.13 wheel). Windows: tentative; it has run there, but GTSAM ships no
+  Windows wheels on PyPI, so install steps aren't written up yet.
+  [Requirements](https://openmvis.com/getting-started/requirements/)
+
+The validation behind these claims is on
+[openmvis.com](https://openmvis.com/benchmark/methodology/) and in `doc/`.
+
+## MVIS vs Kalibr vs Basalt
+
+| Capability | MVIS | Kalibr | Basalt |
+|---|---|---|---|
+| Camera intrinsics + distortion | ✅ | ✅ | ✅ |
+| Distortion models | radtan, kb4, equidistant, FOV, DS, EUCM, UCM, omni_radtan (experimental) | radtan, equidistant, FOV, omni, omni-radtan, DS, EUCM | radtan, KB4, DS, EUCM, UCM |
+| Different models in one rig | ✅ | ✅ | ✅ |
+| Camera–IMU extrinsics + time offset | ✅ | ✅ | ✅ |
+| Multiple IMUs in one solve | ✅ | ✅ | ✖ one IMU per run |
+| Gyro-only mode per auxiliary IMU | ✅ | ✖ | ✖ |
+| IMU intrinsics (scale, misalignment) | ✅ three conventions (kalibr, rpng, calyx) | ✅ | ✅ scale + misalignment |
+| G-sensitivity Tg | ✅ | ✅ | ✖ |
+| Gyro–accel offset t_ga | ✅ on by default | ✖ | ✖ |
+| Board shape (one height per corner) | ✅ `estimate.board_points` | ✖ flat board | ✖ flat board |
+| KB4-type polynomial past 90° | ✅ `kb4`, what `fisheye` means | ✖ pinhole-equi needs rays in front of the camera | ✅ KB4 |
+| Rolling-shutter readout | ✅ in camera and camera–IMU solves | camera-only, separate tool | ✖ |
+| Global + rolling shutter + IMUs in one solve | ✅ readout per camera | ✖ | ✖ |
+| Corrected-dataset export | ✅ `apply-calib` | ✖ | ✖ |
+| Digital-twin simulation | ✅ `mvis.simulation` | ✖ | ✖ |
+| Round-trip PASS/FAIL validation | ✅ `roundtrip` | ✖ | ✖ |
+| Batch sweep over a dataset family | ✅ `input.bags` | ✖ | ✖ |
+| Dataset download + check | ✅ `mvis datasets` | ✖ | ✖ |
+| Trajectory model | discrete factor graph | continuous-time B-spline | continuous-time B-spline |
+| Boards | AprilGrid, chessboard, ArUco, ChArUco | AprilGrid, chessboard, circles | AprilGrid |
+| Input | ROS1/ROS2 bag, EuRoC, image folders | ROS bag | ROS bag, EuRoC |
+| Runs without ROS | ✅ pure Python | ✖ | ✅ C++ build, no ROS |
+| Platforms | Linux, macOS, Windows (tentative) (Python 3.11–3.12) | Linux (ROS 1, or Docker) | Linux, macOS |
+| Kalibr interop | ✅ read + write camchain, read AprilGrid targets | native | ✖ |
+
+How each tool works:
+
+| | MVIS | Kalibr | Basalt |
+|---|---|---|---|
+| Optimizer | GTSAM factor graph (LM) | Custom `aslam_optimizer` | Custom LM + Gauss-Newton |
+| Trajectory | Per-frame pose + SLERP | B-spline (order 6) | B-spline SE(3) (order 5) |
+| Outlier rejection | Two passes: P99, then a warm-start rerun | One pass, Blake-Zisserman | One pass, Huber |
+| Output files | YAML + HTML report | YAML + TXT + PDF | JSON (cereal) |
+
+Measured side by side on the same public recordings, every parameter as
+median ± sd across recordings:
+[openmvis.com/benchmark/results](https://openmvis.com/benchmark/results/).
+The design comparison is on
+[Comparison vs Kalibr / Basalt](https://openmvis.com/getting-started/comparison/).
+Kalibr and Basalt are only called as external programs for those comparisons;
+neither is distributed with MVIS.
+
+## Get started
+
+Python 3.11 or 3.12, on Linux or macOS (Windows tentative):
+
+```bash
+pip install "pymvis[apriltag,ros1]"      # AprilGrid boards + ROS1 bag input
+mvis check --env --smoke                 # verify the install
+```
+
+Optional extras: `apriltag` (AprilGrid), `aruco` (opencv-contrib), `ros1` (ROS1
+bags, no ROS needed), `mcap` (MCAP episodes), `viz` (Rerun viewer), `dev`
+(pytest). For development, clone and `pip install -e ".[apriltag,aruco,ros1,dev]"`.
+
+A first calibration on a VI-Rig recording (gated on the Hub: accept the terms,
+then `hf auth login`):
+
+```bash
+mvis datasets download --select mvis_4imus_3cams/april_01   # ~7 GB to $MVIS_DATASETS
+mvis check -c examples/regression/mvis_4imus_3cams/cam_imu_april_01.yaml
+mvis run   -c examples/regression/mvis_4imus_3cams/cam_imu_april_01.yaml
+```
+
+The run writes the calibration YAML, a JSON result and an HTML report next to
+the config's `output_file`.
+
+**Calibrate your own rig with the agent.** The repository ships a
+[Claude Code](https://claude.com/claude-code) skill, `mvis-calibrate`, that
+takes you from a raw recording to a verified, released calibration in seven
+gated stages, built on `mvis inspect`, `mvis check`, `mvis run`,
+`mvis verdict` and `mvis roundtrip`. Start Claude Code in a checkout (or copy
+`.claude/` next to your data), say "calibrate my rig, data at …" or run
+`/mvis-calibrate`. Details and two worked examples: [doc/agent.md](doc/agent.md).
+
+Everything else is on openmvis.com:
+
+- [Installation](https://openmvis.com/getting-started/installation/) and
+  [Quickstart](https://openmvis.com/getting-started/quickstart/)
+- [Guides](https://openmvis.com/guides/board-setup/): board setup, calibration
+  motion, camera, camera-IMU, rolling shutter, multi-sensor rigs, round trip,
+  simulation
+- [Configuration](https://openmvis.com/reference/configuration/),
+  [CLI](https://openmvis.com/reference/cli/),
+  [Python API](https://openmvis.com/reference/python-api/),
+  [result formats](https://openmvis.com/reference/result-formats/)
+- [Datasets](https://openmvis.com/datasets/), the
+  [Device wiki](https://openmvis.com/devices/) and
+  [FAQ & troubleshooting](https://openmvis.com/about/faq/)
+- In this repository: `doc/camera_models.html` (projection, unprojection,
+  Jacobians), `doc/estimate_config.md`, `doc/testing.md`,
+  `examples/configs/`.
+
+MVIS is research code, maintained on a best-effort basis. GTSAM 4.2 wheels need
+`numpy<2`, so `pyproject.toml` pins NumPy and OpenCV accordingly.
+
+## Citation
+
+If you use MVIS, please cite the MVIS paper (see `CITATION.cff`):
+
+```bibtex
+@article{Yang2024MVIS,
+  author  = {Yang, Yulin and Geneva, Patrick and Huang, Guoquan},
+  title   = {Multi-visual-inertial system: Analysis, calibration, and estimation},
+  journal = {The International Journal of Robotics Research},
+  year    = {2024},
+  volume  = {43},
+  number  = {13},
+  pages   = {1995--2026},
+  doi     = {10.1177/02783649241245726}
+}
+```
+
+and the project, by its Zenodo concept DOI (resolves to the latest release; each release also
+has a version DOI, `10.5281/zenodo.24239183` for v0.1.0):
+
+```bibtex
+@misc{openmvis,
+  title  = {{OpenMVIS}: open-source multi-visual-inertial sensor calibration},
+  author = {{OpenMVIS Contributors}},
+  year   = {2026},
+  doi    = {10.5281/zenodo.24239182},
+  url    = {https://openmvis.com}
+}
+```
+
+If you use analytic combined IMU integration, ACI2, or ACI3 (ACI2 with IMU intrinsics, from the
+MVIS paper), also cite the ACI2 paper. Every MVIS camera–IMU solve uses ACI3 in its IMU factors.
+
+```bibtex
+@inproceedings{yang2020aci2,
+  title     = {Analytic Combined {IMU} Integration ({ACI}$^2$) For Visual Inertial Navigation},
+  author    = {Yang, Yulin and Wisely Babu, Benzun Pious and Chen, Chuchu and Huang, Guoquan and Ren, Liu},
+  booktitle = {2020 IEEE International Conference on Robotics and Automation (ICRA)},
+  year      = {2020},
+  pages     = {4680--4686},
+  doi       = {10.1109/ICRA40945.2020.9197280}
+}
+```
+
+If your results depend on the Calibench-VI datasets, cite them too; the entries are on
+[openmvis.com/about/contributors](https://openmvis.com/about/contributors/#citing-the-datasets-calibench-vi).
+
+## Contributors
+
+- **Yulin Yang** ([yangyulin](https://github.com/yangyulin)) — author and maintainer.
+- **Yuantai Zhang** ([Yuantai-Z](https://github.com/Yuantai-Z)) and **Xingxing Zuo** ([homepage](https://xingxingzuo.github.io/), advisor) — camera-only pipeline fixes,
+  the ROS1 recalibration tool and RealSense D435i recordings.
+- **Nerako Lee** ([nerakoo](https://github.com/nerakoo)) and **Chuchu Chen** ([homepage](https://mae.engineering.gwu.edu/chuchu-chen), advisor) — RealSense D455/D456 recordings and
+  calibration runs for the Device wiki and the Calibench-VI community datasets.
+
+The full list is in [AUTHORS](AUTHORS); the people behind the datasets and the MVIS paper are on
+[openmvis.com/about/contributors](https://openmvis.com/about/contributors/).
+
+## Contributing
+
+Issues and pull requests are welcome; see
+[CONTRIBUTING.md](https://github.com/openmvis/openmvis/blob/main/CONTRIBUTING.md).
+
+## License
+
+MVIS is released under
+[GPL-3.0-only](https://github.com/openmvis/openmvis/blob/main/LICENSE): free for
+everyone, including companies and commercial use, as long as software that
+includes or is derived from MVIS is released under the GPL. For use in
+closed-source products, a commercial licence is available; see
+[COMMERCIAL-LICENSE.md](https://github.com/openmvis/openmvis/blob/main/COMMERCIAL-LICENSE.md)
+(licensing@openmvis.com). Calibration results you compute with MVIS are yours to
+publish, including commercially.

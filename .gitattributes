@@ -1,0 +1,2 @@
+tool/CyperstereoView-3.0/Linux/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+tool/CyperstereoView-3.0/Windows/CyperstereoView.exe filter=lfs diff=lfs merge=lfs -text

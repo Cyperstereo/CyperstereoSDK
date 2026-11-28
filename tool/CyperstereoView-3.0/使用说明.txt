@@ -1,55 +1,66 @@
-Cyperstereo View 3.0 正式版
-
-本包包含 Windows 程序、Linux 上位机源码，以及可直接用于升级的固件文件。
-不包含 FPGA 工程、FX3 固件工程，也不包含电路说明。
-
-一、Windows
-1. 双击 Windows\CyperstereoView.exe 打开图形界面。
-2. 顶部「连接相机」选择一台相机。多台同时接上时，一次只连接所选的那一台。
-3. 「图像」页可以查看、放大、保存图像，并读取或写入最大曝光、最大增益。写入后需要给相机断电再上电才会生效。
-4. 「固件升级」页可以选择 firmware 目录中的文件，或你自己的 .bit / .img。
-   建议先点「检查连接（不擦写）」。确认后再点「开始升级」。
-   升级不保留旧固件备份。擦写开始后不能取消，请保持供电，看到校验通过后再断电重启。
-5. 命令行（不打开界面）：
-   Windows\cyperstereo-cli.exe list
-   Windows\cyperstereo-cli.exe param info
-   Windows\cyperstereo-cli.exe param set --exposure-ms 15 --gain 4
-   Windows\cyperstereo-cli.exe param reset
-   Windows\cyperstereo-cli.exe fpga check
-   Windows\cyperstereo-cli.exe fpga program firmware\fpga_ar0234_six_aeparam.bit --accept-single-image-risk
-   Windows\cyperstereo-cli.exe fx3 check
-   Windows\cyperstereo-cli.exe fx3 program firmware\fx3_slave_ar0234_aeparam_v1.img --accept-single-image-risk
-   Windows\cyperstereo-cli.exe fx3 prepare firmware\fx3_slave_ar0234_aeparam_v1.img
-   接了多台相机时，在命令后加上 --device 序列号，例如 --device A600001。
-   prepare 只导出一份保留当前序列号的 FX3 镜像，不写入相机。
-
-二、Linux（x86_64 或 aarch64，Ubuntu 20.04+ / Debian 11+）
-1. 解压 Linux\CyperstereoView-3.0-linux.tar.gz。
-2. 在解压出的目录执行：
-   ./linux/build_linux.sh
-   需要 sudo 安装编译依赖。依赖已经装好时可以加 --no-deps。
-   同时安装桌面图标和设备权限：
-   ./linux/build_linux.sh --install
-   安装后重新插拔相机；若提示加入 video 组，注销一次再登录。
-3. 图形界面：
-   ./linux/run_cyperstereo.sh
-   或安装后从应用程序菜单打开 Cyperstereo View。
-4. 命令行不需要 Qt 和 OpenCV，只需要 python3：
-   ./linux/cyperstereo-cli.sh list
-   ./linux/cyperstereo-cli.sh param info
-   ./linux/cyperstereo-cli.sh param set --exposure-ms 15 --gain 4
-   ./linux/cyperstereo-cli.sh param reset
-   ./linux/cyperstereo-cli.sh fpga check
-   ./linux/cyperstereo-cli.sh fpga program firmware/fpga_ar0234_six_aeparam.bit --accept-single-image-risk
-   ./linux/cyperstereo-cli.sh fx3 check
-   ./linux/cyperstereo-cli.sh fx3 program firmware/fx3_slave_ar0234_aeparam_v1.img --accept-single-image-risk
-   ./linux/cyperstereo-cli.sh fx3 prepare firmware/fx3_slave_ar0234_aeparam_v1.img
-   多台相机时同样使用 --device 序列号。
-5. 升级过程中 Linux 会自动阻止休眠。
-
-三、固件文件
-请按相机型号选择。型号不对时程序会拒绝写入，除非在界面勾选强制覆盖，或命令行加上 --force-overwrite。
-
-四、说明
-最大曝光、最大增益写入后，重新上电才生效。
-本版在 Windows 上完成打包和测试。Linux 使用与 Windows 相同的命令，需要在 Linux 电脑上编译后使用。
+Cyperstereo View 3.0（Windows + Linux，20261128）
+
+Windows 版和 Linux 版都是拷到目标电脑即可使用，不需要安装 Python、ROS、OpenCV、Kalibr 或 OpenMVIS。
+Linux 版可以在 Ubuntu 16.04、18.04、20.04、22.04、24.04（x86_64）上运行。
+两者都不包含 FPGA 工程、FX3 固件工程，也不包含电路说明。
+
+目录
+  Windows\CyperstereoView.exe   图形界面，双击打开
+  Windows\cyperstereo-cli.exe   命令行（不打开界面）
+  Windows\openmvis\             内置 OpenMVIS 0.4.1 标定程序，必须和 CyperstereoView.exe 放在同一目录，不能删
+  Linux\CyperstereoView-3.0-linux-x86_64-ubuntu16.04-24.04.tar.gz
+                                Linux 可直接运行的发布包（只有这一个程序包，不含源码）
+  Linux\Linux构建说明.txt       Linux 版的解压和运行步骤
+
+本版新增
+  - 每个相机可以单独设置最大曝光和最大增益（SC136HGS、AR0234）。默认仍是统一设置；
+    「图像」页勾选「各相机单独设置」后，可以给勾选的相机单独填写，未勾选的相机跟随统一值。
+    需要配套的新 FPGA 比特流；旧比特流上这一项显示为不支持。
+  - OpenMVIS 升级到 0.4.1，「标定」页可以输入当地重力 |g|（默认 9.81，内置深圳/上海/北京预设）。
+  - MT9V034：修改帧率时提示单帧触发（slave）模式不能超过 30 Hz。
+  - 修复：中文 Windows 上写标定结果时的 GBK 编码错误；Windows 上 OpenMVIS 的文件锁错误。
+
+一、Windows（Windows 10/11，64 位）
+1. 双击 Windows\CyperstereoView.exe 打开图形界面。
+2. 顶部「连接相机」选择一台相机。多台同时接上时，一次只连接所选的那一台。
+3. 「图像」页可以查看、放大、保存图像，并读取或写入最大曝光、最大增益、帧率。写入后需要给相机断电再上电才会生效。
+   各相机单独设置的编号是 FPGA 接口编号 C1~C6；四目版本中 C3 显示为图像 4，C4 显示为图像 3。
+4. 「标定」页可以录制 AprilGrid 和 IMU，或选择已有的图像目录 / ROS1 bag，在本机完成多目标定、多目加 IMU 标定。
+   - 标定方法可选 Kalibr 或 OpenMVIS。OpenMVIS 的结果文件名带 -openmvis-，不会覆盖 Kalibr 的结果。
+   - 选 OpenMVIS 时可以填写当地重力 |g|，标定时按该值固定。
+   - 结果写在数据所在目录。同名文件已存在时，旧文件改名为 .时间.bak 保留。
+5. 「固件升级」页可以选择 .bit / .img 文件。建议先点「检查连接（不擦写）」，确认后再点「开始升级」。
+   升级不保留旧固件备份。擦写开始后不能取消，请保持供电，看到校验通过后再断电重启。
+6. 命令行：
+   Windows\cyperstereo-cli.exe list
+   Windows\cyperstereo-cli.exe param info
+   Windows\cyperstereo-cli.exe param set --exposure-ms 10 --gain 8
+   Windows\cyperstereo-cli.exe param reset
+   Windows\cyperstereo-cli.exe param camera
+   Windows\cyperstereo-cli.exe param camera --cam 2 --exposure-ms 8 --gain 4
+   Windows\cyperstereo-cli.exe param camera --cam 2 --unified
+   Windows\cyperstereo-cli.exe param camera --clear
+   Windows\cyperstereo-cli.exe fps
+   Windows\cyperstereo-cli.exe fps 30
+   Windows\cyperstereo-cli.exe fpga check
+   Windows\cyperstereo-cli.exe fpga program 固件.bit --accept-single-image-risk
+   Windows\cyperstereo-cli.exe fx3 check
+   Windows\cyperstereo-cli.exe fx3 program 固件.img --accept-single-image-risk
+   Windows\cyperstereo-cli.exe fx3 prepare 固件.img
+   接了多台相机时，在命令后加上 --device 序列号，例如 --device A600001。
+   param camera 不带参数时只读取各相机当前生效的值；--cam N 单独设置接口 CN，--unified 让它改回跟随统一值，
+   --clear 让所有相机都跟随统一值。
+   fps 带数值时把帧率存进相机 Flash，下次上电生效；--default 清除。
+
+二、Linux（Ubuntu 16.04 / 18.04 / 20.04 / 22.04 / 24.04，x86_64）
+1. 解压 Linux\CyperstereoView-3.0-linux-x86_64-ubuntu16.04-24.04.tar.gz。
+2. 运行 ./cyperstereo-view.sh。命令和 Windows 版相同，例如 ./cyperstereo-view.sh param info。
+3. 目标电脑要有桌面自带的 libGL、libEGL、libX11，并有一种中文字体。/tmp 不要挂成 noexec。
+   不需要安装 OpenCV、Python 或 OpenMVIS。相机权限见压缩包里的 README.txt。
+   本目录只发布可执行包，不附带源码。
+
+三、说明
+- 最大曝光、最大增益（包括各相机单独设置）、帧率写入后，重新上电才生效。
+- 固件升级时型号不对会拒绝写入，除非在界面勾选强制覆盖，或命令行加 --force-overwrite。
+- 内置 OpenMVIS 以 GPL-3.0 授权，许可证见 Windows\openmvis\OPENMVIS-LICENSE.txt。
+  本发布不附带源码；如需 OpenMVIS 0.4.1 源码，可向发布方索取。

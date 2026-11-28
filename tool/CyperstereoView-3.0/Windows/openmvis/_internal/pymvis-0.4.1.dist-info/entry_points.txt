@@ -1,0 +1,2 @@
+[console_scripts]
+mvis = mvis.cli.main:main

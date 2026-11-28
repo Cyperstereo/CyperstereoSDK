@@ -1,0 +1,23 @@
+Cyperstereo View 3.0 Linux 版（20261128）
+
+本目录只发布可执行包，不附带源码。
+文件：CyperstereoView-3.0-linux-x86_64-ubuntu16.04-24.04.tar.gz
+
+它能在 Ubuntu 16.04、18.04、20.04、22.04、24.04（x86_64）上直接运行，
+不需要在目标电脑安装 OpenCV、Python、ROS 或 OpenMVIS，也不用再编译。
+
+1. 拷到目标电脑解压：
+     tar -xzf CyperstereoView-3.0-linux-x86_64-ubuntu16.04-24.04.tar.gz
+     cd CyperstereoView-3.0-linux-x86_64-ubuntu16.04-24.04
+   不要在 Windows 上解压后再拷过去。
+2. 相机权限（只需一次）：
+     sudo cp 99-cyperstereo.rules /etc/udev/rules.d/
+     sudo udevadm control --reload-rules && sudo udevadm trigger
+     sudo usermod -aG video "$USER"
+   之后重新插拔相机；加入 video 组后需要注销重新登录。
+3. 图形界面：./cyperstereo-view.sh
+4. 命令行和界面是同一个程序，命令和 Windows 版相同，例如：
+     ./cyperstereo-view.sh param info
+     ./cyperstereo-view.sh param camera --cam 2 --exposure-ms 8 --gain 4
+5. 目标电脑需要桌面自带的 libGL、libEGL、libX11 和一种中文字体。
+   /tmp 不要挂成 noexec。不需要安装 OpenCV。

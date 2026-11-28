@@ -1,0 +1,76 @@
+/*
+ * OpenMVIS: A Multi-Visual-Inertial Sensor Calibration Benchmark
+ * Copyright (C) 2026 Yulin Yang
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3 of the License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * SPDX-FileCopyrightText: 2026 Yulin Yang <contact@openmvis.com>
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+/* MVIS report views (calibration process + solved rig). Theme: --mv-* tokens fall back
+   from the report's names to the site's, so one file serves both. */
+.mvv{--mv-card:var(--bg-card,var(--bg,#fff));--mv-soft:var(--bg-code,var(--soft,#f3f3f1));--mv-ink:var(--text-primary,var(--ink,#14140f));
+  --mv-muted:var(--text-secondary,var(--muted,#5c5b55));--mv-line:var(--border,var(--line,#e1e0da));--mv-accent:var(--primary,var(--accent,#2563eb));
+  --mv-panel:#0f141b;--mv-board:#9333ea;--mv-start:#16a34a;--mv-cur:#f59e0b;--mv-grid:rgba(127,127,127,.18);
+  color:var(--mv-ink);font-variant-numeric:tabular-nums;margin:8px 0 18px}
+.mvv *{box-sizing:border-box}
+.mvv .mv-lead{margin:.2rem 0 .7rem;color:var(--mv-muted);font-size:14px}
+.mvv .mv-box{display:grid;grid-template-columns:minmax(0,1fr) 330px;border:1px solid var(--mv-line);border-radius:12px;overflow:hidden;background:var(--mv-card)}
+.mvv .mv-stage{position:relative;background:var(--mv-soft);min-height:470px}
+.mvv .mv-stage canvas{display:block;width:100%;height:470px;touch-action:none;cursor:grab}
+.mvv .mv-tools{position:absolute;left:10px;top:10px;display:flex;gap:6px;flex-wrap:wrap;right:10px;pointer-events:none}
+.mvv .mv-tools>*{pointer-events:auto}
+.mvv button,.mvv select{font:inherit;font-size:13px;background:var(--mv-card);color:var(--mv-ink);border:1px solid var(--mv-line);border-radius:7px;padding:4px 11px;min-height:32px;cursor:pointer}
+.mvv button[aria-pressed=true]{border-color:var(--mv-accent);color:var(--mv-accent);font-weight:600}
+.mvv .mv-gap{margin-left:8px}
+.mvv .mv-readout{position:absolute;right:10px;top:10px;font-size:12px;color:var(--mv-muted);background:var(--mv-card);border:1px solid var(--mv-line);border-radius:7px;padding:3px 9px;max-width:60%}
+.mvv .mv-side{border-left:1px solid var(--mv-line);padding:8px 10px;display:flex;flex-direction:column;gap:6px;min-height:0;overflow:hidden}
+.mvv .mv-hd{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mv-muted);font-weight:600}
+.mvv .mv-list{flex:1 1 0;min-height:0;display:flex;flex-direction:column;gap:6px}
+.mvv .mv-compact .mv-list{display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:minmax(96px,1fr);overflow-y:auto}
+.mvv .mv-compact .mv-cam{padding:4px 5px}.mvv .mv-compact .mv-cam b{font-size:11px;white-space:nowrap;overflow:hidden}
+.mvv .mv-compact .mv-tag{display:none}
+.mvv .mv-cam{border:1px solid var(--mv-line);border-radius:9px;padding:5px 7px;cursor:pointer;flex:1 1 0;min-height:0;display:flex;flex-direction:column;background:var(--mv-card);overflow:hidden}
+.mvv .mv-cam[aria-current=true]{border-color:var(--mv-accent);box-shadow:0 0 0 1px var(--mv-accent) inset}
+.mvv .mv-cam b{font-size:12px;display:flex;align-items:center;gap:6px}.mvv .mv-cam b i{width:9px;height:9px;border-radius:50%;display:inline-block}
+.mvv .mv-tag{font-size:10px;font-weight:600;border-radius:4px;padding:1px 5px;background:var(--mv-soft);color:var(--mv-muted);margin-left:auto}
+.mvv .mv-pair{flex:1 1 0;min-height:0;display:flex;gap:6px;justify-content:center;align-items:center;margin:4px 0 2px}
+.mvv .mv-pair canvas{border-radius:5px;background:var(--mv-panel);display:block;width:auto;height:auto;max-width:100%;max-height:100%;cursor:default;touch-action:auto}
+.mvv .mv-cam small,.mvv .mv-covis{display:block;font-size:11px;color:var(--mv-muted);line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mvv .mv-covis{white-space:normal}
+.mvv .mv-strip{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:9px 12px;border-top:1px solid var(--mv-line)}
+.mvv .mv-strip input{flex:1 1 220px;min-width:0;accent-color:var(--mv-accent)}
+.mvv .mv-lab{font-size:13px;color:var(--mv-muted);white-space:nowrap}
+.mvv .mv-chips{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12.5px;color:var(--mv-muted);margin:8px 2px 0}
+.mvv .mv-chips span{display:inline-flex;align-items:center;gap:6px}.mvv .mv-chips i{width:10px;height:10px;border-radius:50%;display:inline-block}
+.mvv .mv-chips i.mv-ln{width:22px;height:4px;border-radius:2px;background:linear-gradient(90deg,#bfdbfe,#1e3a8a)}
+.mvv .mv-info{padding:12px;border-left:1px solid var(--mv-line);overflow:auto}
+.mvv .mv-picks{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.mvv table{border-collapse:collapse;width:100%;font-size:13px}.mvv th,.mvv td{text-transform:none;letter-spacing:normal;font-size:13px;background:none}.mvv td,.mvv th{text-align:left;padding:5px 8px 5px 0;border-bottom:1px solid var(--mv-line);vertical-align:top}.mvv th{color:var(--mv-muted);font-weight:500}
+.mvv .mv-two{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+.mvv .mv-fig{border:1px solid var(--mv-line);border-radius:12px;background:var(--mv-card);padding:10px}.mvv .mv-fig b{font-size:13px}.mvv .mv-fig svg{width:100%;height:auto;display:block}
+.mvv .mv-scroll{overflow-x:auto;margin-top:12px}
+.mvv .mv-rig .mv-stage,.mvv .mv-rig .mv-stage canvas{min-height:420px;height:420px}
+.mvv .mv-fs{position:fixed!important;inset:0;z-index:1000;border-radius:0!important}
+.mvv .mv-fs .mv-stage,.mvv .mv-fs .mv-stage canvas{height:calc(100vh - 60px)!important}.mvv .mv-fs .mv-side{height:calc(100vh - 60px)}
+@media (max-width:860px){.mvv .mv-box{grid-template-columns:minmax(0,1fr)}.mvv .mv-side{border-left:0;border-top:1px solid var(--mv-line);height:auto;flex-direction:row;overflow-x:auto}
+  .mvv .mv-list,.mvv .mv-compact .mv-list{display:flex;flex-direction:row;gap:6px;overflow:visible}.mvv .mv-compact .mv-cam{min-width:150px}
+  .mvv .mv-cam{min-width:230px;flex:none}.mvv .mv-pair{height:120px;flex:none}.mvv .mv-info{border-left:0;border-top:1px solid var(--mv-line)}
+  .mvv .mv-stage canvas{height:340px}.mvv .mv-stage{min-height:340px}.mvv .mv-two{grid-template-columns:1fr}.mvv .mv-readout{max-width:none;left:10px}}
+@media print{.mvv .mv-tools,.mvv .mv-strip button,.mvv .mv-strip select,.mvv .mv-strip input{display:none}}
+
+.mvv .mv-main{display:flex;flex-direction:column;min-width:0}
+.mvv .mv-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 10px;border-top:1px solid var(--mv-line);background:var(--mv-card)}
+.mvv .mv-key{position:absolute;left:10px;bottom:8px;right:10px;font-size:11px;color:var(--mv-muted);pointer-events:none}
+.mvv .mv-fs .mv-side{height:auto}
+@media (max-width:860px){.mvv .mv-key{display:none}}
